@@ -1,0 +1,14 @@
+# Raw and processed CDR data - real traffic data, large files, never git.
+# See data/raw/**/SOURCE.md (once added) for where each source came from.
+data/raw/
+data/processed/
+
+# MLflow local tracking store + artifacts
+mlflow.db
+mlruns/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,12 @@
+lightgbm==4.7.0
+lime==0.2.0.1
+mlflow==3.15.1
+mlflow_skinny==3.15.1
+mlflow_tracing==3.15.1
+numpy==2.5.2
+pandas==2.3.3
+scikit_learn==1.9.0
+shap==0.52.0
+jupyter
+pytest
+feast
