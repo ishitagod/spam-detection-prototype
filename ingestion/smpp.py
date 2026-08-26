@@ -11,6 +11,12 @@ from typing import NamedTuple
 
 import pandas as pd
 
+from common.schemas import (
+    CANONICAL_FEATURE_SCHEMA,
+    CANONICAL_LABEL_SCHEMA,
+    validate_features,
+    validate_labels,
+)
 from config.settings import SMPP_SUBMIT_SM_OPERATION
 from ingestion.dcs_codecs import decode_by_dcs
 from labels.rule_labels import build_rule_labels, is_rule_evaluated
@@ -292,8 +298,32 @@ FEATURE_MAP = {
 #                                      would just be a redundant duplicate
 #                                      of the same signal.
 
+# Schema validation, wired into map_to_canonical() below - catches column
+# drift (a FEATURE_MAP edit that silently breaks the shared contract) at
+# the file it happened in, instead of it surfacing downstream as a missing-
+# column KeyError three pipeline stages later. `message_id` is excluded on
+# purpose: SMPP never populates it (no FEATURE_MAP entry for it at all,
+# unlike SS7 - see common/schemas.py's CANONICAL_FEATURE_SCHEMA docstring
+# on why the column exists as SS7's join key). Labels never include
+# message_id either, for BOTH sources - label_source only ever sets
+# record_id (see below).
+REQUIRED_FEATURE_COLS = [c for c in CANONICAL_FEATURE_SCHEMA if c != "message_id"]
+REQUIRED_LABEL_COLS = [c for c in CANONICAL_LABEL_SCHEMA if c != "message_id"]
+
 # These are the RULE ENGINE'S OUTPUT. Raw ingredients for labels/rule_labels.py
 # only - never returned as-is, never a feature. See map_to_canonical().
+#
+# `decision` semantics (confirmed against real op-4 data, all 6,045,250
+# rows across 48 files - zero NaN among them): 1 = fraud, 0 = non-fraud,
+# blank/NaN = unspecified (never reached a rule at all). NOT currently used
+# by build_rule_labels() (which keys off fraud_type=="spam" instead - see
+# labels/rule_labels.py for why) or returned in label_source below - kept
+# here only as an ingredient for is_rule_evaluated(). Notably more complete
+# than the rule/rule_name-based rule_evaluated signal: is_rule_evaluated()
+# finds ZERO evaluated-and-clean rows in real SMPP data (the rule engine
+# only ever writes rule/rule_name when it fires), while decision==0 covers
+# 6,042,073 of those same rows. See notebooks/eda_time_windows.ipynb for
+# where this gap first showed up and how decision is used to work around it.
 LABEL_SOURCE_COLS = ["decision", "rule", "rule_name", "fraud_type"]
 
 
@@ -341,4 +371,7 @@ def map_to_canonical(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     label_source["rule_flagged"] = build_rule_labels(raw_label_cols).where(
         label_source["rule_evaluated"]
     )
+
+    validate_features(features, required=REQUIRED_FEATURE_COLS)
+    validate_labels(label_source, required=REQUIRED_LABEL_COLS)
     return features, label_source

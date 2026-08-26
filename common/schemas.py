@@ -7,6 +7,8 @@ source's *_FEATURE_MAP dict - nothing stopped smpp.py and ss7.py from
 drifting a name (e.g. "originator" vs "originator_id") independently.
 """
 
+from pathlib import Path
+
 import pandas as pd
 
 # canonical column -> expected pandas dtype (as a string, checked loosely -
@@ -64,3 +66,31 @@ def validate_labels(df: pd.DataFrame, *, required: list[str] | None = None) -> N
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"missing canonical label column(s): {missing}")
+
+
+def verify_csv_roundtrip(df: pd.DataFrame, path: str | Path) -> None:
+    """
+    Re-reads a just-written CSV and confirms it comes back at all, and with
+    the same row count as what was written. Call this immediately after
+    every `df.to_csv(path, ...)` in the pipeline.
+
+    Deliberately a ROW-COUNT check, not a full content diff - it's a
+    corruption/truncation tripwire (bad quoting, an encoding crash, a
+    write that silently didn't finish), not a promise that every value
+    round-trips byte-for-byte. One KNOWN, intentional exception to that:
+    "" vs NaN on text_decode_failed rows - see
+    ingestion/run_ingest.py's load_features_csv().
+    """
+    path = Path(path)
+    try:
+        reread = pd.read_csv(path, low_memory=False)
+    except Exception as e:
+        raise ValueError(
+            f"{path}: written CSV does not read back cleanly "
+            f"({type(e).__name__}: {e})"
+        ) from e
+    if len(reread) != len(df):
+        raise ValueError(
+            f"{path}: wrote {len(df)} rows but read back {len(reread)} - "
+            "CSV round-trip corruption, do not trust this file as-is"
+        )

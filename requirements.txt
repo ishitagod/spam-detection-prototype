@@ -5,8 +5,20 @@ mlflow_skinny==3.15.1
 mlflow_tracing==3.15.1
 numpy==2.5.2
 pandas==2.3.3
+faiss-cpu==1.15.0  # features/faiss_index.py
 scikit_learn==1.9.0
+sentence-transformers==6.0.0  # features/text_embeddings.py - all-MiniLM-L6-v2
 shap==0.52.0
 jupyter
 pytest
-feast
+feast==0.66.0
+# dill version pin is required, not cosmetic: feast declares dill~=0.3.0
+# and pip will warn about this pin conflicting with that, but the
+# installed 0.3.9 cannot serialize the on-demand feature view UDF in
+# feature_repo/definitions.py under Python 3.14 - `feast apply` fails
+# with `TypeError: _Pickler._batch_setitems() missing 1 required
+# positional argument: 'obj'` (dill's pickler internals assume a
+# pre-3.14 cpython pickle.Pickler signature). 0.4.1 fixes this; keep the
+# pin until feast's own requirement catches up.
+dill==0.4.1
+torch

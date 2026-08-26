@@ -27,7 +27,21 @@ assumed - see the git history / conversation for the actual samples):
 DCS values below are UNSIGNED - callers normalize sign (SMPP stores dcs as
 a signed byte, SS7 appears to already store it unsigned) before calling in
 here. This module has no opinion on that, it's a source-specific quirk.
+
+3. Decoded text is sanitized (embedded \r/\n collapsed to a space) before
+   being returned - see _sanitize_for_storage(). Real messages legitimately
+   decode WITH raw newlines (GSM 03.38 maps 0x0A/0x0D to '\n'/'\r' - see
+   _GSM7_BASIC), that's correct decoding, not a bug. But it's real-world-
+   confirmed fragile once that text goes through a CSV round-trip at scale:
+   a genuine SS7 multi-line message decoded fine and round-tripped fine
+   through pandas in its OWN per-file features CSV (~90K rows), then broke
+   ("ParserError: EOF inside string") reading it back from the ~2.7M-row
+   concatenated messages.csv features/message_reassembly.py produces -
+   same string content, only the file scale differed. Rather than chase
+   the exact pandas/CSV large-file quirk, decoded text never contains a
+   raw newline in the first place - sidesteps the whole bug class.
 """
+import re
 
 # ---------------------------------------------------------------------------
 # GSM 03.38 default alphabet + septet unpacking
@@ -144,6 +158,18 @@ def decode_utf16be(payload: bytes) -> str | None:
         return None
 
 
+def _sanitize_for_storage(text: str | None) -> str | None:
+    """Collapse embedded \\r\\n / \\r / \\n into a single space - see the
+    module docstring for why this exists (real, correctly-decoded text can
+    contain these; storing them raw in a CSV field is what's fragile, not
+    the decode). Runs of whitespace this creates are left as-is - this is
+    a minimal fix for the newline-in-CSV problem specifically, not a
+    general text-normalization pass."""
+    if text is None:
+        return None
+    return re.sub(r"\r\n|\r|\n", " ", text)
+
+
 def _printable_score(text: str | None) -> float:
     """Fraction of characters that are printable, excluding the unmapped-
     code placeholder so a bad GSM-7 decode full of undefined codes can't
@@ -233,13 +259,18 @@ def decode_by_dcs(payload: bytes, dcs: int | None, *, source: str) -> tuple[str 
 
     if dcs_int in ambiguous:
         text, codec = _best_of(payload, ambiguous[dcs_int], funcs)
-        return text, f"{codec}(auto)" if codec else None
-
-    if dcs_int in table:
+        codec_used = f"{codec}(auto)" if codec else None
+    elif dcs_int in table:
         codec = table[dcs_int]
-        return funcs[codec](payload), codec
+        text, codec_used = funcs[codec](payload), codec
+    else:
+        # Unmapped DCS - don't guess a single default, score every codec
+        # this source supports and keep the most legible result.
+        text, codec = _best_of(payload, funcs.keys(), funcs)
+        codec_used = f"{codec}(auto)" if codec else None
 
-    # Unmapped DCS - don't guess a single default, score every codec this
-    # source supports and keep the most legible result.
-    text, codec = _best_of(payload, funcs.keys(), funcs)
-    return text, f"{codec}(auto)" if codec else None
+    # Scoring above (_best_of/_printable_score) runs on the RAW decoded
+    # text on purpose - sanitizing first would penalize a legitimately
+    # multi-line message's score for no reason. Only the final returned
+    # text is sanitized - see module docstring / _sanitize_for_storage.
+    return _sanitize_for_storage(text), codec_used

@@ -58,6 +58,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from common.schemas import verify_csv_roundtrip
 from ingestion.run_ingest import load_features_csv
 
 REQUIRED_FEATURE_COLS = [
@@ -226,6 +227,12 @@ def run_reassembly(features_dir: Path, labels_dir: Path, out_path: Path) -> pd.D
     out_path.parent.mkdir(parents=True, exist_ok=True)
     messages.to_csv(out_path, index=False)
     print(f"Wrote {len(messages)} rows to {out_path}")
+    # Catches CSV write/round-trip corruption right here, same run - see
+    # common/schemas.py's verify_csv_roundtrip() docstring for the real
+    # bug (a 2.7M-row messages.csv that silently corrupted) this exists
+    # because of.
+    verify_csv_roundtrip(messages, out_path)
+    print("Verified: reads back cleanly.")
     return messages
 
 

@@ -39,6 +39,12 @@ SMPP's convention (concat_total_parts=1, concat_part_num=1, concat_ref=None).
 """
 import pandas as pd
 
+from common.schemas import (
+    CANONICAL_FEATURE_SCHEMA,
+    CANONICAL_LABEL_SCHEMA,
+    validate_features,
+    validate_labels,
+)
 from ingestion.dcs_codecs import decode_by_dcs
 from labels.rule_labels import build_rule_labels, is_rule_evaluated
 
@@ -233,6 +239,15 @@ FEATURE_MAP = {
 #                                      reasoning as SMPP's sar_ref/
 #                                      sar_msg_parts/sar_msg_part).
 
+# Schema validation, wired into map_to_canonical() below - see
+# ingestion/smpp.py's REQUIRED_FEATURE_COLS comment for why this exists.
+# Unlike SMPP, SS7 DOES populate message_id (FEATURE_MAP["message_id"] =
+# "reference") - so features require the full schema. Labels still exclude
+# message_id: label_source only ever sets record_id, for both sources
+# (see map_to_canonical() below), never message_id.
+REQUIRED_FEATURE_COLS = list(CANONICAL_FEATURE_SCHEMA)
+REQUIRED_LABEL_COLS = [c for c in CANONICAL_LABEL_SCHEMA if c != "message_id"]
+
 # See ingestion/smpp.py's LABEL_SOURCE_COLS docstring - same purpose here:
 # raw ingredients for labels/rule_labels.py only, never returned as-is, and
 # NEVER read by the unsupervised layer - fraud_type/decision/rule/status
@@ -277,4 +292,7 @@ def map_to_canonical(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     label_source["rule_flagged"] = build_rule_labels(raw_label_cols).where(
         label_source["rule_evaluated"]
     )
+
+    validate_features(features, required=REQUIRED_FEATURE_COLS)
+    validate_labels(label_source, required=REQUIRED_LABEL_COLS)
     return features, label_source

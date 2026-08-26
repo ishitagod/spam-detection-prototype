@@ -198,5 +198,26 @@ def test_rule_evaluated_and_flagged_computed_end_to_end(labels):
     assert unevaluated["rule_flagged"].isna().all()
 
 
+# ---------------------------------------------------------------------------
+# Schema validation tripwire - proves map_to_canonical() actually catches
+# column drift, not just that it doesn't false-positive on the real shape
+# above. See ingestion/smpp.py's REQUIRED_FEATURE_COLS comment.
+# ---------------------------------------------------------------------------
+
+def test_map_to_canonical_raises_if_a_feature_mapping_breaks(cleaned, monkeypatch):
+    """Simulates a FEATURE_MAP edit that silently drops a required raw
+    column (e.g. a typo'd source column name) - map_to_canonical() must
+    fail loudly here, not hand back a features frame that's silently
+    missing a canonical column."""
+    import ingestion.smpp as smpp_module
+
+    broken_map = dict(smpp_module.FEATURE_MAP)
+    del broken_map["originator"]
+    monkeypatch.setattr(smpp_module, "FEATURE_MAP", broken_map)
+
+    with pytest.raises(ValueError, match="originator"):
+        smpp_module.map_to_canonical(cleaned)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

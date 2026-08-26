@@ -158,5 +158,21 @@ def test_multipart_row_uses_sarref_msg_part_msg_parts():
     assert r["concat_part_num"] == 4
 
 
+# ---------------------------------------------------------------------------
+# Schema validation tripwire - see ingestion/ss7.py's REQUIRED_FEATURE_COLS
+# comment and tests/test_smpp_ingestion.py's matching test.
+# ---------------------------------------------------------------------------
+
+def test_map_to_canonical_raises_if_a_feature_mapping_breaks(cleaned, monkeypatch):
+    import ingestion.ss7 as ss7_module
+
+    broken_map = dict(ss7_module.FEATURE_MAP)
+    del broken_map["message_id"]
+    monkeypatch.setattr(ss7_module, "FEATURE_MAP", broken_map)
+
+    with pytest.raises(ValueError, match="message_id"):
+        ss7_module.map_to_canonical(cleaned)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

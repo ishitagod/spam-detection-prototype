@@ -27,6 +27,14 @@ from ingestion.dcs_codecs import (
     decode_utf16be,
 )
 
+
+def _pack_septets(codes: list[int]) -> bytes:
+    """Inverse of dcs_codecs._unpack_septets(), for building synthetic
+    packed-septet test payloads from known GSM 03.38 codes."""
+    bits = "".join(f"{c:07b}"[::-1] for c in codes)
+    bits += "0" * ((-len(bits)) % 8)
+    return bytes(int(bits[i:i + 8][::-1], 2) for i in range(0, len(bits), 8))
+
 # Real op-4 SMPP payload (UDH already stripped), dcs unsigned 241 -> "gsm7"
 # per SMPP_DCS_TABLE. SMPP stores GSM-7 content pre-unpacked (1 byte/char),
 # NOT packed septets - this is the fixture that proves it.
@@ -143,6 +151,44 @@ def test_empty_payload_returns_none_none_regardless_of_dcs():
 def test_unknown_source_raises():
     with pytest.raises(ValueError):
         decode_by_dcs(b"hi", 0, source="XYZ")
+
+
+# ---------------------------------------------------------------------------
+# Newline sanitization - real-data-motivated (see ingestion/dcs_codecs.py's
+# module docstring): GSM 03.38 legitimately maps 0x0A/0x0D to '\n'/'\r', and
+# a real SS7 multi-line message decoded fine but corrupted the CSV round-trip
+# once concatenated to full dataset scale ("ParserError: EOF inside string").
+# decode_by_dcs() must never return a raw \r or \n, regardless of codec.
+# ---------------------------------------------------------------------------
+
+def test_smpp_latin1_path_collapses_embedded_crlf_to_space():
+    # dcs=241 -> "gsm7" -> decode_latin1 for SMPP (see module docstring) -
+    # byte 0x0D/0x0A decode directly to '\r'/'\n' via plain latin-1.
+    text, codec = decode_by_dcs(b"hi\r\nbye", 241, source="SMPP")
+    assert codec == "gsm7"
+    assert text == "hi bye"
+    assert "\r" not in text and "\n" not in text
+
+
+def test_ss7_packed_septet_path_collapses_embedded_linefeed_to_space():
+    # 'A' (0x41), LF (0x0A), 'B' (0x42) as packed septets - the actual
+    # mechanism a real multi-line SS7 message hit.
+    payload = _pack_septets([0x41, 0x0A, 0x42])
+    text, codec = decode_by_dcs(payload, 192, source="SS7")
+    assert codec == "gsm7"
+    assert text == "A B"
+    assert "\n" not in text
+
+
+def test_sanitization_does_not_affect_autodetect_scoring():
+    """The auto-detect winner must be chosen from the RAW decode (so a
+    legitimately multi-line message doesn't get penalized for containing
+    \\n) - sanitization only happens to the final returned text, after the
+    winning codec is already picked. Regression check against the existing
+    real-sample auto-detect behavior."""
+    text, codec = decode_by_dcs(SS7_GSM7_PACKED_PAYLOAD, 1, source="SS7")
+    assert codec == "gsm7(auto)"
+    assert text == "Good Morning Cherima "  # unchanged - no \r/\n in this sample
 
 
 if __name__ == "__main__":

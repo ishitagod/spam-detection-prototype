@@ -39,6 +39,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from common.schemas import verify_csv_roundtrip
 from ingestion import smpp, ss7
 from ingestion.base import SourceHandlers
 
@@ -90,6 +91,11 @@ def ingest_file(csv_path: Path, source: str, out_dir: Path) -> dict:
 
     features.to_csv(features_out, index=False)
     label_source.to_csv(labels_out, index=False)
+    # Catches CSV write/round-trip corruption at the file it happened in,
+    # same run - see common/schemas.py's verify_csv_roundtrip() docstring
+    # for the real bug this exists because of.
+    verify_csv_roundtrip(features, features_out)
+    verify_csv_roundtrip(label_source, labels_out)
 
     return {
         "file": csv_path.name,
@@ -148,10 +154,24 @@ def run_ingestion(
         print("\nNothing ingested.")
         return pd.DataFrame()
 
-    manifest = pd.DataFrame(manifest_rows)[
+    new_manifest = pd.DataFrame(manifest_rows)[
         ["source", "file", "raw_rows", "kept_rows", "rule_evaluated", "rule_flagged"]
     ]
     manifest_path = out_dir / "ingestion_manifest.csv"
+
+    # MERGE with any existing manifest, replacing only the row(s) for the
+    # source(s) just (re-)processed - a real bug this fixes: running
+    # `--source SMPP` then separately `--source SS7` used to blindly
+    # overwrite the whole file each time, so the second run silently wiped
+    # out the first run's rows (caught by notebooks/pipeline_sanity_check.
+    # ipynb's row-count conservation check: manifest showed 0 SMPP rows
+    # after re-ingesting both sources one at a time).
+    if manifest_path.exists():
+        existing = pd.read_csv(manifest_path)
+        existing = existing[~existing["source"].isin(sources)]
+        manifest = pd.concat([existing, new_manifest], ignore_index=True)
+    else:
+        manifest = new_manifest
     manifest.to_csv(manifest_path, index=False)
 
     print(f"\nTotals:")
