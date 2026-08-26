@@ -11,6 +11,7 @@ Run:
     pytest tests/test_text_embeddings.py -v
 """
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from features.text_embeddings import compute_message_embeddings, embed_texts
+from features.text_embeddings import (
+    _select_device,
+    compute_message_embeddings,
+    embed_texts,
+)
 
 DIM = 4
 
@@ -45,7 +50,7 @@ class FakeModel:
             vectors.append(rng.rand(DIM).astype(np.float32))
         return np.array(vectors, dtype=np.float32) if vectors else np.zeros((0, DIM), dtype=np.float32)
 
-    def get_sentence_embedding_dimension(self):
+    def get_embedding_dimension(self):
         return DIM
 
 
@@ -133,6 +138,38 @@ def test_embed_texts_empty_input_returns_zero_rows_correct_dim():
 def test_embed_texts_output_is_float32():
     result = embed_texts(["hello", "world"], model=FakeModel())
     assert result.dtype == np.float32
+
+
+def _fake_torch(cuda_available: bool) -> types.ModuleType:
+    fake = types.ModuleType("torch")
+    fake.cuda = types.SimpleNamespace(is_available=lambda: cuda_available)
+    return fake
+
+
+# _select_device tested DIRECTLY (unlike everything above, which only goes
+# through the public API) - the whole point of this file's FakeModel
+# pattern is avoiding a real model load, but _get_model()/_select_device
+# are exactly the code path a real (non-injected) run takes BEFORE a model
+# object exists, so there's no way to reach it through embed_texts()'s
+# `model=` injection without actually loading real weights. Torch is
+# faked via sys.modules too (not assumed installed) - same reasoning.
+def test_select_device_returns_explicit_request_without_importing_torch(monkeypatch):
+    """An explicit request must short-circuit before ever touching torch -
+    setting sys.modules['torch'] = None makes any `import torch` raise,
+    so this proves the guard rather than just happening to pass."""
+    monkeypatch.setitem(sys.modules, "torch", None)
+    assert _select_device("cpu") == "cpu"
+    assert _select_device("cuda") == "cuda"
+
+
+def test_select_device_auto_detects_cuda_when_available(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(cuda_available=True))
+    assert _select_device(None) == "cuda"
+
+
+def test_select_device_falls_back_to_cpu_when_cuda_unavailable(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(cuda_available=False))
+    assert _select_device(None) == "cpu"
 
 
 if __name__ == "__main__":

@@ -1,23 +1,12 @@
 """
-Text embeddings: turns each logical message's `text` into a fixed-length
-vector that captures MEANING, not literal characters - "WIN A PRIZE NOW"
-and "You've won a prize!!" end up close together in this vector space
-even though the strings barely share any characters. Downstream
-consumers, per CLAUDE.md's roadmap:
-  - a FAISS near-duplicate index (not yet built) - nearest-neighbor
-    search over these vectors, for burst/campaign detection.
-  - Isolation Forest (not yet built) - scores [embedding + behavioral
-    features] jointly, per docs/feature_catalog.md and README.md's
-    modeling plan.
+Text embeddings: turns message's `text` into a fixed-length
+vector that captures MEANING, not literal characters.
 Both consume the SAME embeddings computed here rather than each
 re-encoding text independently - one model, one pass, two downstream
 readers. This is exactly why it's its own step rather than being folded
 into either consumer (see CLAUDE.md's roadmap note).
 
-MODEL: `all-MiniLM-L6-v2` via sentence-transformers
-(config/settings.py's TEXT_EMBEDDING_MODEL) - prototype choice, smallest
-footprint of the candidates evaluated (Distil-mBERT/XLM-R are production
-options, not used here). Embeddings are L2-normalized at encode time, so
+MODEL: `all-MiniLM-L6-v2` via sentence-transformers. Embeddings are L2-normalized at encode time, so
 cosine similarity downstream reduces to a plain dot product - what
 FAISS's inner-product index types expect.
 
@@ -33,16 +22,11 @@ few hundred thousand distinct strings and encoding all 8mm+ rows.
 
 WHAT THIS DOES NOT DO: build the FAISS index itself, or train anything -
 purely produces the embeddings matrix + a row-aligned identity map for
-downstream steps to consume. It also does not run through Feast/get
-served online, unlike sender-behavioral features - a message's embedding
-is a pure function of ITS OWN text (no sender history needed), so at
-real inference time the future FastAPI service just calls embed_texts()
-directly on the one incoming message. Nothing to precompute per sender
-ahead of time.
+downstream steps to consume.
 """
+
 import argparse
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
@@ -56,15 +40,37 @@ _model = None  # lazily loaded, process-wide cache - loading weights off
 # FastAPI service (encoding one live message per request) share this.
 
 
-def _get_model():
+def _select_device(requested: str | None) -> str:
+    """
+    Explicit device choice, not left to sentence-transformers' silent
+    auto-detection.
+    """
+    if requested:
+        return requested
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _get_model(device: str | None = None):
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(TEXT_EMBEDDING_MODEL)
+
+        resolved_device = _select_device(device)
+        print(
+            f"  text_embeddings: loading {TEXT_EMBEDDING_MODEL} on device={resolved_device}"
+        )
+        _model = SentenceTransformer(TEXT_EMBEDDING_MODEL, device=resolved_device)
     return _model
 
 
-def embed_texts(texts, batch_size: int = TEXT_EMBEDDING_BATCH_SIZE, model=None) -> np.ndarray:
+def embed_texts(
+    texts,
+    batch_size: int = TEXT_EMBEDDING_BATCH_SIZE,
+    model=None,
+    device: str | None = None,
+) -> np.ndarray:
     """
     Low-level, reusable encoder: any list/array/Series of strings in,
     float32 (N, D) L2-normalized embeddings out. No dedup here - that's
@@ -73,19 +79,16 @@ def embed_texts(texts, batch_size: int = TEXT_EMBEDDING_BATCH_SIZE, model=None) 
     inference request has nothing to dedup against.
 
     `model` is injectable (any object exposing sentence-transformers'
-    `.encode()` interface) specifically so tests never need to load real
-    weights just to exercise the surrounding pipeline logic - see
-    tests/test_text_embeddings.py's fake model.
+    `.encode()`/`.get_embedding_dimension()` interface) specifically so
+    tests never need to load real weights just to exercise the
+    surrounding pipeline logic - see tests/test_text_embeddings.py's fake
+    model. `device` is ignored when `model` is injected (the caller
+    already controls that object).
     """
-    model = model or _get_model()
+    model = model or _get_model(device)
     texts = list(texts)
     if not texts:
-        # Try the current sentence-transformers 6.x name first, fall back
-        # to the deprecated one - kept for compatibility with any
-        # injected test double (tests/test_text_embeddings.py's
-        # FakeModel) that only implements the older interface.
-        get_dim = getattr(model, "get_embedding_dimension", None) or model.get_sentence_embedding_dimension
-        return np.zeros((0, get_dim()), dtype=np.float32)
+        return np.zeros((0, model.get_embedding_dimension()), dtype=np.float32)
     embeddings = model.encode(
         texts,
         batch_size=batch_size,
@@ -97,7 +100,7 @@ def embed_texts(texts, batch_size: int = TEXT_EMBEDDING_BATCH_SIZE, model=None) 
 
 
 def compute_message_embeddings(
-    messages: pd.DataFrame, model=None
+    messages: pd.DataFrame, model=None, device: str | None = None
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """
     Returns (embeddings, id_map):
@@ -128,15 +131,17 @@ def compute_message_embeddings(
         f"  {n} message(s), {len(uniques)} distinct text(s) "
         f"({len(uniques) / max(n, 1):.1%} unique)"
     )
-    unique_embeddings = embed_texts(uniques, model=model)
+    unique_embeddings = embed_texts(uniques, model=model, device=device)
     embeddings = unique_embeddings[codes]
 
-    id_map = pd.DataFrame({
-        "message_key": df["source"] + "|" + df["record_id"],
-        "source": df["source"],
-        "record_id": df["record_id"],
-        "timestamp": df["timestamp"],
-    })
+    id_map = pd.DataFrame(
+        {
+            "message_key": df["source"] + "|" + df["record_id"],
+            "source": df["source"],
+            "record_id": df["record_id"],
+            "timestamp": df["timestamp"],
+        }
+    )
     return embeddings, id_map
 
 
@@ -146,16 +151,15 @@ def run_text_embeddings(
     model=None,
     sample_n: int | None = None,
     seed: int = 42,
+    device: str | None = None,
 ) -> None:
     """
     `sample_n`: encode a random sample of this many rows instead of the
-    full file - real wall-clock cost here is ~14ms PER DISTINCT TEXT on
-    CPU (measured, not estimated), so the full ~8.2M-row dataset is a
-    ~21hr job. Prototype-scale default is to sample, and only commit to
-    a full run once the downstream FAISS/Isolation Forest steps have
-    validated the approach - see CLAUDE.md's roadmap. `seed` makes the
-    sample reproducible run to run (same rows every time, not a fresh
-    random draw each call).
+    full file. Prototype-scale default is to sample, and only commit to a full run
+    once the downstream FAISS/Isolation Forest steps have validated the
+    approach - see CLAUDE.md's roadmap. `seed` makes the sample
+    reproducible run to run (same rows every time, not a fresh random
+    draw each call).
     """
     messages_path = Path(messages_path)
     if not messages_path.exists():
@@ -164,7 +168,8 @@ def run_text_embeddings(
 
     print(f"Loading {messages_path} ...")
     messages = pd.read_csv(
-        messages_path, low_memory=False,
+        messages_path,
+        low_memory=False,
         usecols=lambda c: c in set(REQUIRED_COLS),
     )
     total_rows = len(messages)
@@ -177,7 +182,9 @@ def run_text_embeddings(
         )
 
     print(f"Computing embeddings for {len(messages)} message(s) ...")
-    embeddings, id_map = compute_message_embeddings(messages, model=model)
+    embeddings, id_map = compute_message_embeddings(
+        messages, model=model, device=device
+    )
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -207,22 +214,88 @@ def run_text_embeddings(
 
 
 def main():
+    # SOURCES imported lazily (not at module top) so importing
+    # text_embeddings.py for its functions doesn't also pull in
+    # ingestion.run_ingest's pandas/ingestion-handler machinery unless
+    # main() actually runs.
+    from ingestion.run_ingest import SOURCES
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--messages_path", type=str,
-        default="data/processed/SMPP/messages_with_behavioral.csv",
+        "--messages_path",
+        type=str,
+        default=None,
+        help="Explicit path to one messages_with_behavioral.csv, run exactly "
+        "against that one file (requires --out_dir too). Default: unset - "
+        "runs every source in ingestion.run_ingest.SOURCES (SMPP and SS7 "
+        "today) under --processed_dir instead, same layout pipeline.py uses, "
+        "so no explicit path is needed to cover both.",
     )
-    parser.add_argument("--out_dir", type=str, default="data/processed/SMPP")
     parser.add_argument(
-        "--sample_n", type=int, default=None,
+        "--out_dir",
+        type=str,
+        default=None,
+        help="Output directory for the --messages_path run above. Required "
+        "if --messages_path is given, ignored otherwise.",
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        choices=list(SOURCES.keys()),
+        default=None,
+        help="Only run one source under --processed_dir. Default: every "
+        f"source ({list(SOURCES.keys())}). Ignored if --messages_path is given.",
+    )
+    parser.add_argument(
+        "--processed_dir",
+        type=str,
+        default="data/processed",
+        help="Root of data/processed/<SOURCE>/... - used when --messages_path "
+        "isn't given (see that flag).",
+    )
+    parser.add_argument(
+        "--sample_n",
+        type=int,
+        default=None,
         help="Encode a random sample of this many rows instead of the full file (see module docstring).",
     )
     parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-    run_text_embeddings(
-        Path(args.messages_path), Path(args.out_dir),
-        sample_n=args.sample_n, seed=args.seed,
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        choices=["cuda", "cpu"],
+        help="Force a device instead of auto-detecting (see _select_device). "
+        "Default: use CUDA if available, else CPU.",
     )
+    args = parser.parse_args()
+
+    if args.messages_path:
+        if not args.out_dir:
+            parser.error("--out_dir is required when --messages_path is given")
+        run_text_embeddings(
+            Path(args.messages_path),
+            Path(args.out_dir),
+            sample_n=args.sample_n,
+            seed=args.seed,
+            device=args.device,
+        )
+        return
+
+    # No explicit path - run every source (or just --source, if given)
+    # under --processed_dir, same data/processed/<SOURCE>/... layout
+    # pipeline.py's own per-source loop uses.
+    processed_dir = Path(args.processed_dir)
+    sources = [args.source] if args.source else list(SOURCES.keys())
+    for source in sources:
+        print(f"\n-- {source} --")
+        run_text_embeddings(
+            processed_dir / source / "messages_with_behavioral.csv",
+            processed_dir / source,
+            sample_n=args.sample_n,
+            seed=args.seed,
+            device=args.device,
+        )
 
 
 if __name__ == "__main__":
