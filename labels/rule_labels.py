@@ -86,10 +86,23 @@ def is_rule_evaluated(label_source_df: pd.DataFrame) -> pd.Series:
     signal (see ingestion/smpp.py's LABEL_SOURCE_COLS comment). `rule` is
     then used only to subtract whitelist bypasses out of that pool -
     `rule_name` isn't needed for anything here.
+
+    ONLY decision in {0, 1} counts as evaluated - real SS7 data has 11
+    distinct `decision` codes, not just 0/1 (0: 13.2M, 1: 824,765, plus 9
+    other codes totalling 634,783 rows - 6, 27, 13, 32, 31, 5, 3, 34, 9,
+    36). Checked: EVERY one of those 634,783 other-code rows has
+    fraud_type == NaN - none are ever labelled spam, so restricting to
+    {0, 1} costs zero real positive examples. Without this restriction
+    they'd all fall into the "confirmed clean" bucket by default (fraud_type
+    != "spam"), which is not a trustworthy negative - decision=0
+    specifically means "rule engine confident not spam"; these other codes
+    are a different, unconfirmed signal (SMPP never hits this - its
+    `decision` is already only ever 0, 1, or blank).
     """
     if "decision" not in label_source_df.columns:
         raise ValueError("label_source_df has no `decision` column")
-    evaluated = label_source_df["decision"].notna()
+    decision = pd.to_numeric(label_source_df["decision"], errors="coerce")
+    evaluated = decision.isin([0, 1])
     if "rule" in label_source_df.columns:
         whitelist_only = label_source_df["rule"].astype("string").str.startswith(
             WHITELIST_RULE_PREFIX, na=False

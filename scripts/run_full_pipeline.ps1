@@ -17,12 +17,20 @@
 #   .\scripts\run_full_pipeline.ps1 -StartAt 2   # skip step 1 (embeddings) -
 #                                                 # e.g. already computed and
 #                                                 # you're just re-running FAISS on
+#   .\scripts\run_full_pipeline.ps1 -FaissGpu    # use GPU faiss for steps 2/3
+#                                                 # (see requirements-gpu.txt)
 
 param(
     [double]$MinImprovement = 0.0,
-    [int]$StartAt = 1  # first step NUMBER to actually run - earlier steps are
-                        # printed as SKIPPED, not executed. Use when a step's
-                        # output already exists on disk from a prior run.
+    [int]$StartAt = 1,  # first step NUMBER to actually run - earlier steps are
+                         # printed as SKIPPED, not executed. Use when a step's
+                         # output already exists on disk from a prior run.
+    [switch]$FaissGpu   # pass --gpu to the FAISS steps (2/8, 3/8). Off by
+                         # default - requires requirements-gpu.txt installed
+                         # (see that file; UNTESTED as of writing). Safe to
+                         # try even if not installed - features/faiss_index.py
+                         # detects a missing GPU build and falls back to CPU
+                         # with a printed message rather than failing.
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,18 +71,20 @@ function Step {
     }
 }
 
+$FaissGpuArgs = if ($FaissGpu) { @("--gpu") } else { @() }
+
 Push-Location $ProjectRoot
 try {
     Step -Number 1 -Name "1/8 Text embeddings - full, both sources (SMPP + SS7)" `
         -PyArgs @("-m", "features.text_embeddings", "--processed_dir", "data/processed", "--device", "cuda")
 
     Step -Number 2 -Name "2/8 FAISS near-dup - SMPP" `
-        -PyArgs @("-m", "features.faiss_index", "--source_dir", "data/processed/SMPP")
+        -PyArgs (@("-m", "features.faiss_index", "--source_dir", "data/processed/SMPP") + $FaissGpuArgs)
 
     Step -Number 3 -Name "3/8 FAISS near-dup - SS7" `
-        -PyArgs @("-m", "features.faiss_index", "--source_dir", "data/processed/SS7",
+        -PyArgs (@("-m", "features.faiss_index", "--source_dir", "data/processed/SS7",
           "--messages_path", "data/processed/SS7/messages_with_behavioral.csv",
-          "--out_path", "data/processed/SS7/faiss_output.parquet")
+          "--out_path", "data/processed/SS7/faiss_output.parquet") + $FaissGpuArgs)
 
     Step -Number 4 -Name "4/8 Isolation Forest (anomaly_score)" `
         -PyArgs @("-m", "models.anomaly.train")

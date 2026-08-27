@@ -34,10 +34,11 @@ def unit_vec(cos_sim: float) -> np.ndarray:
 BASE = unit_vec(1.0)  # dot with itself/identical vectors = 1.0
 
 
-def run(embeddings, rows, threshold=THRESHOLD, windows=WINDOWS):
+def run(embeddings, rows, threshold=THRESHOLD, windows=WINDOWS, use_gpu=False):
     id_map = pd.DataFrame(rows)
     return compute_near_dup_features(
         np.array(embeddings, dtype=np.float32), id_map, threshold=threshold, windows=windows,
+        use_gpu=use_gpu,
     )
 
 
@@ -57,6 +58,21 @@ def test_no_match_within_threshold_gives_zero():
 def test_single_message_never_matches_itself():
     result = run([BASE], [row("m1")])
     assert result.iloc[0]["near_dup_match_count_w"] == 0
+
+
+def test_use_gpu_falls_back_to_cpu_when_faiss_gpu_not_installed():
+    """This sandbox has faiss-cpu (requirements.txt default), which has
+    no faiss.StandardGpuResources - use_gpu=True must degrade to the
+    CPU index cleanly rather than crash, and produce the SAME result as
+    the CPU path (see _to_gpu()'s docstring)."""
+    embeddings = [BASE, unit_vec(1.0)]
+    rows = [
+        row("m1", timestamp="2026-08-19T10:00:00"),
+        row("m2", timestamp="2026-08-19T10:05:00"),
+    ]
+    cpu_result = run(embeddings, rows, use_gpu=False)
+    gpu_result = run(embeddings, rows, use_gpu=True)
+    pd.testing.assert_frame_equal(cpu_result, gpu_result)
 
 
 def test_earlier_near_dup_is_counted_for_the_later_message():

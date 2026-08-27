@@ -38,11 +38,18 @@ def label_source() -> pd.DataFrame:
         # decision is a more complete "touched" signal than rule/rule_name,
         # so this must still count as evaluated even without a rule id.
         {"decision": 0, "rule": None, "rule_name": None, "fraud_type": None},
+        # 6: decision is a real, non-blank value but NOT 0 or 1 - real SS7
+        # data has 9 other decision codes (6, 27, 13, 32, 31, 5, 3, 34, 9,
+        # 36) that are NOT the confirmed-clean(0)/flagged(1) binary SMPP
+        # uses; every one of those rows has fraud_type==NaN in real data,
+        # so must NOT count as evaluated (would otherwise be a fabricated
+        # "confirmed clean" negative).
+        {"decision": 6, "rule": None, "rule_name": None, "fraud_type": None},
     ])
 
 
 def test_is_rule_evaluated_true_for_real_rule_hit(label_source):
-    assert is_rule_evaluated(label_source).tolist() == [True, False, False, True, True, True]
+    assert is_rule_evaluated(label_source).tolist() == [True, False, False, True, True, True, False]
 
 
 def test_is_rule_evaluated_true_for_decision_only_with_blank_rule(label_source):
@@ -60,12 +67,21 @@ def test_is_rule_evaluated_excludes_whitelist_only_rows(label_source):
     assert is_rule_evaluated(label_source).iloc[2] == False
 
 
+def test_is_rule_evaluated_excludes_non_binary_decision_codes(label_source):
+    """Row 6: decision=6 - a real, non-blank SS7 decision code that isn't
+    the confirmed-clean(0)/flagged(1) pair. Must NOT count as evaluated:
+    every real row with a decision outside {0, 1} has fraud_type==NaN, so
+    including them would fabricate a "confirmed clean" negative out of an
+    unconfirmed signal."""
+    assert is_rule_evaluated(label_source).iloc[6] == False
+
+
 def test_build_rule_labels_flags_fraud_type_spam_specifically(label_source):
     """Positive label is fraud_type=='spam', not decision==1 - decision==1
     covers other fraud categories too (row 4: generic), which must NOT be
     treated as spam-positive for this project."""
     flagged = build_rule_labels(label_source)
-    assert flagged.tolist() == [True, False, False, False, False, False]
+    assert flagged.tolist() == [True, False, False, False, False, False, False]
 
 
 def test_decision_equals_one_is_not_sufficient_for_flagged(label_source):

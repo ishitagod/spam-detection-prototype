@@ -83,13 +83,45 @@ DEFAULT_WINDOWS = {
 }
 
 
-def build_index(embeddings: np.ndarray) -> "faiss.Index":
+_gpu_resources = None  # lazily created, process-wide - one GPU resource
+# pool reused across every chunk's index build, not re-allocated per call.
+
+
+def _to_gpu(index: "faiss.Index") -> "faiss.Index":
+    """
+    Moves a CPU FAISS index onto GPU 0 - only if a GPU-enabled faiss
+    build is actually installed. requirements.txt pins faiss-cpu by
+    default (works everywhere, incl. this sandbox); requirements-gpu.txt
+    swaps in a GPU build on a machine that has one - see that file's
+    comments, package naming has moved around across faiss releases.
+    faiss-cpu has no `StandardGpuResources` attribute at all, so this
+    degrades to the CPU index with a clear print rather than crashing -
+    same "disclose, don't fake certainty" principle as
+    text_embeddings.py's sample-info file.
+    """
+    global _gpu_resources
+    if not hasattr(faiss, "StandardGpuResources"):
+        print("  --gpu requested but faiss-gpu isn't installed (faiss.StandardGpuResources missing) - using CPU index.")
+        return index
+    if _gpu_resources is None:
+        _gpu_resources = faiss.StandardGpuResources()
+    try:
+        return faiss.index_cpu_to_gpu(_gpu_resources, 0, index)
+    except Exception as e:
+        print(f"  Could not move FAISS index to GPU ({e}) - using CPU index.")
+        return index
+
+
+def build_index(embeddings: np.ndarray, use_gpu: bool = False) -> "faiss.Index":
     """Flat inner-product index - exact search, no approximation. Fine at
     the scale compute_near_dup_features_chunked() bounds each call to
     (chunk_size + buffer, not the full corpus); revisit (e.g. IVF) only
     if benchmarking at that bounded scale shows it's actually needed -
-    IVF's benefit shrinks once chunking already keeps N small."""
+    IVF's benefit shrinks once chunking already keeps N small.
+    `use_gpu`: see _to_gpu() - falls back to CPU cleanly if unavailable."""
     index = faiss.IndexFlatIP(embeddings.shape[1])
+    if use_gpu:
+        index = _to_gpu(index)
     index.add(embeddings)
     return index
 
@@ -99,6 +131,7 @@ def compute_near_dup_features(
     id_map: pd.DataFrame,
     threshold: float = FAISS_NEAR_DUP_THRESHOLD,
     windows: dict[str, np.timedelta64] | None = None,
+    use_gpu: bool = False,
 ) -> pd.DataFrame:
     """
     `id_map` must have `message_key`, `originator`, `timestamp` - same
@@ -106,6 +139,7 @@ def compute_near_dup_features(
     `windows`: name -> trailing-window duration (defaults to
     DEFAULT_WINDOWS, the configured 1hr/24hr pair). Returns one row per
     input message, same order, with 3 near_dup_* columns per window.
+    `use_gpu`: see build_index()/_to_gpu().
     """
     windows = windows if windows is not None else DEFAULT_WINDOWS
     missing = [c for c in REQUIRED_ID_MAP_COLS if c not in id_map.columns]
@@ -116,8 +150,20 @@ def compute_near_dup_features(
     timestamps = pd.to_datetime(id_map["timestamp"]).to_numpy()
     originators = id_map["originator"].astype(str).to_numpy()
 
-    index = build_index(embeddings)
-    lims, sims, matches = index.range_search(embeddings, threshold)
+    index = build_index(embeddings, use_gpu=use_gpu)
+    try:
+        lims, sims, matches = index.range_search(embeddings, threshold)
+    except RuntimeError as e:
+        # Not every GPU faiss build/index type supports range_search
+        # (unlike CPU FlatIP, which always does) - this whole feature
+        # depends on range_search specifically (see module docstring on
+        # why, vs. a fixed top-K), so retry on CPU rather than crash the
+        # whole pipeline over a GPU-search gap.
+        if not use_gpu:
+            raise
+        print(f"  GPU index.range_search failed ({e}) - retrying this chunk on CPU.")
+        index = build_index(embeddings, use_gpu=False)
+        lims, sims, matches = index.range_search(embeddings, threshold)
 
     columns = {"message_key": id_map["message_key"].to_numpy()}
     for name in windows:
@@ -153,6 +199,7 @@ def compute_near_dup_features_chunked(
     chunk_size: int = FAISS_CHUNK_SIZE,
     threshold: float = FAISS_NEAR_DUP_THRESHOLD,
     windows: dict[str, np.timedelta64] | None = None,
+    use_gpu: bool = False,
 ) -> pd.DataFrame:
     """
     Same output as compute_near_dup_features() (verified equal in
@@ -201,6 +248,7 @@ def compute_near_dup_features_chunked(
             sorted_id_map.iloc[buffer_start:chunk_end].reset_index(drop=True),
             threshold=threshold,
             windows=windows,
+            use_gpu=use_gpu,
         )
         chunk_offset = (
             pos - buffer_start
@@ -225,6 +273,7 @@ def run_faiss_near_dup(
     messages_path: Path,
     out_path: Path,
     chunk_size: int = FAISS_CHUNK_SIZE,
+    use_gpu: bool = False,
 ) -> None:
     """
     `source_dir` must already contain embeddings.npy + embeddings_id_map.parquet
@@ -257,10 +306,11 @@ def run_faiss_near_dup(
     )
 
     print(
-        f"Computing near-dup features for {len(id_map)} message(s) (chunk_size={chunk_size}) ..."
+        f"Computing near-dup features for {len(id_map)} message(s) "
+        f"(chunk_size={chunk_size}, use_gpu={use_gpu}) ..."
     )
     result = compute_near_dup_features_chunked(
-        embeddings, id_map, chunk_size=chunk_size
+        embeddings, id_map, chunk_size=chunk_size, use_gpu=use_gpu
     )
 
     out_path = Path(out_path)
@@ -286,12 +336,20 @@ def main():
         "--out_path", type=str, default="data/processed/SMPP/faiss_output.parquet"
     )
     parser.add_argument("--chunk_size", type=int, default=FAISS_CHUNK_SIZE)
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Use GPU FAISS if installed (see requirements-gpu.txt) - falls "
+        "back to CPU automatically, with a printed message, if a GPU build "
+        "isn't actually available. Default: CPU (faiss-cpu, requirements.txt).",
+    )
     args = parser.parse_args()
     run_faiss_near_dup(
         Path(args.source_dir),
         Path(args.messages_path),
         Path(args.out_path),
         chunk_size=args.chunk_size,
+        use_gpu=args.gpu,
     )
 
 
