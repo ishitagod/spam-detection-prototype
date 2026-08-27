@@ -1,0 +1,27 @@
+# Optional: GPU-accelerated FAISS, for a machine with an NVIDIA GPU +
+# CUDA (see features/faiss_index.py's --gpu flag / _to_gpu()). NOT
+# installed by default - requirements.txt's faiss-cpu already covers
+# CPU-only development and this sandbox, and CLAUDE.md's "FlatIP for
+# now" plan doesn't require GPU FAISS to work.
+#
+# faiss-cpu and a GPU faiss package can't both be installed at once -
+# they share the same top-level `faiss` import name and conflict. This
+# file does NOT `-r requirements.txt` (that would just reinstall
+# faiss-cpu and put you right back where you started) - install the
+# base requirements first as normal, THEN swap faiss packages:
+#   pip install --no-cache-dir -r requirements.txt   # as usual, includes faiss-cpu
+#   pip uninstall faiss-cpu -y
+#   pip install --no-cache-dir -r requirements-gpu.txt   # just this one package
+#
+# UNVERIFIED on the target GPU machine as of writing (untested per
+# 2026-08-27 conversation - "I'll test it on the other machine later").
+# FAISS's GPU wheel packaging has changed names/availability across
+# releases (older faiss-gpu was conda-only; newer releases publish
+# CUDA-version-specific wheels to PyPI, e.g. faiss-gpu-cu12). If the
+# exact package/version below 404s or fails to import
+# faiss.StandardGpuResources, check https://pypi.org/search/?q=faiss
+# for whatever's current and adjust this pin - the code in
+# features/faiss_index.py already degrades to CPU automatically and
+# prints a clear message if the GPU build isn't usable, so a wrong pin
+# here fails loud at install time, not silently at runtime.
+faiss-gpu-cu12==1.9.0
