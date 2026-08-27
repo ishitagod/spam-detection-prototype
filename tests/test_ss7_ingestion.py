@@ -159,6 +159,53 @@ def test_multipart_row_uses_sarref_msg_part_msg_parts():
 
 
 # ---------------------------------------------------------------------------
+# delivery-response rows (message_type in (1, 4, 7), decision != 0) - not
+# real SRI/MT traffic, must not survive clean() or feed the vlr_address
+# lookup.
+# ---------------------------------------------------------------------------
+
+def test_delivery_response_sri_response_row_dropped_and_not_merged():
+    """A message_type=1 row with decision != 0 is a delivery-response
+    record misusing the SRI_response type, not a real routing lookup - it
+    must not be used to fill vlr_address on the matching MT_request."""
+    raw = pd.DataFrame([
+        row(  # looks like an SRI_response for virtual_imsi=555, but decision != 0
+            index=1, message_type=1, reference=1, content=None, decoded_content=None,
+            virtual_imsi=555, vlr_address="BOGUS_VLR", decision=1,
+        ),
+        row(index=2, message_type=2, reference=2, virtual_imsi=555, vlr_address=None),
+    ])
+    cleaned = clean(raw)
+    assert cleaned["index"].tolist() == [2]
+    assert pd.isna(cleaned.iloc[0]["vlr_address"])
+
+
+def test_delivery_response_message_type_4_and_7_dropped():
+    raw = pd.DataFrame([
+        row(index=1, message_type=3, reference=1),  # MO, kept
+        row(index=2, message_type=4, reference=2, decision=1, content=None, decoded_content=None),
+        row(index=3, message_type=7, reference=3, decision=1, content=None, decoded_content=None),
+    ])
+    cleaned = clean(raw)
+    assert cleaned["index"].tolist() == [1]
+
+
+def test_message_type_1_4_7_with_decision_zero_not_treated_as_delivery_response():
+    """decision == 0 on these types is NOT a delivery response - a
+    genuine SRI_response with decision=0 must still feed the vlr_address
+    merge as before."""
+    raw = pd.DataFrame([
+        row(
+            index=1, message_type=1, reference=1, content=None, decoded_content=None,
+            virtual_imsi=555, vlr_address="VLR_A", decision=0,
+        ),
+        row(index=2, message_type=2, reference=2, virtual_imsi=555, vlr_address=None),
+    ])
+    cleaned = clean(raw)
+    assert cleaned.iloc[0]["vlr_address"] == "VLR_A"
+
+
+# ---------------------------------------------------------------------------
 # Schema validation tripwire - see ingestion/ss7.py's REQUIRED_FEATURE_COLS
 # comment and tests/test_smpp_ingestion.py's matching test.
 # ---------------------------------------------------------------------------

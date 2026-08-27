@@ -115,6 +115,25 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     can't skip a message it can't decode, so training data shouldn't
     either.
     """
+    # message_type in (1, 4, 7) with decision != 0 are delivery-response
+    # rows, not real SRI/MT traffic - drop before anything else. type
+    # 4/7 rows never reach `kept` regardless (only MO/MT_request do), but
+    # type 1 (MT_SRI_response) rows feed sri_lookup below - a decision != 0
+    # row there is a delivery-response record misusing the SRI_response
+    # message_type, not a genuine routing lookup, and would otherwise merge
+    # a bogus vlr_address into the matching MT_request row.
+    # decision blank/NaN means "unspecified/never reached a rule" (see
+    # ingestion/smpp.py's decision-semantics comment) - not a delivery
+    # response, so only an explicit non-zero decision counts here.
+    decision = pd.to_numeric(df.get("decision"), errors="coerce")
+    delivery_response = df["message_type"].isin([1, 4, 7]) & decision.notna() & (decision != 0)
+    if delivery_response.any():
+        print(
+            f"  clean (SS7): dropping {delivery_response.sum()} delivery-response "
+            "row(s) (message_type in (1,4,7), decision != 0)"
+        )
+    df = df[~delivery_response]
+
     sri_response = df[df["message_type"] == _MT_SRI_RESPONSE]
     # Sort by time before dedup so "keep last" means "most recent lookup",
     # not input-order-dependent. A handful of virtual_imsi values repeat
