@@ -14,9 +14,15 @@
 # this script's own location):
 #   .\scripts\run_full_pipeline.ps1
 #   .\scripts\run_full_pipeline.ps1 -MinImprovement 0.01
+#   .\scripts\run_full_pipeline.ps1 -StartAt 2   # skip step 1 (embeddings) -
+#                                                 # e.g. already computed and
+#                                                 # you're just re-running FAISS on
 
 param(
-    [double]$MinImprovement = 0.0
+    [double]$MinImprovement = 0.0,
+    [int]$StartAt = 1  # first step NUMBER to actually run - earlier steps are
+                        # printed as SKIPPED, not executed. Use when a step's
+                        # output already exists on disk from a prior run.
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,7 +43,11 @@ function Step {
     # NOTE: param must NOT be named $Args - that collides with
     # PowerShell's reserved automatic $args variable and silently
     # breaks splatting (python.exe launches with zero arguments).
-    param([string]$Name, [string[]]$PyArgs)
+    param([int]$Number, [string]$Name, [string[]]$PyArgs)
+    if ($Number -lt $StartAt) {
+        Write-Host "`n=== $Name === SKIPPED (-StartAt $StartAt)" -ForegroundColor DarkGray
+        return
+    }
     Write-Host "`n=== $Name ===" -ForegroundColor Cyan
     "`n=== $Name ($(Get-Date)) ===" | Out-File -FilePath $LogPath -Append -Encoding utf8
     # No 2>&1 here on purpose: under Windows PowerShell 5.1, redirecting
@@ -55,38 +65,38 @@ function Step {
 
 Push-Location $ProjectRoot
 try {
-    Step "1/8 Text embeddings - full, both sources (SMPP + SS7)" `
+    Step -Number 1 -Name "1/8 Text embeddings - full, both sources (SMPP + SS7)" `
         -PyArgs @("-m", "features.text_embeddings", "--processed_dir", "data/processed", "--device", "cuda")
 
-    Step "2/8 FAISS near-dup - SMPP" `
+    Step -Number 2 -Name "2/8 FAISS near-dup - SMPP" `
         -PyArgs @("-m", "features.faiss_index", "--source_dir", "data/processed/SMPP")
 
-    Step "3/8 FAISS near-dup - SS7" `
+    Step -Number 3 -Name "3/8 FAISS near-dup - SS7" `
         -PyArgs @("-m", "features.faiss_index", "--source_dir", "data/processed/SS7",
           "--messages_path", "data/processed/SS7/messages_with_behavioral.csv",
           "--out_path", "data/processed/SS7/faiss_output.parquet")
 
-    Step "4/8 Isolation Forest (anomaly_score)" `
+    Step -Number 4 -Name "4/8 Isolation Forest (anomaly_score)" `
         -PyArgs @("-m", "models.anomaly.train")
 
-    Step "5/8 LightGBM with embeddings (rule_pattern_score)" `
+    Step -Number 5 -Name "5/8 LightGBM with embeddings (rule_pattern_score)" `
         -PyArgs @("-m", "models.rule_pattern.train", "--with_embeddings")
 
-    Step "6/8 Compare/promote - anomaly_score" `
+    Step -Number 6 -Name "6/8 Compare/promote - anomaly_score" `
         -PyArgs @("-m", "models.compare_versions",
           "--experiment_name", "anomaly_score",
           "--registered_name", "anomaly_score_model",
           "--metric_key", "overall_pr_auc",
           "--min_improvement", "$MinImprovement")
 
-    Step "7/8 Compare/promote - rule_pattern_score_with_embeddings" `
+    Step -Number 7 -Name "7/8 Compare/promote - rule_pattern_score_with_embeddings" `
         -PyArgs @("-m", "models.compare_versions",
           "--experiment_name", "rule_pattern_score_with_embeddings",
           "--registered_name", "rule_pattern_score_model",
           "--metric_key", "test_overall_pr_auc",
           "--min_improvement", "$MinImprovement")
 
-    Step "8/8 Embedding-dominance diagnostic" `
+    Step -Number 8 -Name "8/8 Embedding-dominance diagnostic" `
         -PyArgs @("-m", "scripts.check_embedding_dominance")
 }
 finally {

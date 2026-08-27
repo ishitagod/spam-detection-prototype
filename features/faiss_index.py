@@ -179,12 +179,21 @@ def compute_near_dup_features_chunked(
 
     max_window = max(windows.values())
 
+    n_chunks = -(-n // chunk_size)  # ceil division, for the progress line below
+    print(f"    {n_chunks} chunk(s) of up to {chunk_size} rows each")
+
     chunks = []
     pos = 0
+    chunk_num = 0
     while pos < n:
+        chunk_num += 1
         chunk_end = min(pos + chunk_size, n)
         buffer_start = np.searchsorted(
             sorted_ts, sorted_ts[pos] - max_window, side="left"
+        )
+        print(
+            f"    chunk {chunk_num}/{n_chunks}: rows {pos}-{chunk_end} "
+            f"(+{pos - buffer_start} buffer row(s)) ..."
         )
 
         slice_result = compute_near_dup_features(
