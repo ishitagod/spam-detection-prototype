@@ -79,13 +79,17 @@ def is_rule_evaluated(label_source_df: pd.DataFrame) -> pd.Series:
                                    unsupervised layer instead. Do NOT
                                    assign rule_flagged=0 to these rows for
                                    supervised training.
+
+    `decision` is the base "touched by the rule engine" signal, not
+    `rule`/`rule_name`: real SMPP data has rows where `decision` is set (0
+    or 1) but `rule`/`rule_name` is blank - decision is the more complete
+    signal (see ingestion/smpp.py's LABEL_SOURCE_COLS comment). `rule` is
+    then used only to subtract whitelist bypasses out of that pool -
+    `rule_name` isn't needed for anything here.
     """
-    cols = [c for c in ("rule", "rule_name") if c in label_source_df.columns]
-    if not cols:
-        raise ValueError("label_source_df has neither `rule` nor `rule_name` column")
-    evaluated = pd.Series(False, index=label_source_df.index)
-    for c in cols:
-        evaluated |= label_source_df[c].notna()
+    if "decision" not in label_source_df.columns:
+        raise ValueError("label_source_df has no `decision` column")
+    evaluated = label_source_df["decision"].notna()
     if "rule" in label_source_df.columns:
         whitelist_only = label_source_df["rule"].astype("string").str.startswith(
             WHITELIST_RULE_PREFIX, na=False

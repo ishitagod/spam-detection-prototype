@@ -1,10 +1,8 @@
 """
 Feast feature repo: what CLAUDE.md's "offline and online ML platform are
 the SAME environment for this prototype" simplification looks like in
-practice - the online store exists so FastAPI (not yet built - see
-CLAUDE.md's next-steps list) can look up a sender's behavioral state in a
-single fast key-value read at inference time, instead of rescanning that
-sender's full message history per request.
+practice - the online store exists so FastAPI can look up a sender's behavioral state in a
+single fast key-value read at inference time
 
 Two-piece design, because one of the four behavioral features can't be
 precomputed:
@@ -24,8 +22,7 @@ precomputed:
     docstring for why recent_text_counts_json is a top-K approximation,
     not the exact set.
 
-Apply / materialize (SQLite online store per feature_store.yaml - no
-Kafka/Redis per CLAUDE.md):
+Apply / materialize :
     cd feature_repo
     feast apply
     feast materialize-incremental $(python -c "import datetime; print(datetime.datetime.now().isoformat())")

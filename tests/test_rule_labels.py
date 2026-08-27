@@ -33,11 +33,24 @@ def label_source() -> pd.DataFrame:
         # split spam/generic/abuse_word - only "spam" should count as
         # rule_flagged for this (spam-specific) project.
         {"decision": 1, "rule": "S_generic_check", "rule_name": "Some generic fraud check", "fraud_type": "generic"},
+        # 5: decision set (0) but rule/rule_name both blank - the gap real
+        # SMPP data has (see ingestion/smpp.py's LABEL_SOURCE_COLS comment):
+        # decision is a more complete "touched" signal than rule/rule_name,
+        # so this must still count as evaluated even without a rule id.
+        {"decision": 0, "rule": None, "rule_name": None, "fraud_type": None},
     ])
 
 
 def test_is_rule_evaluated_true_for_real_rule_hit(label_source):
-    assert is_rule_evaluated(label_source).tolist() == [True, False, False, True, True]
+    assert is_rule_evaluated(label_source).tolist() == [True, False, False, True, True, True]
+
+
+def test_is_rule_evaluated_true_for_decision_only_with_blank_rule(label_source):
+    """Row 5: decision=0, rule/rule_name both blank - decision is the base
+    "touched" signal now, so this counts as evaluated with no rule id at
+    all, and since `rule` isn't SW_-prefixed (it's blank, not SW_) it isn't
+    excluded as whitelist-only either."""
+    assert is_rule_evaluated(label_source).iloc[5] == True
 
 
 def test_is_rule_evaluated_excludes_whitelist_only_rows(label_source):
@@ -52,7 +65,7 @@ def test_build_rule_labels_flags_fraud_type_spam_specifically(label_source):
     covers other fraud categories too (row 4: generic), which must NOT be
     treated as spam-positive for this project."""
     flagged = build_rule_labels(label_source)
-    assert flagged.tolist() == [True, False, False, False, False]
+    assert flagged.tolist() == [True, False, False, False, False, False]
 
 
 def test_decision_equals_one_is_not_sufficient_for_flagged(label_source):
@@ -72,9 +85,9 @@ def test_rule_flagged_is_na_when_never_evaluated(label_source):
     assert pd.isna(flagged.iloc[2])  # whitelist-only
 
 
-def test_raises_when_neither_rule_column_present():
+def test_raises_when_decision_column_missing():
     with pytest.raises(ValueError):
-        is_rule_evaluated(pd.DataFrame({"decision": [1, 0]}))
+        is_rule_evaluated(pd.DataFrame({"rule": ["S_x", None]}))
 
 
 if __name__ == "__main__":

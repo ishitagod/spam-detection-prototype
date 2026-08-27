@@ -54,6 +54,7 @@ Also kept: a simpler plausibility_check() (mean anomaly_score by group)
 - weaker than PR-AUC (doesn't account for the full score distribution),
 but cheap and easy to sanity-eyeball alongside the real metric.
 """
+
 import argparse
 from pathlib import Path
 
@@ -68,7 +69,7 @@ from models.anomaly.data import build_feature_matrix, load_source_features
 from models.metrics import evaluate_overall_and_per_source
 
 MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
-MLFLOW_EXPERIMENT_NAME = "anomaly_score"
+MLFLOW_EXPERIMENT_NAME = "isolation_forest"
 
 
 def train_isolation_forest(
@@ -79,8 +80,11 @@ def train_isolation_forest(
     random_state: int = 42,
 ) -> IsolationForest:
     model = IsolationForest(
-        n_estimators=n_estimators, max_samples=max_samples,
-        contamination=contamination, random_state=random_state, n_jobs=-1,
+        n_estimators=n_estimators,
+        max_samples=max_samples,
+        contamination=contamination,
+        random_state=random_state,
+        n_jobs=-1,
     )
     model.fit(X)
     return model
@@ -114,7 +118,9 @@ def plausibility_check(df: pd.DataFrame, anomaly_score: np.ndarray) -> dict:
     if flagged.any():
         result["mean_anomaly_score_flagged"] = float(anomaly_score[flagged].mean())
     if clean.any():
-        result["mean_anomaly_score_rule_confirmed_clean"] = float(anomaly_score[clean].mean())
+        result["mean_anomaly_score_rule_confirmed_clean"] = float(
+            anomaly_score[clean].mean()
+        )
     return result
 
 
@@ -152,7 +158,9 @@ def run(
         source_dir = data_dir / source
         messages_path = source_dir / "messages_with_behavioral.csv"
         df = load_source_features(source_dir, messages_path)
-        print(f"  {source}: {len(df)} message(s) (sampled subset with embeddings+near-dup)")
+        print(
+            f"  {source}: {len(df)} message(s) (sampled subset with embeddings+near-dup)"
+        )
         frames.append(df)
     df = pd.concat(frames, ignore_index=True)
 
@@ -160,15 +168,22 @@ def run(
     X, feature_names, preprocessor = build_feature_matrix(df)
     print(f"  {X.shape[1]} feature(s): {len(feature_names)} columns")
 
-    max_samples_arg = max_samples if max_samples == "auto" else (
-        int(max_samples) if float(max_samples) > 1 else float(max_samples)
+    max_samples_arg = (
+        max_samples
+        if max_samples == "auto"
+        else (int(max_samples) if float(max_samples) > 1 else float(max_samples))
     )
-    contamination_arg = contamination if contamination == "auto" else float(contamination)
+    contamination_arg = (
+        contamination if contamination == "auto" else float(contamination)
+    )
 
     print("Training Isolation Forest ...")
     model = train_isolation_forest(
-        X, n_estimators=n_estimators, max_samples=max_samples_arg,
-        contamination=contamination_arg, random_state=random_state,
+        X,
+        n_estimators=n_estimators,
+        max_samples=max_samples_arg,
+        contamination=contamination_arg,
+        random_state=random_state,
     )
     anomaly_score = score_anomalies(model, X)
 
@@ -177,7 +192,9 @@ def run(
     for k, v in checks.items():
         print(f"  {k}: {v}")
 
-    print("Real evaluation - PR-AUC / log loss against rule_evaluated labels (validation only, not training):")
+    print(
+        "Real evaluation - PR-AUC / log loss against rule_evaluated labels (validation only, not training):"
+    )
     pr_auc_metrics = evaluate_against_rule_labels(df, anomaly_score)
     for k, v in pr_auc_metrics.items():
         print(f"  {k}: {v}")
@@ -185,33 +202,43 @@ def run(
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
     with mlflow.start_run():
-        mlflow.log_params({
-            "sources": ",".join(sources),
-            "n_rows": len(df),
-            "n_features": X.shape[1],
-            "n_estimators": n_estimators,
-            "max_samples": max_samples,
-            "contamination": contamination,
-            "random_state": random_state,
-        })
+        mlflow.log_params(
+            {
+                "sources": ",".join(sources),
+                "n_rows": len(df),
+                "n_features": X.shape[1],
+                "n_estimators": n_estimators,
+                "max_samples": max_samples,
+                "contamination": contamination,
+                "random_state": random_state,
+            }
+        )
         mlflow.log_metrics(checks)
         mlflow.log_metrics(pr_auc_metrics)
         mlflow.log_dict({"feature_names": feature_names}, "feature_names.json")
 
         pipeline = Pipeline([("preprocessor", preprocessor), ("iforest", model)])
         mlflow.sklearn.log_model(pipeline, name="model")
-        print(f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={MLFLOW_EXPERIMENT_NAME})")
+        print(
+            f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={MLFLOW_EXPERIMENT_NAME})"
+        )
 
     # Score-per-message output, one file per source, min-max normalized
     # column added for convenience (0-1, easy to eyeball) alongside the
     # raw decision_function-derived score (the actual anomaly_score).
     score_min, score_max = anomaly_score.min(), anomaly_score.max()
-    normalized = (anomaly_score - score_min) / (score_max - score_min) if score_max > score_min else np.zeros_like(anomaly_score)
-    df_out = pd.DataFrame({
-        "message_key": df["source"] + "|" + df["record_id"],
-        "anomaly_score": anomaly_score,
-        "anomaly_score_normalized": normalized,
-    })
+    normalized = (
+        (anomaly_score - score_min) / (score_max - score_min)
+        if score_max > score_min
+        else np.zeros_like(anomaly_score)
+    )
+    df_out = pd.DataFrame(
+        {
+            "message_key": df["source"] + "|" + df["record_id"],
+            "anomaly_score": anomaly_score,
+            "anomaly_score_normalized": normalized,
+        }
+    )
     for source in sources:
         out_path = data_dir / source / "anomaly_scores.parquet"
         subset = df_out[df_out["message_key"].str.startswith(f"{source}|")]
@@ -229,8 +256,12 @@ def main():
     parser.add_argument("--random_state", type=int, default=42)
     args = parser.parse_args()
     run(
-        args.sources, Path(args.data_dir), args.n_estimators,
-        args.max_samples, args.contamination, args.random_state,
+        args.sources,
+        Path(args.data_dir),
+        args.n_estimators,
+        args.max_samples,
+        args.contamination,
+        args.random_state,
     )
 
 
