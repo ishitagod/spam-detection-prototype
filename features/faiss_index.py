@@ -327,18 +327,17 @@ def run_faiss_near_dup(
     `originator`, which text_embeddings.py's id_map doesn't carry (that
     module has no notion of "sender" - kept separate on purpose).
     """
-    # Pinned to 1 thread as a diagnostic: a real crash
-    # (STATUS_STACK_BUFFER_OVERRUN, exit -1073740791) was hit running this
-    # against SMPP's full 5.5M-row embeddings for the first time - real
-    # sender velocity here reaches 48,606 msgs/hr for one sender (vs a
-    # 6,726 median), which at FAISS_NEAR_DUP_THRESHOLD=0.92 can make
-    # range_search's uncapped match array blow up combinatorially for a
-    # single bursty sender's window. Native OpenMP parallel range_search
-    # crashing on Windows under that kind of load is a known failure
-    # class for faiss-cpu; this rules it out (or doesn't) before touching
-    # chunk_size/threshold, which trade against the deliberate
-    # "don't undercount prolific senders" choice documented above.
-    faiss.omp_set_num_threads(1)
+    # Was pinned to 1 thread as a diagnostic after a real crash
+    # (STATUS_STACK_BUFFER_OVERRUN, exit -1073740791) on SMPP's full
+    # 5.5M-row embeddings - since ruled out as the cause: the crash was
+    # range_search's match array blowing up combinatorially for a dense
+    # 24hr buffer (real sender velocity here reaches 48,606 msgs/hr),
+    # fixed properly by batching the QUERY side of range_search
+    # (query_batch_size above / compute_near_dup_features()'s docstring),
+    # not by single-threading. Left single-threaded, this module runs
+    # ~8-10x+ slower than necessary on a real multi-core machine for no
+    # remaining safety benefit - not pinning it here lets FAISS use every
+    # core, same as its own default.
 
     source_dir = Path(source_dir)
     emb_path = source_dir / "embeddings.npy"
