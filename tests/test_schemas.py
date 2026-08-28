@@ -87,5 +87,23 @@ def test_verify_csv_roundtrip_raises_with_path_in_message_on_unparseable_file(tm
         verify_csv_roundtrip(df, path)
 
 
+def test_verify_csv_roundtrip_only_materializes_one_column(tmp_path):
+    """Real bug: reading every column of a multi-column file just to count
+    rows OOM'd on a real 5.5M-row, ~20-column SMPP write. usecols=[0] must
+    still catch row-count corruption on a WIDE frame, not just narrow
+    single-column test fixtures - corruption confined to a later column
+    (not column 0) must still surface, since the C parser tokenizes every
+    field of every row regardless of which columns get materialized."""
+    df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"], "c": [1.0, 2.0, 3.0]})
+    path = tmp_path / "wide.csv"
+    df.to_csv(path, index=False)
+    verify_csv_roundtrip(df, path)  # no raise - clean wide write
+
+    # Corrupt it: an unterminated quote in column "b" (not column "a"/index 0).
+    path.write_text('a,b,c\n1,"unterminated,1.0\n2,y,2.0\n3,z,3.0\n', encoding="utf-8")
+    with pytest.raises(ValueError, match=r"wide\.csv"):
+        verify_csv_roundtrip(df, path)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

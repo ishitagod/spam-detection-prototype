@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.anomaly.data import BEHAVIORAL_COLS
 from models.rule_pattern.data import (
     build_feature_matrix,
-    build_feature_matrix_with_embeddings,
     load_labelled_messages,
     load_labelled_messages_with_embeddings,
 )
@@ -48,7 +47,7 @@ def test_load_labelled_messages_keeps_only_rule_evaluated_rows(tmp_path):
 
 def test_label_is_one_for_flagged_zero_for_confirmed_clean():
     df = _sample_df().iloc[:3]  # the 3 rule_evaluated rows
-    _, y, _ = build_feature_matrix(df)
+    _, y, _, _ = build_feature_matrix(df)
     assert list(y) == [1, 0, 1]  # matches rule_flagged: True, False, True
 
 
@@ -57,14 +56,14 @@ def test_behavioral_columns_are_included_unscaled():
     splits are scale-invariant, so raw values should pass through
     exactly, including real observed extremes like 16,971."""
     df = _sample_df()
-    X, _, feature_names = build_feature_matrix(df)
+    X, _, feature_names, _ = build_feature_matrix(df)
     idx = feature_names.index("sender_msgs_last_1hr")
     assert list(X[:, idx]) == [0, 10, 100, 1000, 16971]
 
 
 def test_nan_dcs_does_not_crash_left_for_lightgbm_to_handle():
     df = _sample_df()
-    X, _, feature_names = build_feature_matrix(df)
+    X, _, feature_names, _ = build_feature_matrix(df)
     idx = feature_names.index("dcs")
     assert np.isnan(X[2, idx])  # the NaN row's dcs stays NaN, not imputed
 
@@ -72,7 +71,7 @@ def test_nan_dcs_does_not_crash_left_for_lightgbm_to_handle():
 def test_text_length_is_derived_correctly():
     df = _sample_df()
     df["text"] = ["hi", "hello", "hey there", "", "a"]
-    X, _, feature_names = build_feature_matrix(df)
+    X, _, feature_names, _ = build_feature_matrix(df)
     idx = feature_names.index("text_length")
     assert list(X[:, idx]) == [2, 5, 9, 0, 1]
 
@@ -80,16 +79,24 @@ def test_text_length_is_derived_correctly():
 def test_source_gets_one_hot_encoded():
     df = _sample_df()
     df["source"] = ["SMPP", "SMPP", "SS7", "SS7", "SS7"]
-    _, _, feature_names = build_feature_matrix(df)
+    _, _, feature_names, _ = build_feature_matrix(df)
     assert "source_SMPP" in feature_names
     assert "source_SS7" in feature_names
 
 
 def test_all_behavioral_cols_present():
     df = _sample_df()
-    _, _, feature_names = build_feature_matrix(df)
+    _, _, feature_names, _ = build_feature_matrix(df)
     for col in BEHAVIORAL_COLS:
         assert col in feature_names
+
+
+def test_fitted_is_empty_when_no_optional_features_requested():
+    """Neither use_embeddings nor use_tfidf - nothing corpus-dependent was
+    fit, so there's nothing to serialize for inference-time reuse."""
+    df = _sample_df()
+    _, _, _, fitted = build_feature_matrix(df)
+    assert fitted == {}
 
 
 def _write_labelled_messages_with_embeddings(tmp_path, n_rows=6, n_evaluated=4, n_with_embedding=3):
@@ -141,11 +148,12 @@ def test_build_feature_matrix_with_embeddings_reduces_to_pca_components():
         "rule_flagged": [True, False, True, False, True],
         **{col: np.random.RandomState(i).randn(5) for i, col in enumerate(source_dir_cols)},
     })
-    X, y, feature_names, pipeline = build_feature_matrix_with_embeddings(df, n_embedding_components=2)
+    X, y, feature_names, fitted = build_feature_matrix(df, use_embeddings=True, n_embedding_components=2)
     assert "emb_0" not in feature_names
     assert "emb_pca_0" in feature_names and "emb_pca_1" in feature_names
     assert "emb_pca_2" not in feature_names
     assert list(y) == [1, 0, 1, 0, 1]
+    assert "embedding_pca_pipeline" in fitted
 
 
 def test_build_feature_matrix_with_embeddings_base_features_stay_unscaled():
@@ -157,9 +165,75 @@ def test_build_feature_matrix_with_embeddings_base_features_stay_unscaled():
         "rule_flagged": [True, False, True, False, True],
         **{f"emb_{i}": np.random.RandomState(i).randn(5) for i in range(4)},
     })
-    X, _, feature_names, _ = build_feature_matrix_with_embeddings(df, n_embedding_components=2)
+    X, _, feature_names, _ = build_feature_matrix(df, use_embeddings=True, n_embedding_components=2)
     idx = feature_names.index("sender_msgs_last_1hr")
     assert list(X[:, idx]) == [0, 10, 100, 1000, 16971]  # raw, not scaled
+
+
+def test_embedding_pca_fit_only_on_train_mask():
+    """PCA must be FIT on train_mask rows only - a component axis fit on a
+    test-only outlier the train fold never saw would be real leakage into
+    featurization itself, not just into the model."""
+    n = 20
+    rng = np.random.RandomState(0)
+    df = pd.DataFrame({
+        "source": ["SMPP"] * n, "record_id": [str(i) for i in range(n)],
+        "text": ["hi"] * n, "dcs": [0.0] * n, "text_decode_failed": [False] * n,
+        **{c: [0] * n for c in BEHAVIORAL_COLS},
+        "rule_flagged": [True, False] * (n // 2),
+        **{f"emb_{i}": rng.randn(n) for i in range(4)},
+    })
+    train_mask = np.array([True] * 15 + [False] * 5)
+    # A PCA fit on ONLY the train rows must differ from one fit on everyone -
+    # confirms train_mask actually changed what gets fit, not silently ignored.
+    _, _, _, fitted_train_only = build_feature_matrix(
+        df, train_mask=train_mask, use_embeddings=True, n_embedding_components=2,
+    )
+    _, _, _, fitted_full = build_feature_matrix(
+        df, train_mask=np.ones(n, dtype=bool), use_embeddings=True, n_embedding_components=2,
+    )
+    pca_train_only = fitted_train_only["embedding_pca_pipeline"].named_steps["pca"]
+    pca_full = fitted_full["embedding_pca_pipeline"].named_steps["pca"]
+    assert not np.allclose(pca_train_only.components_, pca_full.components_)
+
+
+def test_build_feature_matrix_with_tfidf_adds_ngram_columns():
+    df = pd.DataFrame({
+        "source": ["SMPP"] * 6, "record_id": [str(i) for i in range(6)],
+        "text": ["win a free prize now", "win a free prize now", "win a free prize now",
+                 "hello how are you today", "hello how are you today", "meeting at noon tomorrow"],
+        "dcs": [0.0] * 6, "text_decode_failed": [False] * 6,
+        **{c: [0] * 6 for c in BEHAVIORAL_COLS},
+        "rule_flagged": [True, True, True, False, False, False],
+    })
+    X, y, feature_names, fitted = build_feature_matrix(
+        df, use_tfidf=True, tfidf_max_features=20, tfidf_min_df=1,
+    )
+    tfidf_cols = [f for f in feature_names if f.startswith("tfidf_")]
+    assert len(tfidf_cols) > 0
+    assert "tfidf_vectorizer" in fitted
+    assert list(y) == [1, 1, 1, 0, 0, 0]
+
+
+def test_tfidf_vocabulary_fit_only_on_train_mask():
+    """A word that appears ONLY in a test-only row must not enter the
+    vocabulary - fitting on the full pool would leak test-set vocabulary
+    into featurization itself (the exact concern that motivated
+    train_mask in the first place, see module docstring)."""
+    df = pd.DataFrame({
+        "source": ["SMPP"] * 4, "record_id": [str(i) for i in range(4)],
+        "text": ["alpha beta", "alpha beta", "alpha beta", "onlyintestrow uniqueword"],
+        "dcs": [0.0] * 4, "text_decode_failed": [False] * 4,
+        **{c: [0] * 4 for c in BEHAVIORAL_COLS},
+        "rule_flagged": [True, True, False, False],
+    })
+    train_mask = np.array([True, True, True, False])  # row 3 (the unique-vocab row) is test-only
+    _, _, feature_names, fitted = build_feature_matrix(
+        df, train_mask=train_mask, use_tfidf=True, tfidf_min_df=1,
+    )
+    vocab = set(fitted["tfidf_vectorizer"].vocabulary_.keys())
+    assert "onlyintestrow" not in vocab
+    assert "alpha" in vocab
 
 
 if __name__ == "__main__":

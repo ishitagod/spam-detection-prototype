@@ -1,0 +1,277 @@
+"""
+Fraud-TYPE discovery via DBSCAN, run ON TOP OF (not instead of) the
+Isolation Forest anomaly layer - see docs/ml/modeling.md. Isolation
+Forest gives exactly ONE number per row (how anomalous); it has no
+concept of grouping similar anomalies together, so it structurally
+cannot answer "anomalous in what WAY, resembling what other cases" -
+that's what this script adds. Two different unsupervised jobs, not two
+competing techniques for the same job.
+
+CONNECTION TO ISOLATION FOREST, concretely: this reads
+models/anomaly/train.py's ALREADY-WRITTEN `anomaly_scores.parquet` per
+source rather than re-scoring - if that file is stale relative to a real
+feature-set change, re-run `python -m models.anomaly.train` first, this
+script does not do that for you. Rows are then filtered down to the top
+`--anomaly_percentile` by that same anomaly_score (default: top 10%)
+BEFORE clustering - clustering the full traffic stream would spend all
+its effort characterizing normal messages, which isn't this script's
+job; the whole point is characterizing what the anomaly layer already
+flagged as worth a second look.
+
+SAME VECTOR SPACE AS ISOLATION FOREST, ON PURPOSE: the feature matrix is
+built via models.anomaly.data.build_feature_matrix() over the FULL
+candidate pool first (same PCA/scaling fit Isolation Forest itself
+trained on), and only THEN sliced down to the anomalous subset's rows -
+not re-fit on the subset alone. Refitting PCA on just the anomalous rows
+would silently change the basis DBSCAN clusters in, making "the same
+messages, described two different ways" instead of one consistent space
+both techniques share.
+
+NOT A DEPLOYABLE MODEL: scikit-learn's DBSCAN has no .predict() for
+genuinely new data at all - unlike IsolationForest/LightGBM, nothing
+here generalizes to the next incoming message, so no model artifact is
+logged to MLflow the way train.py logs one (would be misleading - there
+is nothing to reload and reuse). This is a periodic, OFFLINE discovery
+tool: run it, hand-inspect+name the resulting clusters using
+summarize_clusters()'s output, and ONLY the resulting hand-confirmed
+labels later become training data for a real supervised multiclass
+classifier (see CLAUDE.md's Stage A -> Stage B bootstrap note - same
+principle as rule-derived labels being a bootstrap, not the final
+answer). This script itself never runs at live inference.
+
+CLUSTER LABEL -1 IS MEANINGFUL, NOT A FAILURE: DBSCAN's own convention
+for "doesn't belong to any dense group" - kept as its own value rather
+than forced into the nearest cluster, because a genuinely novel one-off
+anomaly (not resembling any other flagged case yet) is a real, different
+finding from "here are 40 near-identical flooding bursts".
+
+Usage:
+    python -m models.anomaly.cluster_discovery
+    python -m models.anomaly.cluster_discovery --anomaly_percentile 95 --min_samples 8
+    python -m models.anomaly.cluster_discovery --eps 2.1   # override the auto-suggested eps
+"""
+import argparse
+from pathlib import Path
+
+import mlflow
+import numpy as np
+import pandas as pd
+from sklearn.cluster import DBSCAN
+from sklearn.neighbors import NearestNeighbors
+
+from models.anomaly.data import BEHAVIORAL_COLS, NEAR_DUP_COLS, build_feature_matrix, load_source_features
+
+MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
+# Own experiment name, separate from "anomaly_score" - see docs/ml/
+# modeling.md's MLflow conventions: a variant that isn't a real
+# promotable candidate (which this structurally can't be - see module
+# docstring's NOT A DEPLOYABLE MODEL note) gets logged under its own
+# name so it's never mistaken for one in the MLflow UI.
+MLFLOW_EXPERIMENT_NAME = "fraud_type_cluster_discovery"
+
+# Columns worth printing per cluster to actually eyeball what it IS -
+# raw (pre-log1p, pre-scale) values, not the PCA/scaled X the model
+# actually clustered on, because a human reading "mean=1.3, std=0.4" in
+# PCA-component-space can't map that back to "this is a flooding burst"
+# the way "mean sender_msgs_last_1hr=8,200" can.
+SUMMARY_RAW_COLS = BEHAVIORAL_COLS + NEAR_DUP_COLS
+
+
+def suggest_eps(X: np.ndarray, min_samples: int) -> float:
+    """
+    Standard DBSCAN eps heuristic: for every point, its distance to its
+    own min_samples-th nearest neighbor; eps set at a percentile of that
+    distribution is a common starting point (approximating the "knee" of
+    the sorted k-distance curve without requiring a human to eyeball a
+    plot in what's meant to be a non-interactive CLI script).
+    NOT calibrated against any labelled ground truth - there isn't one
+    for cluster quality here - same "documented starting point, not a
+    proven-correct constant" honesty as config/settings.py's
+    FAISS_NEAR_DUP_THRESHOLD. Override with --eps once real clusters
+    have been eyeballed and this guess looks wrong.
+    """
+    nn = NearestNeighbors(n_neighbors=min_samples)
+    nn.fit(X)
+    distances, _ = nn.kneighbors(X)
+    k_distances = np.sort(distances[:, -1])
+    suggested = float(np.percentile(k_distances, 90))
+    print(
+        f"  --eps not given - suggesting {suggested:.3f} (90th percentile of "
+        f"{min_samples}-NN distances over the {len(X)} candidate rows). "
+        "This is a heuristic starting point, not a tuned value - inspect "
+        "the clusters it produces and override --eps if they look wrong "
+        "(too many tiny clusters -> eps too small; one giant cluster -> "
+        "eps too large)."
+    )
+    return suggested
+
+
+def load_features_and_scores(sources: list[str], data_dir: Path) -> tuple[pd.DataFrame, np.ndarray, list[str]]:
+    """
+    Loads the SAME joined feature set models/anomaly/train.py trains on
+    (models.anomaly.data.load_source_features + build_feature_matrix),
+    then merges in that run's already-computed anomaly_score by
+    message_key. Raises a clear error (not a silent empty join) if
+    anomaly_scores.parquet is missing for a source - this script depends
+    on that file existing, it does not compute it.
+    """
+    frames = []
+    for source in sources:
+        source_dir = data_dir / source
+        messages_path = source_dir / "messages_with_behavioral.csv"
+        scores_path = source_dir / "anomaly_scores.parquet"
+        if not scores_path.exists():
+            raise FileNotFoundError(
+                f"{scores_path} not found - run `python -m models.anomaly.train` "
+                f"for {source} first (see module docstring: this script consumes "
+                "that output, it doesn't compute anomaly scores itself)."
+            )
+        df = load_source_features(source_dir, messages_path)
+        scores = pd.read_parquet(scores_path)[["message_key", "anomaly_score"]]
+        df = df.merge(scores, on="message_key", how="inner", validate="one_to_one")
+        print(f"  {source}: {len(df)} message(s) with both features and an anomaly_score")
+        frames.append(df)
+
+    combined = pd.concat(frames, ignore_index=True)
+    X, feature_names, _ = build_feature_matrix(combined)
+    return combined, X, feature_names
+
+
+def select_anomalous_subset(
+    df: pd.DataFrame, X: np.ndarray, percentile: float,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    Threshold computed ONCE across the combined (all-sources) pool, not
+    per source - matches how Isolation Forest itself was trained jointly
+    across sources (CLAUDE.md's "one model to start, not two"), so the
+    cutoff reflects the same shared score distribution the model actually
+    produced, not two separately-recalibrated ones.
+    """
+    threshold = float(np.percentile(df["anomaly_score"].to_numpy(), percentile))
+    mask = df["anomaly_score"].to_numpy() >= threshold
+    print(
+        f"  anomaly_score >= {threshold:.4f} (top {100 - percentile:.0f}%): "
+        f"{mask.sum()} / {len(df)} rows selected for clustering"
+    )
+    return df[mask].reset_index(drop=True), X[mask]
+
+
+def run_dbscan(X: np.ndarray, eps: float, min_samples: int) -> np.ndarray:
+    model = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1)
+    return model.fit_predict(X)
+
+
+def summarize_clusters(df: pd.DataFrame, labels: np.ndarray) -> dict:
+    """
+    One summary block per distinct cluster label (including -1, see
+    module docstring) - size, mean anomaly_score, mean of the raw
+    interpretable behavioral/near-dup columns, and source breakdown.
+    This is the actual input to the human hand-labeling step (Stage A ->
+    Stage B) - not a formal metric, there's no ground truth to score
+    cluster quality against here.
+    """
+    working = df.copy()
+    working["cluster_label"] = labels
+    summary = {}
+    for cluster_id, group in working.groupby("cluster_label"):
+        key = "noise" if cluster_id == -1 else f"cluster_{cluster_id}"
+        summary[key] = {
+            "n_rows": int(len(group)),
+            "mean_anomaly_score": float(group["anomaly_score"].mean()),
+            "source_counts": group["source"].value_counts().to_dict(),
+            **{col: float(group[col].mean()) for col in SUMMARY_RAW_COLS},
+        }
+    return summary
+
+
+def print_cluster_summary(summary: dict) -> None:
+    for name, stats in sorted(summary.items(), key=lambda kv: -kv[1]["n_rows"]):
+        print(f"  {name}: {stats['n_rows']} row(s), mean_anomaly_score={stats['mean_anomaly_score']:.3f}, "
+              f"sources={stats['source_counts']}")
+        for col in SUMMARY_RAW_COLS:
+            print(f"      {col}: {stats[col]:.3f}")
+
+
+def run(
+    sources: list[str],
+    data_dir: Path,
+    anomaly_percentile: float,
+    eps: float | None,
+    min_samples: int,
+) -> None:
+    print(f"Loading features + anomaly scores for sources: {sources} ...")
+    df, X, _ = load_features_and_scores(sources, data_dir)
+
+    print(f"Selecting top {100 - anomaly_percentile:.0f}% by anomaly_score ...")
+    df_subset, X_subset = select_anomalous_subset(df, X, anomaly_percentile)
+    if len(df_subset) < min_samples:
+        raise ValueError(
+            f"Only {len(df_subset)} row(s) selected, fewer than --min_samples "
+            f"({min_samples}) - DBSCAN can't form any cluster from this few "
+            "points. Raise the candidate pool (lower --anomaly_percentile) or "
+            "lower --min_samples."
+        )
+
+    resolved_eps = eps if eps is not None else suggest_eps(X_subset, min_samples)
+
+    print(f"Running DBSCAN (eps={resolved_eps:.4f}, min_samples={min_samples}) on {len(X_subset)} rows ...")
+    labels = run_dbscan(X_subset, resolved_eps, min_samples)
+    n_clusters = len(set(labels.tolist()) - {-1})
+    n_noise = int((labels == -1).sum())
+    print(f"  {n_clusters} cluster(s) found, {n_noise} row(s) unclustered (noise, label -1)")
+
+    summary = summarize_clusters(df_subset, labels)
+    print("Cluster summary (see module docstring - this feeds human hand-labeling, not a formal metric):")
+    print_cluster_summary(summary)
+
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+    with mlflow.start_run():
+        mlflow.log_params({
+            "sources": ",".join(sources),
+            "anomaly_percentile": anomaly_percentile,
+            "n_candidate_rows": len(df_subset),
+            "eps": resolved_eps,
+            "eps_was_auto_suggested": eps is None,
+            "min_samples": min_samples,
+        })
+        mlflow.log_metrics({"n_clusters": n_clusters, "n_noise": n_noise})
+        mlflow.log_dict(summary, "cluster_summary.json")
+        # Deliberately NO mlflow.sklearn.log_model() here - see module
+        # docstring's NOT A DEPLOYABLE MODEL note: there is no reusable
+        # artifact to reload, logging one would misrepresent what this is.
+        print(f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={MLFLOW_EXPERIMENT_NAME})")
+
+    df_out = pd.DataFrame({
+        "message_key": df_subset["source"] + "|" + df_subset["record_id"],
+        "source": df_subset["source"],
+        "anomaly_score": df_subset["anomaly_score"],
+        "cluster_label": labels,
+    })
+    for source in sources:
+        out_path = data_dir / source / "fraud_type_clusters.parquet"
+        subset = df_out[df_out["source"] == source].drop(columns="source")
+        subset.to_parquet(out_path, index=False)
+        print(f"Wrote {len(subset)} rows to {out_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sources", type=str, nargs="+", default=["SMPP", "SS7"])
+    parser.add_argument("--data_dir", type=str, default="data/processed")
+    parser.add_argument(
+        "--anomaly_percentile", type=float, default=90.0,
+        help="Only cluster rows at/above this anomaly_score percentile "
+        "(default: top 10%%). Not calibrated - see module docstring.",
+    )
+    parser.add_argument(
+        "--eps", type=float, default=None,
+        help="DBSCAN eps. Default: auto-suggested from k-distance (see suggest_eps()).",
+    )
+    parser.add_argument("--min_samples", type=int, default=5)
+    args = parser.parse_args()
+    run(args.sources, Path(args.data_dir), args.anomaly_percentile, args.eps, args.min_samples)
+
+
+if __name__ == "__main__":
+    main()

@@ -42,6 +42,19 @@ if (-not (Test-Path $python)) {
     exit 1
 }
 
+# Without these two lines, the log ends up full of embedded null bytes:
+# python.exe's actual stdout encoding and PowerShell's assumption of what
+# encoding a piped native process is using ($OutputEncoding) can silently
+# disagree on Windows (commonly UTF-8 vs UTF-16) - Tee-Object then
+# re-encodes each captured byte under the wrong assumption, which shows up
+# as a stray \x00 interleaved between characters. Pinning both sides to
+# UTF-8 explicitly, rather than relying on whatever the console/codepage
+# defaults to, is the fix - not a cosmetic Out-File -Encoding change,
+# which only affects how PowerShell's OWN strings get written, not how it
+# interprets python.exe's bytes on the way in.
+$env:PYTHONIOENCODING = "utf-8"
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 $StartTime = Get-Date
 $LogPath = Join-Path $ProjectRoot "scripts\run_full_pipeline.log"
 Write-Host "Logging to $LogPath"

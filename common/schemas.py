@@ -80,10 +80,24 @@ def verify_csv_roundtrip(df: pd.DataFrame, path: str | Path) -> None:
     round-trips byte-for-byte. One KNOWN, intentional exception to that:
     "" vs NaN on text_decode_failed rows - see
     ingestion/run_ingest.py's load_features_csv().
+
+    usecols=[0] (single column) is deliberate, not an oversight: this only
+    needs a row count, and reading every column of a multi-million-row
+    file (real SMPP output: 5.5M rows) just to discard the data was a real
+    OOM in practice - same failure mode already documented in
+    models/rule_pattern/data.py's load_labelled_messages() docstring, just
+    hit here too. Pandas' C parser still tokenizes every field of every
+    row to find column boundaries even with usecols narrowing what gets
+    materialized - real quoting/encoding/truncation corruption in ANY
+    column still raises here, this just stops storing 19 columns nobody
+    reads. dtype=str on that one column (not low_memory=False) silences
+    the DtypeWarning pandas' chunked default engine raises when a column
+    looks like mixed types across chunks - irrelevant here since only a
+    row count is ever read off it, never the values themselves.
     """
     path = Path(path)
     try:
-        reread = pd.read_csv(path, low_memory=False)
+        reread = pd.read_csv(path, usecols=[0], dtype=str)
     except Exception as e:
         raise ValueError(
             f"{path}: written CSV does not read back cleanly "

@@ -36,35 +36,67 @@ decision==1 directly (labels/rule_labels.py found ~7.5% of SS7's
 decision==1 rows are non-spam fraud types; rule_flagged already encodes
 fraud_type=="spam" specifically, decision alone doesn't).
 
-EMBEDDINGS-AWARE VARIANT (load_labelled_messages_with_embeddings() +
-build_feature_matrix_with_embeddings()): "not embeddings" above is a
-scoping decision for the DEFAULT path, not a permanent architectural
-stance - real evidence points the other way. A trained baseline model's
-own feature importances show `text_length` (the only content-adjacent
-signal it has) as the single most important feature by a wide margin -
-meaning even a crude proxy for content carries real separating power,
-so genuine content (real embeddings, not just character count) would
-plausibly help more, not be redundant. This variant exists to test that
-once features/text_embeddings.py's full-dataset run is done (not just
-the current CPU-scale sample - see that module's docstring): as of
-writing, the sample only overlaps ~18/2,693 SMPP and ~2,635/349,962 SS7
-rule_evaluated rows (under 1% either way), so this path is not yet
-useful as the main training path, only ready for when it is. Reuses
-models/anomaly/data.py's embedding_pca_pipeline() (StandardScaler + PCA)
-for the SAME reason it's needed there: 384 raw dims would swamp this
-model's other ~10 features the same way it swamped Isolation Forest's,
-even though tree splits themselves don't require scaling.
+EMBEDDINGS/TF-IDF, both OPTIONAL and INDEPENDENTLY toggleable
+(use_embeddings=, use_tfidf= on build_feature_matrix() below): "not
+embeddings" in the module summary above is a scoping decision for the
+DEFAULT path, not a permanent architectural stance - real evidence points
+the other way. A trained baseline model's own feature importances show
+`text_length` (the only content-adjacent signal it has) as the single
+most important feature by a wide margin - meaning even a crude proxy for
+content carries real separating power, so genuine content would plausibly
+help more, not be redundant. Confirmed empirically for TF-IDF specifically:
+a standalone TfidfVectorizer+LogisticRegression test on the full real SS7
+rule_evaluated pool, split by UNIQUE TEXT (no template leaking across
+train/test), scored PR-AUC 0.934 vs a 0.669 naive baseline - real
+generalizing signal, not just template memorization.
+
+use_embeddings is NOT yet useful as the main training path: the MiniLM
+embedding sample only overlaps ~1% of the rule_evaluated pool (under 1%
+for both sources as of writing - see load_labelled_messages_with_embeddings()),
+because features/text_embeddings.py's full-dataset run (~21hr CPU job) is
+still sample-scale. This flag exists so the comparison is one command
+away once that full run lands.
+
+Embeddings and TF-IDF are deliberately independent flags, not one combined
+"with_content" toggle: they catch different things in real spam here - TF-IDF
+is good at recognizing literal repeated TEMPLATES (this dataset's real spam
+is heavily templated), embeddings are the ones that could plausibly
+generalize to spam that's semantically similar but not worded the same.
+LightGBM can use both together without one dominating the other the way
+raw embeddings dominated Isolation Forest's joint distance-based scoring
+(scripts/check_embedding_dominance.py) - tree splits evaluate each
+feature's information gain independently, they don't blend into one
+distance metric, so the 384-vs-500-vs-~10 dimension imbalance that
+mattered for Isolation Forest isn't the same risk here.
+
+FIT-ON-TRAIN-ONLY: both the embedding PCA and the TF-IDF vocabulary are
+corpus-dependent transformers - fitting them on the full pool (train+test
+together) would leak test-set distribution/vocabulary into featurization
+itself, before the model ever sees a train/test split. build_feature_matrix()
+takes a `train_mask` for exactly this reason: fit happens on
+df[train_mask] only, transform applies to every row. (This also FIXES a
+pre-existing minor leak: the previous embeddings-only path fit PCA on the
+full df before train.py's split - harmless in practice for PCA, but worth
+closing now that TF-IDF's vocabulary fit makes the same mistake far more
+consequential.)
 """
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from models.anomaly.data import BEHAVIORAL_COLS, N_EMBEDDING_COMPONENTS, embedding_pca_pipeline
 
 CANONICAL_COLS = ["dcs", "text_decode_failed"]
 REQUIRED_COLS = ["source", "record_id", "rule_evaluated", "rule_flagged", "text"] + CANONICAL_COLS + BEHAVIORAL_COLS
+
+# Validated empirically (see module docstring) on the full real SS7 corpus,
+# not tuned against a target metric - a reasonable starting point, same
+# spirit as N_EMBEDDING_COMPONENTS above.
+TFIDF_MAX_FEATURES = 500
+TFIDF_NGRAM_RANGE = (1, 3)
+TFIDF_MIN_DF = 5
 
 
 def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
@@ -112,8 +144,8 @@ def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
 
 def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     """
-    The canonical + behavioral + source columns shared by both
-    build_feature_matrix() and build_feature_matrix_with_embeddings().
+    The canonical + behavioral + source columns build_feature_matrix()
+    always includes, regardless of use_embeddings/use_tfidf.
     `dcs` can be NaN in real data - left as-is deliberately, LightGBM
     has native missing-value handling built in, no imputation needed.
     """
@@ -125,11 +157,66 @@ def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def build_feature_matrix(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Returns (X, y, feature_names). y = 1 for rule_flagged (spam), 0 for confirmed-clean."""
-    matrix = _base_feature_frame(df)
+def build_feature_matrix(
+    df: pd.DataFrame,
+    train_mask: np.ndarray | None = None,
+    use_embeddings: bool = False,
+    use_tfidf: bool = False,
+    n_embedding_components: int = N_EMBEDDING_COMPONENTS,
+    tfidf_max_features: int = TFIDF_MAX_FEATURES,
+    tfidf_ngram_range: tuple[int, int] = TFIDF_NGRAM_RANGE,
+    tfidf_min_df: int = TFIDF_MIN_DF,
+) -> tuple[np.ndarray, np.ndarray, list[str], dict]:
+    """
+    Returns (X, y, feature_names, fitted). X/y cover ALL rows of df in its
+    original order (caller slices by idx_train/idx_test) - `fitted` is a
+    dict of whichever corpus-dependent transformers were actually used
+    ({"embedding_pca_pipeline": ..., "tfidf_vectorizer": ...}, only the
+    keys for flags that were True), empty if neither use_embeddings nor
+    use_tfidf is set. Both must be reused unchanged at inference time,
+    same reason as models/anomaly/data.py's preprocessor.
+
+    `train_mask`: boolean array, same length as df, True = this row is in
+    the training fold. Embeddings PCA and TF-IDF vocabulary are FIT on
+    df[train_mask] ONLY, then applied (.transform()) to every row - see
+    module docstring for why this matters (test-set leakage into
+    featurization itself, not just into the model). Defaults to "every
+    row is train" (all-True) when omitted - correct for the base-features-
+    only path (nothing here is corpus-fit) and for tests that don't care
+    about train/test leakage, but the real training entrypoint
+    (models/rule_pattern/train.py) must always pass a real mask whenever
+    use_embeddings or use_tfidf is True.
+    """
+    if train_mask is None:
+        train_mask = np.ones(len(df), dtype=bool)
+
+    base = _base_feature_frame(df)
+    pieces = [base]
+    fitted: dict = {}
+
+    if use_embeddings:
+        embedding_cols = [c for c in df.columns if c.startswith("emb_")]
+        pca_pipeline = embedding_pca_pipeline(n_embedding_components)
+        pca_pipeline.fit(df.loc[train_mask, embedding_cols].to_numpy(dtype=np.float64))
+        embeddings_reduced = pca_pipeline.transform(df[embedding_cols].to_numpy(dtype=np.float64))
+        embedding_names = [f"emb_pca_{i}" for i in range(n_embedding_components)]
+        pieces.append(pd.DataFrame(embeddings_reduced, columns=embedding_names, index=df.index))
+        fitted["embedding_pca_pipeline"] = pca_pipeline
+
+    if use_tfidf:
+        text = df["text"].fillna("")
+        vectorizer = TfidfVectorizer(
+            ngram_range=tfidf_ngram_range, max_features=tfidf_max_features, min_df=tfidf_min_df,
+        )
+        vectorizer.fit(text[train_mask])
+        tfidf_matrix = vectorizer.transform(text).toarray()
+        tfidf_names = [f"tfidf_{t}" for t in vectorizer.get_feature_names_out()]
+        pieces.append(pd.DataFrame(tfidf_matrix, columns=tfidf_names, index=df.index))
+        fitted["tfidf_vectorizer"] = vectorizer
+
+    matrix = pd.concat(pieces, axis=1)
     y = (df["rule_flagged"] == True).astype(int).to_numpy()  # noqa: E712
-    return matrix.to_numpy(dtype=np.float64), y, matrix.columns.tolist()
+    return matrix.to_numpy(dtype=np.float64), y, matrix.columns.tolist(), fitted
 
 
 def load_labelled_messages_with_embeddings(source_dir: Path, messages_path: Path) -> pd.DataFrame:
@@ -152,27 +239,3 @@ def load_labelled_messages_with_embeddings(source_dir: Path, messages_path: Path
     emb_df["message_key"] = id_map["message_key"].to_numpy()
 
     return df.merge(emb_df, on="message_key", how="inner").reset_index(drop=True)
-
-
-def build_feature_matrix_with_embeddings(
-    df: pd.DataFrame, n_embedding_components: int = N_EMBEDDING_COMPONENTS,
-) -> tuple[np.ndarray, np.ndarray, list[str], Pipeline]:
-    """
-    Same base features as build_feature_matrix(), PLUS PCA-reduced
-    embeddings. `df` must come from load_labelled_messages_with_embeddings()
-    (needs emb_* columns present). Embeddings get scaled+PCA'd (needs
-    it - see models/anomaly/data.py's embedding_pca_pipeline()); the
-    base features stay unscaled, same as build_feature_matrix() - tree
-    splits don't need it. Returns the fitted PCA pipeline too - same
-    reuse-at-inference requirement as models/anomaly/data.py's
-    preprocessor (train/serve skew otherwise).
-    """
-    base = _base_feature_frame(df)
-    embedding_cols = [c for c in df.columns if c.startswith("emb_")]
-    pca_pipeline = embedding_pca_pipeline(n_embedding_components)
-    embeddings_reduced = pca_pipeline.fit_transform(df[embedding_cols].to_numpy(dtype=np.float64))
-    embedding_names = [f"emb_pca_{i}" for i in range(n_embedding_components)]
-
-    matrix = pd.concat([base, pd.DataFrame(embeddings_reduced, columns=embedding_names)], axis=1)
-    y = (df["rule_flagged"] == True).astype(int).to_numpy()  # noqa: E712
-    return matrix.to_numpy(dtype=np.float64), y, matrix.columns.tolist(), pca_pipeline

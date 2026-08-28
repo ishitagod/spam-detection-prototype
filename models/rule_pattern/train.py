@@ -35,16 +35,32 @@ single-class-skip guard), evaluated on BOTH train and test sets - a
 large train/test gap is the actual overfitting signal to watch for,
 given this pool's small-for-SMPP / imbalanced-for-SS7 shape.
 
---with_embeddings: uses models/rule_pattern/data.py's embeddings-aware
-loader/feature-builder instead of the default ones. NOT useful today -
-the embedding sample only overlaps ~1% of the rule_evaluated pool (see
-that module's docstring) - this flag exists so the comparison is one
-command away once features/text_embeddings.py's full-dataset run is
-done, not something to run expecting a meaningful result right now.
-Logged to a SEPARATE MLflow experiment (rule_pattern_score_with_embeddings)
-so an early, tiny-sample run never gets mistaken for a real baseline
-candidate in the MLflow UI - same reasoning as
+--with_embeddings / --with_tfidf: independently toggleable, see
+models/rule_pattern/data.py's module docstring for why they're separate
+flags rather than one combined switch. --with_embeddings is NOT useful
+today - the MiniLM sample only overlaps ~1% of the rule_evaluated pool -
+this flag exists so the comparison is one command away once
+features/text_embeddings.py's full-dataset run lands. --with_tfidf IS
+useful today - real standalone signal already measured (PR-AUC 0.934 on
+a text-grouped split, see data.py docstring), no sample-coverage blocker.
+
+Either flag routes the split BEFORE featurization, not after: TF-IDF
+vocabulary and embedding PCA are corpus-dependent, so they must be fit on
+the train fold only (see data.py's train_mask docstring) - fitting on the
+full pool first, THEN splitting, would leak test-set information into
+featurization itself. The plain default path (neither flag set) doesn't
+care about split order since nothing in it is corpus-fit, but the split
+now happens first unconditionally, for one consistent code path rather
+than two.
+
+Any experimental combination of these flags is logged to a SEPARATE
+MLflow experiment (rule_pattern_score_experimental) so an early or
+partial-coverage run never gets mistaken for the real baseline candidate
+in the MLflow UI - same reasoning as
 scripts/check_embedding_dominance.py's separate diagnostics experiment.
+with_embeddings/with_tfidf are logged as params on every run, so runs
+are filterable/comparable within that one experiment rather than
+scattered across per-combination experiment names.
 """
 
 import argparse
@@ -61,14 +77,17 @@ from sklearn.model_selection import train_test_split
 from models.anomaly.data import N_EMBEDDING_COMPONENTS
 from models.metrics import evaluate_overall_and_per_source
 from models.rule_pattern.data import (
+    TFIDF_MAX_FEATURES,
+    TFIDF_MIN_DF,
+    TFIDF_NGRAM_RANGE,
     build_feature_matrix,
-    build_feature_matrix_with_embeddings,
     load_labelled_messages,
     load_labelled_messages_with_embeddings,
 )
 
 MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
 MLFLOW_EXPERIMENT_NAME = "light_gbm"
+MLFLOW_EXPERIMENTAL_EXPERIMENT_NAME = "rule_pattern_score_experimental"
 
 
 def train_lightgbm(
@@ -100,9 +119,14 @@ def run(
     random_state: int,
     with_embeddings: bool = False,
     n_embedding_components: int = N_EMBEDDING_COMPONENTS,
+    with_tfidf: bool = False,
+    tfidf_max_features: int = TFIDF_MAX_FEATURES,
+    tfidf_ngram_range: tuple[int, int] = TFIDF_NGRAM_RANGE,
+    tfidf_min_df: int = TFIDF_MIN_DF,
 ) -> None:
     print(
-        f"Loading rule_evaluated rows for sources: {sources} (with_embeddings={with_embeddings}) ..."
+        f"Loading rule_evaluated rows for sources: {sources} "
+        f"(with_embeddings={with_embeddings}, with_tfidf={with_tfidf}) ..."
     )
     frames = []
     for source in sources:
@@ -115,27 +139,38 @@ def run(
         print(f"  {source}: {len(df)} row(s)")
         frames.append(df)
     df = pd.concat(frames, ignore_index=True)
+    y_full = (df["rule_flagged"] == True).astype(int).to_numpy()  # noqa: E712
 
-    embedding_pca_pipeline = None
-    if with_embeddings:
-        X, y, feature_names, embedding_pca_pipeline = (
-            build_feature_matrix_with_embeddings(
-                df,
-                n_embedding_components=n_embedding_components,
-            )
-        )
-    else:
-        X, y, feature_names = build_feature_matrix(df)
-    print(
-        f"Total: {len(df)} rows, {X.shape[1]} feature(s), {int(y.sum())} positive ({y.mean():.1%})"
-    )
-
+    # Split BEFORE featurization, not after: with either flag on, TF-IDF
+    # vocabulary / embedding PCA are corpus-dependent transformers that
+    # must never see the test fold during fit (see data.py's train_mask
+    # docstring). Splitting first and passing a train_mask into
+    # build_feature_matrix() is the one code path that's correct for the
+    # default case too (train_mask is a no-op there).
     idx_train, idx_test = train_test_split(
         np.arange(len(df)),
         test_size=test_size,
-        stratify=y,
+        stratify=y_full,
         random_state=random_state,
     )
+    train_mask = np.zeros(len(df), dtype=bool)
+    train_mask[idx_train] = True
+
+    X, y, feature_names, fitted = build_feature_matrix(
+        df,
+        train_mask=train_mask,
+        use_embeddings=with_embeddings,
+        n_embedding_components=n_embedding_components,
+        use_tfidf=with_tfidf,
+        tfidf_max_features=tfidf_max_features,
+        tfidf_ngram_range=tfidf_ngram_range,
+        tfidf_min_df=tfidf_min_df,
+    )
+    print(
+        f"Total: {len(df)} rows, {X.shape[1]} feature(s), {int(y.sum())} positive ({y.mean():.1%})"
+    )
+    assert np.array_equal(y, y_full), "build_feature_matrix()'s y must match the pre-split labels"
+
     X_train, y_train, df_train = X[idx_train], y[idx_train], df.iloc[idx_train]
     X_test, y_test, df_test = X[idx_test], y[idx_test], df.iloc[idx_test]
     print(f"Train: {len(X_train)} rows | Test: {len(X_test)} rows")
@@ -169,9 +204,14 @@ def run(
     for k, v in test_metrics.items():
         print(f"  {k}: {v}")
 
+    # Any experimental flag routes to a SEPARATE experiment - a plain run
+    # (neither flag set) stays the real baseline candidate in
+    # MLFLOW_EXPERIMENT_NAME; with_embeddings/with_tfidf are logged as
+    # params either way so runs stay filterable/comparable in one place
+    # rather than proliferating one experiment per combination.
     experiment_name = (
-        f"{MLFLOW_EXPERIMENT_NAME}_with_embeddings"
-        if with_embeddings
+        MLFLOW_EXPERIMENTAL_EXPERIMENT_NAME
+        if (with_embeddings or with_tfidf)
         else MLFLOW_EXPERIMENT_NAME
     )
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
@@ -189,9 +229,19 @@ def run(
                 "max_depth": max_depth,
                 "random_state": random_state,
                 "with_embeddings": with_embeddings,
+                "with_tfidf": with_tfidf,
                 **(
                     {"n_embedding_components": n_embedding_components}
                     if with_embeddings
+                    else {}
+                ),
+                **(
+                    {
+                        "tfidf_max_features": tfidf_max_features,
+                        "tfidf_ngram_range": str(tfidf_ngram_range),
+                        "tfidf_min_df": tfidf_min_df,
+                    }
+                    if with_tfidf
                     else {}
                 ),
             }
@@ -199,17 +249,17 @@ def run(
         mlflow.log_metrics({**train_metrics, **test_metrics})
         mlflow.log_dict({"feature_names": feature_names}, "feature_names.json")
         mlflow.lightgbm.log_model(model, name="model")
-        if embedding_pca_pipeline is not None:
-            # Logged as a SEPARATE artifact, not folded into one sklearn
-            # Pipeline with the LightGBM model: this PCA only ever sees
-            # the embedding columns, not the full feature matrix, so it
-            # doesn't chain the way models/anomaly/train.py's single
-            # combined preprocessor+model pipeline does. Both artifacts
-            # must be loaded and applied in this same order at inference
-            # time later.
-            mlflow.sklearn.log_model(
-                embedding_pca_pipeline, name="embedding_pca_pipeline"
-            )
+        # Each fitted transformer logged as its OWN artifact, not folded
+        # into one sklearn Pipeline with the LightGBM model: each only
+        # sees its own slice of columns (embedding_cols / text), not the
+        # full feature matrix, so they don't chain the way
+        # models/anomaly/train.py's single combined preprocessor+model
+        # pipeline does. Must be loaded and applied in the same order at
+        # inference time later (train/serve skew otherwise).
+        if "embedding_pca_pipeline" in fitted:
+            mlflow.sklearn.log_model(fitted["embedding_pca_pipeline"], name="embedding_pca_pipeline")
+        if "tfidf_vectorizer" in fitted:
+            mlflow.sklearn.log_model(fitted["tfidf_vectorizer"], name="tfidf_vectorizer")
         print(
             f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={experiment_name})"
         )
@@ -228,11 +278,25 @@ def main():
         "--with_embeddings",
         action="store_true",
         help="Add PCA-reduced text embeddings as features - not useful until "
-        "features/text_embeddings.py's full-dataset run is done (see module docstring).",
+        "features/text_embeddings.py's full-dataset run is done (see module docstring). "
+        "Independently combinable with --with_tfidf.",
     )
     parser.add_argument(
         "--n_embedding_components", type=int, default=N_EMBEDDING_COMPONENTS
     )
+    parser.add_argument(
+        "--with_tfidf",
+        action="store_true",
+        help="Add TF-IDF n-gram features, fit on the train fold only - real "
+        "standalone signal already measured (see data.py module docstring). "
+        "Independently combinable with --with_embeddings.",
+    )
+    parser.add_argument("--tfidf_max_features", type=int, default=TFIDF_MAX_FEATURES)
+    parser.add_argument(
+        "--tfidf_ngram_range", type=int, nargs=2, default=list(TFIDF_NGRAM_RANGE),
+        metavar=("MIN_N", "MAX_N"),
+    )
+    parser.add_argument("--tfidf_min_df", type=int, default=TFIDF_MIN_DF)
     args = parser.parse_args()
     run(
         args.sources,
@@ -244,6 +308,10 @@ def main():
         args.random_state,
         with_embeddings=args.with_embeddings,
         n_embedding_components=args.n_embedding_components,
+        with_tfidf=args.with_tfidf,
+        tfidf_max_features=args.tfidf_max_features,
+        tfidf_ngram_range=tuple(args.tfidf_ngram_range),
+        tfidf_min_df=args.tfidf_min_df,
     )
 
 

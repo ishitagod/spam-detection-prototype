@@ -25,6 +25,7 @@ Run by hand:
 """
 
 import argparse
+import ast
 from pathlib import Path
 
 import matplotlib
@@ -41,23 +42,34 @@ import shap
 from sklearn.model_selection import train_test_split
 
 from models.rule_pattern.data import build_feature_matrix, load_labelled_messages
-
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
-MLFLOW_EXPERIMENT_NAME = "rule_pattern_score"
+from models.rule_pattern.train import (
+    MLFLOW_EXPERIMENT_NAME,
+    MLFLOW_EXPERIMENTAL_EXPERIMENT_NAME,
+    MLFLOW_TRACKING_URI,
+)
 
 
 def resolve_run_id(run_id: str | None) -> str:
-    """No run_id given -> latest real run in rule_pattern_score"""
+    """
+    No run_id given -> latest real run, checked across BOTH the real
+    baseline experiment and the experimental one (with_embeddings/
+    with_tfidf runs) - imported directly from models.rule_pattern.train
+    rather than redefined here, so this can never silently drift out of
+    sync with wherever train.py actually logs to (this already happened
+    once: train.py's experiment name changed and this file's own stale
+    copy stopped finding new runs).
+    """
     if run_id:
         return run_id
     runs = mlflow.search_runs(
-        experiment_names=[MLFLOW_EXPERIMENT_NAME],
+        experiment_names=[MLFLOW_EXPERIMENT_NAME, MLFLOW_EXPERIMENTAL_EXPERIMENT_NAME],
         order_by=["start_time DESC"],
         max_results=1,
     )
     if runs.empty:
         raise RuntimeError(
-            f"No runs found in experiment '{MLFLOW_EXPERIMENT_NAME}' - train one first."
+            f"No runs found in '{MLFLOW_EXPERIMENT_NAME}' or "
+            f"'{MLFLOW_EXPERIMENTAL_EXPERIMENT_NAME}' - train one first."
         )
     resolved = runs.iloc[0]["run_id"]
     print(f"No --run_id given, using latest: {resolved}")
@@ -67,27 +79,57 @@ def resolve_run_id(run_id: str | None) -> str:
 def rebuild_test_split(run: mlflow.entities.Run, data_dir: Path):
     """
     Rebuilds the EXACT held-out test set that run trained/evaluated on, by
-    reading sources/test_size/random_state back from the run's own params -
-    not fresh CLI defaults, which could silently mismatch what the loaded
-    model actually saw.
+    reading sources/test_size/random_state/with_embeddings/with_tfidf back
+    from the run's own params - not fresh CLI defaults, which could
+    silently mismatch what the loaded model actually saw. Also rebuilds
+    the same train_mask train.py used, since with_tfidf/with_embeddings
+    runs fit their vectorizer/PCA on the train fold only - passing the
+    wrong mask here would silently score the test set through a
+    differently-fit transformer than the one the model was trained
+    against.
     """
     params = run.data.params
     sources = params["sources"].split(",")
     test_size = float(params["test_size"])
     random_state = int(params["random_state"])
+    with_embeddings = params.get("with_embeddings") == "True"
+    with_tfidf = params.get("with_tfidf") == "True"
 
-    frames = [
-        load_labelled_messages(data_dir / s / "messages_with_behavioral.csv")
-        for s in sources
-    ]
+    if with_embeddings:
+        from models.rule_pattern.data import load_labelled_messages_with_embeddings
+        frames = [
+            load_labelled_messages_with_embeddings(data_dir / s, data_dir / s / "messages_with_behavioral.csv")
+            for s in sources
+        ]
+    else:
+        frames = [
+            load_labelled_messages(data_dir / s / "messages_with_behavioral.csv")
+            for s in sources
+        ]
     df = pd.concat(frames, ignore_index=True)
-    X, y, feature_names = build_feature_matrix(df)
+    y_full = (df["rule_flagged"] == True).astype(int).to_numpy()  # noqa: E712
 
     idx_train, idx_test = train_test_split(
         np.arange(len(df)),
         test_size=test_size,
-        stratify=y,
+        stratify=y_full,
         random_state=random_state,
+    )
+    train_mask = np.zeros(len(df), dtype=bool)
+    train_mask[idx_train] = True
+
+    tfidf_ngram_range = (
+        ast.literal_eval(params["tfidf_ngram_range"]) if "tfidf_ngram_range" in params else (1, 3)
+    )
+    X, y, feature_names, _fitted = build_feature_matrix(
+        df,
+        train_mask=train_mask,
+        use_embeddings=with_embeddings,
+        n_embedding_components=int(params["n_embedding_components"]) if with_embeddings else 30,
+        use_tfidf=with_tfidf,
+        tfidf_max_features=int(params.get("tfidf_max_features", 500)),
+        tfidf_ngram_range=tfidf_ngram_range,
+        tfidf_min_df=int(params.get("tfidf_min_df", 5)),
     )
     return X[idx_test], y[idx_test], feature_names
 

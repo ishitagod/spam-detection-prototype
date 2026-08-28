@@ -281,6 +281,19 @@ def run_faiss_near_dup(
     `originator`, which text_embeddings.py's id_map doesn't carry (that
     module has no notion of "sender" - kept separate on purpose).
     """
+    # Pinned to 1 thread as a diagnostic: a real crash
+    # (STATUS_STACK_BUFFER_OVERRUN, exit -1073740791) was hit running this
+    # against SMPP's full 5.5M-row embeddings for the first time - real
+    # sender velocity here reaches 48,606 msgs/hr for one sender (vs a
+    # 6,726 median), which at FAISS_NEAR_DUP_THRESHOLD=0.92 can make
+    # range_search's uncapped match array blow up combinatorially for a
+    # single bursty sender's window. Native OpenMP parallel range_search
+    # crashing on Windows under that kind of load is a known failure
+    # class for faiss-cpu; this rules it out (or doesn't) before touching
+    # chunk_size/threshold, which trade against the deliberate
+    # "don't undercount prolific senders" choice documented above.
+    faiss.omp_set_num_threads(1)
+
     source_dir = Path(source_dir)
     emb_path = source_dir / "embeddings.npy"
     id_map_path = source_dir / "embeddings_id_map.parquet"
