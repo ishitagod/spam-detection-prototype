@@ -215,6 +215,23 @@ def _spread_rows(n, minutes_apart=20, same_text_every=3):
     return embeddings, rows
 
 
+def test_query_batching_matches_single_batch_exactly():
+    """Real bug this guards against: batching the QUERY side of
+    range_search() (config/settings.py's FAISS_QUERY_BATCH_SIZE) must find
+    the EXACT same matches as one unbatched call - it's a memory-shape
+    fix, not an approximation. query_batch_size=4 forces multiple batches
+    over 30 rows; default (>= n) takes the single-call path."""
+    embeddings, rows = _spread_rows(30)
+    id_map = pd.DataFrame(rows)
+    emb = np.array(embeddings, dtype=np.float32)
+    windows = {"short": np.timedelta64(1, "h"), "long": np.timedelta64(6, "h")}
+
+    single_batch = compute_near_dup_features(emb, id_map, windows=windows, query_batch_size=len(rows))
+    multi_batch = compute_near_dup_features(emb, id_map, windows=windows, query_batch_size=4)
+
+    pd.testing.assert_frame_equal(single_batch, multi_batch)
+
+
 def test_chunked_matches_unchunked_exactly():
     embeddings, rows = _spread_rows(30)
     id_map = pd.DataFrame(rows)

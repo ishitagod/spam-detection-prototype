@@ -57,3 +57,15 @@ FAISS_NEAR_DUP_WINDOW_LONG = "24h"
 # that function's docstring). ~500k rows x 384 floats x 4 bytes =~
 # 770MB per chunk, comfortable headroom on typical hardware.
 FAISS_CHUNK_SIZE = 500_000
+
+# How many query rows compute_near_dup_features() sends to index.range_search()
+# per call - does NOT bound the index itself (that's FAISS_CHUNK_SIZE +
+# the 24hr buffer, which for a dense real corpus can be a large fraction
+# of the whole thing - see that function's docstring). range_search's
+# match-array size scales with query-count x candidate-density, so one
+# call over the FULL chunk+buffer as queries can allocate an enormous
+# array in one shot (a real crash hit in practice, exit -1073740791,
+# on a corpus this dense). Batching the QUERY side only spreads that same
+# total allocation across many smaller calls - it changes nothing about
+# which matches get found, just bounds peak memory per call.
+FAISS_QUERY_BATCH_SIZE = 10_000
