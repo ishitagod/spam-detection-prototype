@@ -54,6 +54,12 @@ if (-not (Test-Path $python)) {
 # interprets python.exe's bytes on the way in.
 $env:PYTHONIOENCODING = "utf-8"
 $OutputEncoding = [System.Text.Encoding]::UTF8
+# Piping python's stdout through Tee-Object (below) makes Python switch
+# from line-buffered to block-buffered (~8KB) - prints in faiss_index.py's
+# per-chunk progress loop genuinely execute but sit unflushed for minutes
+# on a long step, making a live run look hung when it isn't. Unbuffered
+# stdout restores live progress through the pipe.
+$env:PYTHONUNBUFFERED = "1"
 
 $StartTime = Get-Date
 $LogPath = Join-Path $ProjectRoot "scripts\run_full_pipeline.log"

@@ -86,6 +86,16 @@ DEFAULT_WINDOWS = {
 _gpu_resources = None  # lazily created, process-wide - one GPU resource
 # pool reused across every chunk's index build, not re-allocated per call.
 
+_gpu_range_search_confirmed_unsupported = False  # set True after the first
+# RuntimeError from index.range_search() on GPU - CONFIRMED (not "some
+# builds don't support it") universal across FAISS's GPU indexes as of
+# writing: GPU faiss simply never implements range_search, only fixed-K
+# search. Every chunk hitting this cold would waste a full GPU index
+# build+add per chunk for a guaranteed failure - this flag makes
+# compute_near_dup_features() skip straight to CPU after the first chunk
+# confirms it, rather than repeating the same wasted GPU attempt on every
+# remaining chunk of a run.
+
 
 def _to_gpu(index: "faiss.Index") -> "faiss.Index":
     """
@@ -150,18 +160,24 @@ def compute_near_dup_features(
     timestamps = pd.to_datetime(id_map["timestamp"]).to_numpy()
     originators = id_map["originator"].astype(str).to_numpy()
 
-    index = build_index(embeddings, use_gpu=use_gpu)
+    global _gpu_range_search_confirmed_unsupported
+    use_gpu_this_call = use_gpu and not _gpu_range_search_confirmed_unsupported
+
+    index = build_index(embeddings, use_gpu=use_gpu_this_call)
     try:
         lims, sims, matches = index.range_search(embeddings, threshold)
     except RuntimeError as e:
-        # Not every GPU faiss build/index type supports range_search
-        # (unlike CPU FlatIP, which always does) - this whole feature
-        # depends on range_search specifically (see module docstring on
-        # why, vs. a fixed top-K), so retry on CPU rather than crash the
-        # whole pipeline over a GPU-search gap.
-        if not use_gpu:
+        # GPU faiss doesn't implement range_search at all (confirmed, not
+        # "some builds don't support it") - this whole feature depends on
+        # range_search specifically (see module docstring on why, vs. a
+        # fixed top-K), so retry on CPU rather than crash the whole
+        # pipeline over a GPU-search gap. Latched module-wide so a
+        # multi-chunk run only pays this failed-attempt cost once, not
+        # once per chunk.
+        if not use_gpu_this_call:
             raise
-        print(f"  GPU index.range_search failed ({e}) - retrying this chunk on CPU.")
+        print(f"  GPU index.range_search failed ({e}) - retrying this chunk on CPU, and skipping GPU for the rest of this run.")
+        _gpu_range_search_confirmed_unsupported = True
         index = build_index(embeddings, use_gpu=False)
         lims, sims, matches = index.range_search(embeddings, threshold)
 
