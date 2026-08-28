@@ -58,14 +58,36 @@ FAISS_NEAR_DUP_WINDOW_LONG = "24h"
 # 770MB per chunk, comfortable headroom on typical hardware.
 FAISS_CHUNK_SIZE = 500_000
 
-# How many query rows compute_near_dup_features() sends to index.range_search()
-# per call - does NOT bound the index itself (that's FAISS_CHUNK_SIZE +
-# the 24hr buffer, which for a dense real corpus can be a large fraction
-# of the whole thing - see that function's docstring). range_search's
-# match-array size scales with query-count x candidate-density, so one
-# call over the FULL chunk+buffer as queries can allocate an enormous
-# array in one shot (a real crash hit in practice, exit -1073740791,
-# on a corpus this dense). Batching the QUERY side only spreads that same
-# total allocation across many smaller calls - it changes nothing about
-# which matches get found, just bounds peak memory per call.
+# How many query rows compute_near_dup_features() sends to FAISS per call -
+# does NOT bound the index itself (that's FAISS_CHUNK_SIZE + the 24hr
+# buffer, which for a dense real corpus can be a large fraction of the
+# whole thing - see that function's docstring). Batching the QUERY side
+# spreads a call's total match allocation across many smaller calls -
+# changes nothing about which matches get found, just bounds peak memory
+# per call.
 FAISS_QUERY_BATCH_SIZE = 10_000
+
+# Hard cap on near-dup candidates returned PER QUERY MESSAGE -
+# compute_near_dup_features() uses a fixed-K faiss.Index.search() (top-K
+# by similarity), then threshold-filters the K results, instead of
+# faiss.Index.range_search() (find EVERY match above threshold, however
+# many). range_search's uncapped result size was the real cause of a
+# native crash (STATUS_STACK_BUFFER_OVERRUN, exit -1073740791) on a dense
+# real corpus - one bursty sender's messages within a chunk+24hr-buffer
+# can mutually match in the hundreds of thousands to millions of pairs.
+#
+# This is a genuine tradeoff, not a free optimization - same one common
+# production near-dup/dedup systems make: bounded, predictable resource
+# usage over guaranteed-exact counts for pathological cases. If a
+# message's true near-dup count exceeds this cap, it's undercounted (see
+# that function's truncation warning) - accepted because a message that
+# hits a 100k-candidate cap is already unambiguously an extreme,
+# rule-worthy outlier; the exact count past that point adds little.
+#
+# Sized off real data: SMPP's real sender_msgs_last_1hr distribution
+# (see models/rule_pattern/train.py's REAL LABEL COMPOSITION-style
+# checks) has median 6,726, 99.99th percentile 48,554, max 48,606 -
+# 100k gives real headroom above the single worst observed hour, while
+# still bounding compute/memory to a small, fixed fraction of what a
+# true unbounded blowup could reach.
+FAISS_MAX_MATCHES_PER_QUERY = 100_000

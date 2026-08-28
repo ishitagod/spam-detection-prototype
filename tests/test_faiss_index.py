@@ -215,6 +215,35 @@ def _spread_rows(n, minutes_apart=20, same_text_every=3):
     return embeddings, rows
 
 
+def test_max_matches_per_query_caps_count_and_warns(capsys):
+    """Real tradeoff this guards against: max_matches_per_query bounds
+    faiss.Index.search()'s K, so a message with MORE true near-dups than
+    the cap is deliberately undercounted (see config/settings.py's
+    FAISS_MAX_MATCHES_PER_QUERY) rather than crashing on an unbounded
+    range_search result. 10 identical earlier messages, cap of 5 - count
+    must be capped at 5, not the true 10, and a truncation warning must
+    print so this isn't a silent accuracy loss."""
+    n_earlier = 10
+    embeddings = [BASE] * n_earlier + [BASE]  # query (last) identical to all
+    rows = [
+        row(f"m{i}", timestamp=f"2026-08-19T10:{i:02d}:00") for i in range(n_earlier)
+    ] + [row("query", timestamp="2026-08-19T10:59:00")]
+
+    result = run(embeddings, rows, windows={"w": np.timedelta64(2, "h")})
+    query_row = result[result["message_key"] == "query"].iloc[0]
+    assert query_row["near_dup_match_count_w"] == n_earlier  # uncapped: finds all 10
+
+    capped = compute_near_dup_features(
+        np.array(embeddings, dtype=np.float32), pd.DataFrame(rows),
+        threshold=THRESHOLD, windows={"w": np.timedelta64(2, "h")},
+        max_matches_per_query=5,
+    )
+    capped_query_row = capped[capped["message_key"] == "query"].iloc[0]
+    assert capped_query_row["near_dup_match_count_w"] == 5  # capped, undercounts the true 10
+
+    assert "hit the 5-candidate cap" in capsys.readouterr().out
+
+
 def test_query_batching_matches_single_batch_exactly():
     """Real bug this guards against: batching the QUERY side of
     range_search() (config/settings.py's FAISS_QUERY_BATCH_SIZE) must find

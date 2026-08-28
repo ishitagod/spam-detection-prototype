@@ -34,11 +34,19 @@ THREE OUTPUT FEATURES PER WINDOW, AND BOTH WINDOWS MATTER:
     behavioral history, so a message that evades every near-dup window
     can still surface as anomalous on other axes.
 
-Uses FAISS range_search, not a fixed top-K search: a fixed K would
-undercount matches for very prolific senders (real data has senders with
-hundreds of thousands of messages - see behavioral.py's docstring).
-range_search returns EVERY match above the similarity threshold, however
-many there are. ONE range_search call covers every configured window -
+Uses a BOUNDED fixed-K FAISS search (faiss.Index.search()), then
+threshold-filters the K results - not faiss.Index.range_search() (find
+EVERY match above threshold, however many). range_search's uncapped
+result size was a real cause of a native crash (STATUS_STACK_BUFFER_
+OVERRUN) on a dense real corpus: one bursty sender's messages within a
+chunk+24hr-buffer can mutually match in the hundreds/millions of pairs
+(real data has senders with hundreds of thousands of messages - see
+behavioral.py's docstring). K is set generously above real observed
+sender velocity (config/settings.py's FAISS_MAX_MATCHES_PER_QUERY) - a
+genuine tradeoff, the same one common production near-dup/dedup systems
+make: bounded, predictable resource usage over a guaranteed-exact count
+for pathological cases (see compute_near_dup_features()'s docstring and
+its truncation warning). ONE search call covers every configured window -
 windows only change which of the SAME raw matches get counted per
 message, so scoring N windows costs one index build + one search, not N
 of them.
@@ -65,6 +73,7 @@ import pandas as pd
 
 from config.settings import (
     FAISS_CHUNK_SIZE,
+    FAISS_MAX_MATCHES_PER_QUERY,
     FAISS_NEAR_DUP_THRESHOLD,
     FAISS_NEAR_DUP_WINDOW_LONG,
     FAISS_NEAR_DUP_WINDOW_SHORT,
@@ -87,15 +96,12 @@ DEFAULT_WINDOWS = {
 _gpu_resources = None  # lazily created, process-wide - one GPU resource
 # pool reused across every chunk's index build, not re-allocated per call.
 
-_gpu_range_search_confirmed_unsupported = False  # set True after the first
-# RuntimeError from index.range_search() on GPU - CONFIRMED (not "some
-# builds don't support it") universal across FAISS's GPU indexes as of
-# writing: GPU faiss simply never implements range_search, only fixed-K
-# search. Every chunk hitting this cold would waste a full GPU index
-# build+add per chunk for a guaranteed failure - this flag makes
-# compute_near_dup_features() skip straight to CPU after the first chunk
-# confirms it, rather than repeating the same wasted GPU attempt on every
-# remaining chunk of a run.
+_gpu_search_confirmed_unsupported = False  # set True after the first
+# RuntimeError from index.search() on GPU - unlike range_search (which
+# GPU faiss never implements at all), fixed-K search() IS generally
+# GPU-supported, so this is just a generic safety latch, not an expected
+# path. Kept for the same reason as before: if it ever does fail, don't
+# repeat the same wasted GPU attempt on every remaining chunk of a run.
 
 
 def _to_gpu(index: "faiss.Index") -> "faiss.Index":
@@ -144,6 +150,7 @@ def compute_near_dup_features(
     windows: dict[str, np.timedelta64] | None = None,
     use_gpu: bool = False,
     query_batch_size: int = FAISS_QUERY_BATCH_SIZE,
+    max_matches_per_query: int = FAISS_MAX_MATCHES_PER_QUERY,
 ) -> pd.DataFrame:
     """
     `id_map` must have `message_key`, `originator`, `timestamp` - same
@@ -151,19 +158,29 @@ def compute_near_dup_features(
     `windows`: name -> trailing-window duration (defaults to
     DEFAULT_WINDOWS, the configured 1hr/24hr pair). Returns one row per
     input message, same order, with 3 near_dup_* columns per window.
-    `use_gpu`: see build_index()/_to_gpu().
+    `use_gpu`: see build_index()/_to_gpu() - fixed-K search() (unlike
+    range_search) is generally GPU-supported, so this can actually help
+    here.
+
+    Uses a fixed-K `index.search()` (top-K by similarity), then
+    threshold-filters the K results - NOT `index.range_search()` (find
+    EVERY match above threshold, however many). range_search's uncapped
+    result size was a real cause of a native crash (STATUS_STACK_BUFFER_
+    OVERRUN, exit -1073740791): one bursty sender's messages within a
+    chunk+24hr-buffer can mutually match in the hundreds of thousands to
+    millions of pairs on a dense real corpus. Bounded top-K, then
+    threshold-filtered, is the same tradeoff common production near-dup/
+    dedup systems make - see config/settings.py's
+    FAISS_MAX_MATCHES_PER_QUERY for how the cap was sized and why this is
+    a genuine tradeoff (can undercount a message whose TRUE near-dup
+    count exceeds the cap), not a free optimization.
 
     `query_batch_size`: the INDEX is still built over every row of
     `embeddings` in one shot (cheap - index.add() is just a memcpy-scale
-    op) - only the QUERY side of range_search() is batched. Real bug this
-    fixes: range_search's match-array size scales with query-count x
-    candidate-density, so querying the FULL set at once against a dense,
-    heavily-templated corpus can allocate one enormous array in a single
-    call (hit in practice as a native crash, exit -1073740791, on a
-    real corpus where the 24hr buffer alone was ~3M rows - see
-    config/settings.py's FAISS_QUERY_BATCH_SIZE). Batching queries finds
-    the EXACT same matches, just spread across many smaller allocations
-    instead of one - this is a memory-shape fix, not an approximation.
+    op) - only the QUERY side of search() is batched, to keep any single
+    call's allocations (bounded to query_batch_size x max_matches_per_query
+    now, rather than query_batch_size x whatever range_search would have
+    found) comfortably small regardless of chunk size.
     """
     windows = windows if windows is not None else DEFAULT_WINDOWS
     missing = [c for c in REQUIRED_ID_MAP_COLS if c not in id_map.columns]
@@ -174,10 +191,12 @@ def compute_near_dup_features(
     timestamps = pd.to_datetime(id_map["timestamp"]).to_numpy()
     originators = id_map["originator"].astype(str).to_numpy()
 
-    global _gpu_range_search_confirmed_unsupported
-    use_gpu_this_call = use_gpu and not _gpu_range_search_confirmed_unsupported
+    global _gpu_search_confirmed_unsupported
+    use_gpu_this_call = use_gpu and not _gpu_search_confirmed_unsupported
 
     index = build_index(embeddings, use_gpu=use_gpu_this_call)
+    # Can't ask a FAISS index for more neighbors than it holds.
+    k = min(max_matches_per_query, embeddings.shape[0])
 
     columns = {"message_key": id_map["message_key"].to_numpy()}
     for name in windows:
@@ -185,36 +204,51 @@ def compute_near_dup_features(
         columns[f"{COL_MAX_SIM}_{name}"] = np.zeros(n, dtype=np.float64)
         columns[f"{COL_DISTINCT_SENDERS}_{name}"] = np.zeros(n, dtype=np.int64)
 
+    truncated_count = 0  # messages whose top-K was still all >= threshold -
+    # their TRUE near-dup count may exceed k, see docstring.
+
     batch_start = 0
     while batch_start < n:
         batch_end = min(batch_start + query_batch_size, n)
         query_batch = embeddings[batch_start:batch_end]
 
         try:
-            lims, sims, matches = index.range_search(query_batch, threshold)
+            sims, matches = index.search(query_batch, k)
         except RuntimeError as e:
-            # GPU faiss doesn't implement range_search at all (confirmed,
-            # not "some builds don't support it") - this whole feature
-            # depends on range_search specifically (see module docstring
-            # on why, vs. a fixed top-K), so retry on CPU rather than
-            # crash the whole pipeline over a GPU-search gap. Latched
-            # module-wide so a multi-chunk, multi-batch run only pays
-            # this failed-attempt cost once, not once per batch.
+            # Generic safety net, not an expected path - fixed-K search()
+            # is generally GPU-supported (unlike range_search, which
+            # never is). Latched module-wide so a multi-chunk, multi-batch
+            # run only pays a failed-attempt cost once, not once per batch.
             if not use_gpu_this_call:
                 raise
-            print(f"  GPU index.range_search failed ({e}) - retrying on CPU, and skipping GPU for the rest of this run.")
-            _gpu_range_search_confirmed_unsupported = True
+            print(f"  GPU index.search failed ({e}) - retrying on CPU, and skipping GPU for the rest of this run.")
+            _gpu_search_confirmed_unsupported = True
             use_gpu_this_call = False
             index = build_index(embeddings, use_gpu=False)
-            lims, sims, matches = index.range_search(query_batch, threshold)
+            sims, matches = index.search(query_batch, k)
 
-        # matches/row_matches are absolute row indices into the FULL
-        # `embeddings`/`timestamps` (the index covers all of it) - only
-        # the query side (j, i) is batch-local vs. global.
+        # search() returns exactly k neighbors per query, sorted by
+        # similarity descending, padded with -1/-inf if the index holds
+        # fewer than k vectors total. matches/sims are batch-local
+        # (row j = query batch_start+j); index positions inside a row are
+        # absolute into the FULL `embeddings`/`timestamps`.
         for j in range(batch_end - batch_start):
             i = batch_start + j
-            row_matches = matches[lims[j] : lims[j + 1]]
-            row_sims = sims[lims[j] : lims[j + 1]]
+            row_matches = matches[j]
+            row_sims = sims[j]
+
+            valid = row_matches >= 0
+            row_matches = row_matches[valid]
+            row_sims = row_sims[valid]
+
+            above_threshold = row_sims >= threshold
+            if above_threshold.all() and len(row_sims) == k:
+                # Every one of the k nearest (the most similarity could
+                # possibly return) still cleared threshold - there may be
+                # more real matches beyond rank k that this call can't see.
+                truncated_count += 1
+            row_matches = row_matches[above_threshold]
+            row_sims = row_sims[above_threshold]
 
             # Point-in-time, shared across every window: strictly before
             # message i. Excludes i itself automatically (age is never > 0
@@ -233,6 +267,13 @@ def compute_near_dup_features(
 
         batch_start = batch_end
 
+    if truncated_count:
+        print(
+            f"  WARNING: {truncated_count} message(s) hit the {k}-candidate "
+            "cap (FAISS_MAX_MATCHES_PER_QUERY) - their real near-dup count "
+            "may be higher than what's recorded."
+        )
+
     return pd.DataFrame(columns)
 
 
@@ -244,6 +285,7 @@ def compute_near_dup_features_chunked(
     windows: dict[str, np.timedelta64] | None = None,
     use_gpu: bool = False,
     query_batch_size: int = FAISS_QUERY_BATCH_SIZE,
+    max_matches_per_query: int = FAISS_MAX_MATCHES_PER_QUERY,
 ) -> pd.DataFrame:
     """
     Same output as compute_near_dup_features() (verified equal in
@@ -294,6 +336,7 @@ def compute_near_dup_features_chunked(
             windows=windows,
             use_gpu=use_gpu,
             query_batch_size=query_batch_size,
+            max_matches_per_query=max_matches_per_query,
         )
         chunk_offset = (
             pos - buffer_start
@@ -320,6 +363,7 @@ def run_faiss_near_dup(
     chunk_size: int = FAISS_CHUNK_SIZE,
     use_gpu: bool = False,
     query_batch_size: int = FAISS_QUERY_BATCH_SIZE,
+    max_matches_per_query: int = FAISS_MAX_MATCHES_PER_QUERY,
 ) -> None:
     """
     `source_dir` must already contain embeddings.npy + embeddings_id_map.parquet
@@ -330,14 +374,15 @@ def run_faiss_near_dup(
     # Was pinned to 1 thread as a diagnostic after a real crash
     # (STATUS_STACK_BUFFER_OVERRUN, exit -1073740791) on SMPP's full
     # 5.5M-row embeddings - since ruled out as the cause: the crash was
-    # range_search's match array blowing up combinatorially for a dense
-    # 24hr buffer (real sender velocity here reaches 48,606 msgs/hr),
-    # fixed properly by batching the QUERY side of range_search
-    # (query_batch_size above / compute_near_dup_features()'s docstring),
-    # not by single-threading. Left single-threaded, this module runs
-    # ~8-10x+ slower than necessary on a real multi-core machine for no
-    # remaining safety benefit - not pinning it here lets FAISS use every
-    # core, same as its own default.
+    # range_search's uncapped match array blowing up combinatorially for a
+    # dense 24hr buffer (real sender velocity here reaches 48,606 msgs/hr),
+    # fixed properly by (1) switching to a bounded fixed-K search() (see
+    # FAISS_MAX_MATCHES_PER_QUERY / compute_near_dup_features()'s
+    # docstring) and (2) batching the query side on top of that
+    # (query_batch_size), not by single-threading. Left single-threaded,
+    # this module runs ~8-10x+ slower than necessary on a real multi-core
+    # machine for no remaining safety benefit - not pinning it here lets
+    # FAISS use every core, same as its own default.
 
     source_dir = Path(source_dir)
     emb_path = source_dir / "embeddings.npy"
@@ -365,11 +410,12 @@ def run_faiss_near_dup(
 
     print(
         f"Computing near-dup features for {len(id_map)} message(s) "
-        f"(chunk_size={chunk_size}, query_batch_size={query_batch_size}, use_gpu={use_gpu}) ..."
+        f"(chunk_size={chunk_size}, query_batch_size={query_batch_size}, "
+        f"max_matches_per_query={max_matches_per_query}, use_gpu={use_gpu}) ..."
     )
     result = compute_near_dup_features_chunked(
         embeddings, id_map, chunk_size=chunk_size, use_gpu=use_gpu,
-        query_batch_size=query_batch_size,
+        query_batch_size=query_batch_size, max_matches_per_query=max_matches_per_query,
     )
 
     out_path = Path(out_path)
@@ -397,11 +443,18 @@ def main():
     parser.add_argument("--chunk_size", type=int, default=FAISS_CHUNK_SIZE)
     parser.add_argument(
         "--query_batch_size", type=int, default=FAISS_QUERY_BATCH_SIZE,
-        help="Query-side batch size for index.range_search() - bounds peak "
+        help="Query-side batch size for index.search() - bounds peak "
         "memory per call on a dense corpus where chunk_size's 24hr buffer "
         "can itself be a large fraction of the whole dataset (see "
         "config/settings.py's FAISS_QUERY_BATCH_SIZE). Does not change "
         "which matches are found, only how many calls it takes to find them.",
+    )
+    parser.add_argument(
+        "--max_matches_per_query", type=int, default=FAISS_MAX_MATCHES_PER_QUERY,
+        help="Hard cap on near-dup candidates considered per message - "
+        "fixed-K index.search() + threshold filter, not unbounded "
+        "range_search (see config/settings.py's FAISS_MAX_MATCHES_PER_QUERY "
+        "for how this was sized and why it's a real tradeoff, not free).",
     )
     parser.add_argument(
         "--gpu",
@@ -409,10 +462,8 @@ def main():
         help="Use GPU FAISS if installed (see requirements-gpu.txt) - falls "
         "back to CPU automatically, with a printed message, if a GPU build "
         "isn't actually available. Default: CPU (faiss-cpu, requirements.txt). "
-        "NOTE: range_search (what this module uses) isn't implemented on "
-        "GPU faiss at all - confirmed, not build-specific - so --gpu is a "
-        "no-op here beyond the one wasted first attempt before it falls "
-        "back to CPU. Kept for if a future faiss release adds support.",
+        "Fixed-K search() (what this module uses) is generally GPU-supported, "
+        "unlike range_search - this flag can genuinely help here.",
     )
     args = parser.parse_args()
     run_faiss_near_dup(
@@ -422,6 +473,7 @@ def main():
         chunk_size=args.chunk_size,
         use_gpu=args.gpu,
         query_batch_size=args.query_batch_size,
+        max_matches_per_query=args.max_matches_per_query,
     )
 
 
