@@ -101,9 +101,7 @@ try {
         -PyArgs (@("-m", "features.faiss_index", "--source_dir", "data/processed/SMPP") + $FaissGpuArgs)
 
     Step -Number 3 -Name "3/8 FAISS near-dup - SS7" `
-        -PyArgs (@("-m", "features.faiss_index", "--source_dir", "data/processed/SS7",
-          "--messages_path", "data/processed/SS7/messages_with_behavioral.csv",
-          "--out_path", "data/processed/SS7/faiss_output.parquet") + $FaissGpuArgs)
+        -PyArgs (@("-m", "features.faiss_index", "--source_dir", "data/processed/SS7") + $FaissGpuArgs)
 
     Step -Number 4 -Name "4/8 Isolation Forest (anomaly_score)" `
         -PyArgs @("-m", "models.anomaly.train")

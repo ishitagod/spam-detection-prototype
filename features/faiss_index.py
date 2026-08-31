@@ -435,10 +435,18 @@ def main():
     parser.add_argument(
         "--messages_path",
         type=str,
-        default="data/processed/SMPP/messages_with_behavioral.csv",
+        default=None,
+        help="Defaults to <source_dir>/messages_with_behavioral.csv - pass "
+        "explicitly only to override. NOT defaulted to a hardcoded SMPP "
+        "path: that previously caused --source_dir SS7 runs to silently "
+        "merge in SMPP's messages and overwrite SMPP's faiss_output.parquet.",
     )
     parser.add_argument(
-        "--out_path", type=str, default="data/processed/SMPP/faiss_output.parquet"
+        "--out_path",
+        type=str,
+        default=None,
+        help="Defaults to <source_dir>/faiss_output.parquet - pass "
+        "explicitly only to override.",
     )
     parser.add_argument("--chunk_size", type=int, default=FAISS_CHUNK_SIZE)
     parser.add_argument(
@@ -466,10 +474,17 @@ def main():
         "unlike range_search - this flag can genuinely help here.",
     )
     args = parser.parse_args()
+    source_dir = Path(args.source_dir)
+    messages_path = (
+        Path(args.messages_path)
+        if args.messages_path
+        else source_dir / "messages_with_behavioral.csv"
+    )
+    out_path = Path(args.out_path) if args.out_path else source_dir / "faiss_output.parquet"
     run_faiss_near_dup(
-        Path(args.source_dir),
-        Path(args.messages_path),
-        Path(args.out_path),
+        source_dir,
+        messages_path,
+        out_path,
         chunk_size=args.chunk_size,
         use_gpu=args.gpu,
         query_batch_size=args.query_batch_size,
