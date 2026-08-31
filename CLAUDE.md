@@ -22,8 +22,17 @@ Goal: production-grade working demo first, then iterate.
 - SMPP and SS7 must map to the same canonical schema before shared ML.
 - `source` is a shared feature.
 - SS7-specific fields may remain SS7-only when they carry real signal.
-- Start with one shared model; split by source only if segment evaluation justifies it.
-- Features must be point-in-time valid. Never use future/finalized transaction information.
+- Split by source (SMPP vs SS7) is in progress, not just theoretical: SMPP and SS7 inference
+  is expected to diverge, so both `models/anomaly/train.py` and `models/rule_pattern/train.py`
+  support `--sources SMPP` / `--sources SS7` to train independent models, and
+  `scripts/run_full_pipeline.ps1 -SplitBySource` runs both source-specific pipelines end to end.
+  Split models get their own MLflow experiment/registered names, suffixed by source (e.g.
+  `isolation_forest_SMPP` / `anomaly_score_model_SMPP`) — never mixed with the combined-sources
+  experiment, so champion/challenger comparisons stay apples-to-apples.
+  `scripts/check_source_split_justified.py` reports both the shared model's per-source PR-AUC gap
+  and, once split runs exist, whether each source-specific model actually beats the shared model's
+  slice of it.
+- Features must be point-in-time valid.
 - Rule-resolved traffic (`rule_evaluated == True`) is not scored at real-time inference.
 - Anomaly detection still trains on the full traffic stream.
 - Rule-pattern model trains only on `rule_evaluated == True`.

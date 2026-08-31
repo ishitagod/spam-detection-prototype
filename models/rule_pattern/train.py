@@ -214,6 +214,12 @@ def run(
         if (with_embeddings or with_tfidf)
         else MLFLOW_EXPERIMENT_NAME
     )
+    # A source-restricted run (e.g. --sources SMPP alone) gets its own
+    # experiment on top of that, suffixed by source - same reasoning as
+    # models/anomaly/train.py: keeps a source-specific champion/challenger
+    # lineage separate from the combined-sources one.
+    if sorted(sources) != sorted(["SMPP", "SS7"]):
+        experiment_name += "_" + "_".join(sources)
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(experiment_name)
     with mlflow.start_run():

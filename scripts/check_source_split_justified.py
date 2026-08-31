@@ -1,36 +1,45 @@
 """
 Answers the actual question CLAUDE.md's architecture rule poses: "start
 with one shared model, split by source only if segment evaluation
-justifies it" - has it?
+justifies it" - has it? And once split (see models/anomaly/train.py and
+models/rule_pattern/train.py's --sources filtering, and
+scripts/run_full_pipeline.ps1 -SplitBySource), did splitting actually
+help?
 
-Does NOT train anything new. Both models/rule_pattern/train.py and
-models/anomaly/train.py already log per-source PR-AUC/log-loss on every
-run via models/metrics.py's evaluate_overall_and_per_source() - this
-script just reads the latest logged run of each and reports the gap
-between the shared model's overall metric and its per-source metrics.
+Does NOT train anything new - reads what's already logged to MLflow.
+
+TWO checks, run for each layer:
+
+1. SHARED-MODEL GAP (pre-split question): does the shared model's own
+   per-source PR-AUC slice (models/metrics.py's
+   evaluate_overall_and_per_source(), logged on every combined
+   --sources SMPP SS7 run) vary a lot by source? A big, persistent gap
+   is the signal that a split might help - see module docstring further
+   down for caveats.
+
+2. SPLIT-VS-SHARED (post-split question, only shown once a split
+   experiment has runs): for each source, is the SOURCE-SPECIFIC
+   model's own PR-AUC actually better than that source's slice of the
+   shared model? This is the number that actually justifies KEEPING the
+   split - a source-specific model trained on a smaller pool can easily
+   score worse than the shared model's slice of it (see the small-SMPP-
+   pool caveat below), so don't assume splitting always wins just
+   because the pre-split gap existed.
 
 Usage:
     python -m scripts.check_source_split_justified
     python -m scripts.check_source_split_justified --min_gap 0.05
 
-Interpreting the output: a persistent, large PR-AUC gap between sources
-is the actual justification threshold per CLAUDE.md - not a vibe call.
-A small gap means the shared model (with `source` as a one-hot feature)
-is already capturing what's source-specific; splitting would just add
-2x models/2x MLflow tracking/2x promotion logic for no measured benefit.
-
-CAVEAT you should know before trusting this: SMPP's rule_evaluated pool
-is 2,693 rows, ALL flagged (see models/rule_pattern/train.py's module
-docstring) - PR-AUC is mathematically undefined for SMPP-only slices in
-that model, so it's skipped upstream (not computed, not silently wrong)
-and will show as "not available" below, not zero. The rule_pattern
-comparison is therefore SS7-only in practice today. anomaly_score's
-comparison is real for both sources (its validation pool includes
-SMPP's flagged rows even though PR-AUC there is also skipped for the
-same reason - so anomaly_score's per-source numbers below face the same
-SMPP gap).
+CAVEAT you should know before trusting either check: SMPP's
+rule_evaluated pool is small (2,693 rows as of writing) - both the
+per-source PR-AUC slice and any SMPP-only split model are trained/
+evaluated on a much smaller sample than SS7's, so a gap here is more
+likely to be sampling noise than a real source difference. Rerun with a
+different --random_state on the SMPP-only training command before
+trusting a one-run gap.
 """
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -41,8 +50,12 @@ sys.path.insert(0, str(REPO_ROOT))
 
 MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
 
-# (experiment_name, metric_prefix, label) - metric_prefix matches what
-# each train.py actually passes to evaluate_overall_and_per_source().
+# (combined_experiment_name, metric_prefix, label) - metric_prefix
+# matches what each train.py actually passes to
+# evaluate_overall_and_per_source(). The split experiment name for a
+# given source is derived as f"{combined_experiment_name}_{source}" -
+# see models/anomaly/train.py / models/rule_pattern/train.py's
+# experiment_name suffixing.
 CHECKS = [
     ("light_gbm", "test_", "rule_pattern_score (LightGBM, plain)"),
     ("rule_pattern_score_experimental", "test_", "rule_pattern_score (--with_embeddings/--with_tfidf)"),
@@ -50,6 +63,10 @@ CHECKS = [
 ]
 
 SOURCES = ["SMPP", "SS7"]
+
+
+def pd_isna(x) -> bool:
+    return x is None or (isinstance(x, float) and math.isnan(x))
 
 
 def latest_run(experiment_name: str):
@@ -64,18 +81,20 @@ def latest_run(experiment_name: str):
     return runs.iloc[0] if len(runs) else None
 
 
-def report(experiment_name: str, prefix: str, label: str, min_gap: float) -> None:
-    print(f"\n=== {label} (experiment: {experiment_name}) ===")
+def shared_model_gap(experiment_name: str, prefix: str, label: str, min_gap: float):
+    """Check 1: does the shared model's per-source slice vary a lot?
+    Returns {source: pr_auc} for reuse by split_vs_shared() below."""
+    print(f"\n=== {label} - shared-model gap (experiment: {experiment_name}) ===")
     run = latest_run(experiment_name)
     if run is None:
-        print("  No runs found - train this model first.")
-        return
+        print("  No runs found - train the combined (both-sources) model first.")
+        return {}
 
     overall_key = f"metrics.{prefix}overall_pr_auc"
     overall = run.get(overall_key)
     if overall is None or pd_isna(overall):
         print(f"  {overall_key} not present in latest run - skipping.")
-        return
+        return {}
     print(f"  overall pr_auc: {overall:.4f}")
 
     per_source = {}
@@ -90,32 +109,69 @@ def report(experiment_name: str, prefix: str, label: str, min_gap: float) -> Non
 
     if len(per_source) < 2:
         print("  Fewer than 2 sources have a defined PR-AUC this run - no real cross-source comparison possible yet.")
-        return
+        return per_source
 
     gap = max(per_source.values()) - min(per_source.values())
     print(f"  max cross-source gap: {gap:.4f} (threshold: {min_gap})")
     if gap >= min_gap:
-        print(f"  -> gap >= threshold: consider evaluating a source-specific model for {label}.")
+        print(f"  -> gap >= threshold: worth evaluating a source-specific model for {label}.")
     else:
         print(f"  -> gap < threshold: shared model looks fine for {label}, no split justified yet.")
+    return per_source
 
 
-def pd_isna(x) -> bool:
-    import math
-    return x is None or (isinstance(x, float) and math.isnan(x))
+def split_vs_shared(experiment_name: str, prefix: str, label: str, min_gap: float, shared_per_source: dict):
+    """Check 2: for each source with a split experiment logged, does the
+    source-specific model actually beat that source's slice of the
+    shared model? Only prints anything for sources that HAVE a split
+    experiment - silent (not a failure) if you haven't split yet."""
+    any_split = False
+    for source in SOURCES:
+        split_experiment = f"{experiment_name}_{source}"
+        run = latest_run(split_experiment)
+        if run is None:
+            continue  # not split for this source - nothing to compare
+        any_split = True
+
+        split_metric = run.get(f"metrics.{prefix}overall_pr_auc")
+        if split_metric is None or pd_isna(split_metric):
+            print(f"\n=== {label} - split vs shared ({source}) ===")
+            print(f"  {split_experiment}: latest run has no {prefix}overall_pr_auc - skipping.")
+            continue
+
+        shared_metric = shared_per_source.get(source)
+        print(f"\n=== {label} - split vs shared ({source}) ===")
+        print(f"  split model  ({split_experiment}): pr_auc = {split_metric:.4f}")
+        if shared_metric is None:
+            print(f"  shared model's {source} slice: not available this run - can't compare directly.")
+            continue
+        print(f"  shared model's {source} slice:      pr_auc = {shared_metric:.4f}")
+        delta = split_metric - shared_metric
+        print(f"  delta (split - shared): {delta:+.4f} (threshold: {min_gap})")
+        if delta >= min_gap:
+            print(f"  -> split model clearly beats the shared model's {source} slice - keep the split for {source}.")
+        elif delta <= -min_gap:
+            print(f"  -> split model is WORSE than the shared model's {source} slice - "
+                  f"revert {source} to the shared model (likely too little data to split, see module docstring).")
+        else:
+            print(f"  -> within noise of the shared model's {source} slice - split isn't earning its complexity yet.")
+
+    if not any_split:
+        print(f"\n=== {label} - split vs shared: no split runs found (see scripts/run_full_pipeline.ps1 -SplitBySource) ===")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--min_gap", type=float, default=0.05,
-        help="PR-AUC gap between sources at/above which a split is worth evaluating (default: 0.05).",
+        help="PR-AUC gap/delta at/above which a split is worth evaluating or keeping (default: 0.05).",
     )
     args = parser.parse_args()
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     for experiment_name, prefix, label in CHECKS:
-        report(experiment_name, prefix, label, args.min_gap)
+        shared_per_source = shared_model_gap(experiment_name, prefix, label, args.min_gap)
+        split_vs_shared(experiment_name, prefix, label, args.min_gap, shared_per_source)
 
 
 if __name__ == "__main__":

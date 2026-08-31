@@ -19,18 +19,32 @@
 #                                                 # you're just re-running FAISS on
 #   .\scripts\run_full_pipeline.ps1 -FaissGpu    # use GPU faiss for steps 2/3
 #                                                 # (see requirements-gpu.txt)
+#   .\scripts\run_full_pipeline.ps1 -SplitBySource -StartAt 4
+#                                                 # train + promote SMPP and SS7 as
+#                                                 # separate models (steps 4-7 run
+#                                                 # twice) instead of one combined model
 
 param(
     [double]$MinImprovement = 0.0,
     [int]$StartAt = 1,  # first step NUMBER to actually run - earlier steps are
                          # printed as SKIPPED, not executed. Use when a step's
                          # output already exists on disk from a prior run.
-    [switch]$FaissGpu   # pass --gpu to the FAISS steps (2/8, 3/8). Off by
+    [switch]$FaissGpu,  # pass --gpu to the FAISS steps (2/8, 3/8). Off by
                          # default - requires requirements-gpu.txt installed
                          # (see that file; UNTESTED as of writing). Safe to
                          # try even if not installed - features/faiss_index.py
                          # detects a missing GPU build and falls back to CPU
                          # with a printed message rather than failing.
+    [switch]$SplitBySource  # train + compare/promote SMPP and SS7 as
+                         # SEPARATE models (steps 4-7 run twice, once per
+                         # source) instead of one combined model. Each
+                         # source gets its own MLflow experiment/registered
+                         # model name (suffixed by source - see
+                         # models/anomaly/train.py and
+                         # models/rule_pattern/train.py). Off by default -
+                         # keep the combined model unless
+                         # scripts/check_source_split_justified.py showed a
+                         # real, persistent per-source gap.
 )
 
 $ErrorActionPreference = "Stop"
@@ -103,25 +117,63 @@ try {
     Step -Number 3 -Name "3/8 FAISS near-dup - SS7" `
         -PyArgs (@("-m", "features.faiss_index", "--source_dir", "data/processed/SS7") + $FaissGpuArgs)
 
-    Step -Number 4 -Name "4/8 Isolation Forest (anomaly_score)" `
-        -PyArgs @("-m", "models.anomaly.train")
+    if ($SplitBySource) {
+        # Two independent models per layer, one per source - each its own
+        # MLflow experiment/registered name (suffixed by source, see
+        # models/anomaly/train.py and models/rule_pattern/train.py). Same
+        # step NUMBERs as the combined path (so -StartAt still lines up),
+        # just run twice.
+        foreach ($src in @("SMPP", "SS7")) {
+            Step -Number 4 -Name "4/8 Isolation Forest (anomaly_score) - $src" `
+                -PyArgs @("-m", "models.anomaly.train", "--sources", $src)
 
-    Step -Number 5 -Name "5/8 LightGBM with embeddings (rule_pattern_score)" `
-        -PyArgs @("-m", "models.rule_pattern.train", "--with_embeddings")
+            Step -Number 5 -Name "5/8 LightGBM with embeddings (rule_pattern_score) - $src" `
+                -PyArgs @("-m", "models.rule_pattern.train", "--with_embeddings", "--sources", $src)
 
-    Step -Number 6 -Name "6/8 Compare/promote - anomaly_score" `
-        -PyArgs @("-m", "models.compare_versions",
-          "--experiment_name", "anomaly_score",
-          "--registered_name", "anomaly_score_model",
-          "--metric_key", "overall_pr_auc",
-          "--min_improvement", "$MinImprovement")
+            Step -Number 6 -Name "6/8 Compare/promote - isolation_forest_$src" `
+                -PyArgs @("-m", "models.compare_versions",
+                  "--experiment_name", "isolation_forest_$src",
+                  "--registered_name", "anomaly_score_model_$src",
+                  "--metric_key", "overall_pr_auc",
+                  "--min_improvement", "$MinImprovement")
 
-    Step -Number 7 -Name "7/8 Compare/promote - rule_pattern_score_with_embeddings" `
-        -PyArgs @("-m", "models.compare_versions",
-          "--experiment_name", "rule_pattern_score_with_embeddings",
-          "--registered_name", "rule_pattern_score_model",
-          "--metric_key", "test_overall_pr_auc",
-          "--min_improvement", "$MinImprovement")
+            Step -Number 7 -Name "7/8 Compare/promote - rule_pattern_score_experimental_$src" `
+                -PyArgs @("-m", "models.compare_versions",
+                  "--experiment_name", "rule_pattern_score_experimental_$src",
+                  "--registered_name", "rule_pattern_score_model_$src",
+                  "--metric_key", "test_overall_pr_auc",
+                  "--min_improvement", "$MinImprovement")
+        }
+    }
+    else {
+        Step -Number 4 -Name "4/8 Isolation Forest (anomaly_score)" `
+            -PyArgs @("-m", "models.anomaly.train")
+
+        Step -Number 5 -Name "5/8 LightGBM with embeddings (rule_pattern_score)" `
+            -PyArgs @("-m", "models.rule_pattern.train", "--with_embeddings")
+
+        Step -Number 6 -Name "6/8 Compare/promote - isolation_forest" `
+            -PyArgs @("-m", "models.compare_versions",
+              # models/anomaly/train.py's MLFLOW_EXPERIMENT_NAME is "isolation_forest",
+              # not "anomaly_score" - same mismatch as step 7, same fix.
+              "--experiment_name", "isolation_forest",
+              "--registered_name", "anomaly_score_model",
+              "--metric_key", "overall_pr_auc",
+              "--min_improvement", "$MinImprovement")
+
+        Step -Number 7 -Name "7/8 Compare/promote - rule_pattern_score" `
+            -PyArgs @("-m", "models.compare_versions",
+              # Step 5 passes --with_embeddings, which models/rule_pattern/train.py
+              # routes to MLFLOW_EXPERIMENTAL_EXPERIMENT_NAME
+              # ("rule_pattern_score_experimental"), NOT a
+              # "rule_pattern_score_with_embeddings" experiment (that name never
+              # gets created) - this used to point at the wrong name and would
+              # hard-fail every run with "No MLflow experiment named ...".
+              "--experiment_name", "rule_pattern_score_experimental",
+              "--registered_name", "rule_pattern_score_model",
+              "--metric_key", "test_overall_pr_auc",
+              "--min_improvement", "$MinImprovement")
+    }
 
     Step -Number 8 -Name "8/8 Embedding-dominance diagnostic" `
         -PyArgs @("-m", "scripts.check_embedding_dominance")

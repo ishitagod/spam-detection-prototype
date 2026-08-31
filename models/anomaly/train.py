@@ -152,6 +152,17 @@ def run(
     contamination: str,
     random_state: int,
 ) -> None:
+    # A source-restricted run (e.g. --sources SMPP alone) gets its own
+    # MLflow experiment, suffixed by source - keeps a source-specific
+    # champion/challenger lineage separate from the combined-sources
+    # experiment, so compare_versions.py never compares a challenger
+    # trained on one population against a champion trained on another.
+    # The full default (both sources) keeps the plain experiment name -
+    # no behavior change for existing combined runs.
+    experiment_name = MLFLOW_EXPERIMENT_NAME
+    if sorted(sources) != sorted(["SMPP", "SS7"]):
+        experiment_name += "_" + "_".join(sources)
+
     print(f"Loading + joining features for sources: {sources} ...")
     frames = []
     for source in sources:
@@ -200,7 +211,7 @@ def run(
         print(f"  {k}: {v}")
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+    mlflow.set_experiment(experiment_name)
     with mlflow.start_run():
         mlflow.log_params(
             {
@@ -220,7 +231,7 @@ def run(
         pipeline = Pipeline([("preprocessor", preprocessor), ("iforest", model)])
         mlflow.sklearn.log_model(pipeline, name="model")
         print(
-            f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={MLFLOW_EXPERIMENT_NAME})"
+            f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={experiment_name})"
         )
 
     # Score-per-message output, one file per source, min-max normalized

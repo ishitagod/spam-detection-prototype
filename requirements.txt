@@ -13,6 +13,9 @@ sentence-transformers==6.0.0  # features/text_embeddings.py - all-MiniLM-L6-v2
 shap==0.52.0
 jupyter
 pytest
+httpx  # serving/app.py test client (fastapi.testclient)
+fastapi==0.141.1  # serving/app.py
+uvicorn==0.52.4    # serving/app.py - run with `uvicorn serving.app:app`
 feast==0.66.0
 # dill version pin is required, not cosmetic: feast declares dill~=0.3.0
 # and pip will warn about this pin conflicting with that, but the
