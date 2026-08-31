@@ -88,9 +88,14 @@ def test_embeddings_are_reduced_to_pca_components_not_raw_dims():
 
 
 def test_output_width_matches_n_components_plus_other_features():
+    """_sample_df() has a single source (SMPP only) - source dummies are
+    dropped entirely for a single-source df (see build_feature_matrix()'s
+    docstring: a constant one-hot column carries no information), so no
+    +1 here. test_source_gets_one_hot_encoded() below covers the
+    multi-source case, where the dummy DOES appear."""
     df = _sample_df()
     X, feature_names, _ = _build(df, n_components=2)
-    expected_width = 2 + len(BEHAVIORAL_COLS) + len(NEAR_DUP_COLS) + 1  # +1 for source_SMPP (single source in test data)
+    expected_width = 2 + len(BEHAVIORAL_COLS) + len(NEAR_DUP_COLS)
     assert X.shape[1] == expected_width
     assert len(feature_names) == expected_width
 
@@ -127,10 +132,11 @@ def test_preprocessor_is_returned_and_reusable():
                 "near_dup_match_count_1hr", "near_dup_distinct_senders_1hr",
                 "near_dup_match_count_24hr", "near_dup_distinct_senders_24hr"]:
         transformed[col] = np.log1p(transformed[col])
-    source_dummies = pd.get_dummies(transformed["source"], prefix="source")
+    # _sample_df() is single-source (SMPP only) - no source dummy in this
+    # path, see test_output_width_matches_n_components_plus_other_features().
     embedding_cols = [c for c in transformed.columns if c.startswith("emb_")]
     combined = pd.concat(
-        [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS], source_dummies, transformed[embedding_cols]], axis=1,
+        [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS], transformed[embedding_cols]], axis=1,
     )
     X_again = preprocessor.transform(combined)
     assert np.allclose(X, X_again)

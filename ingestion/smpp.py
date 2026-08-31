@@ -268,6 +268,15 @@ FEATURE_MAP = {
                                                    # as features - concat_* is
                                                    # the unified, authoritative
                                                    # signal now.
+    "esm_class": "esme_class",               # canonical column - see
+                                               # common/schemas.py's
+                                               # CANONICAL_FEATURE_SCHEMA.
+                                               # Raw batch column is
+                                               # `esme_class`; canonical name
+                                               # matches the live wire
+                                               # payload's `esm_class`
+                                               # spelling instead (see
+                                               # serving/schemas.py).
 }
 
 # Checked against real op-4 rows and deliberately NOT included:
@@ -282,8 +291,6 @@ FEATURE_MAP = {
 #   receipted_message_id           -> entirely NULL on op-4 rows (populated
 #                                      on other operation types only, same
 #                                      trap as message_id - see clean() above)
-#   esme_class                     -> dropped: not required (per-project
-#                                      decision, not a data-quality finding)
 #   sequence_no                    -> dropped: not required (per-project
 #                                      decision, not a data-quality finding)
 #   gsm_features                   -> dropped: replaced by content-byte UDH

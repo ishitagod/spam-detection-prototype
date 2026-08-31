@@ -261,10 +261,13 @@ FEATURE_MAP = {
 # Schema validation, wired into map_to_canonical() below - see
 # ingestion/smpp.py's REQUIRED_FEATURE_COLS comment for why this exists.
 # Unlike SMPP, SS7 DOES populate message_id (FEATURE_MAP["message_id"] =
-# "reference") - so features require the full schema. Labels still exclude
-# message_id: label_source only ever sets record_id, for both sources
-# (see map_to_canonical() below), never message_id.
-REQUIRED_FEATURE_COLS = list(CANONICAL_FEATURE_SCHEMA)
+# "reference") - so features require the full schema, minus `esm_class`
+# (SMPP-only - ESME class is an SMPP PDU field, no SS7 equivalent - see
+# common/schemas.py's CANONICAL_FEATURE_SCHEMA comment; mirrors how
+# ingestion/smpp.py excludes message_id from ITS required list). Labels
+# still exclude message_id: label_source only ever sets record_id, for
+# both sources (see map_to_canonical() below), never message_id.
+REQUIRED_FEATURE_COLS = [c for c in CANONICAL_FEATURE_SCHEMA if c != "esm_class"]
 REQUIRED_LABEL_COLS = [c for c in CANONICAL_LABEL_SCHEMA if c != "message_id"]
 
 # See ingestion/smpp.py's LABEL_SOURCE_COLS docstring - same purpose here:

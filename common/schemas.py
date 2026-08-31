@@ -28,6 +28,12 @@ CANONICAL_FEATURE_SCHEMA: dict[str, str] = {
     "dcs": "float64",
     "text_decode_failed": "bool",  # SMPP-only today - real feature per
     # ingestion/smpp.py, not bookkeeping
+    "esm_class": "float64",  # SMPP-only (ESME class, an SMPP PDU field -
+    # no SS7 equivalent) - raw batch column is `esme_class`
+    # (ingestion/smpp.py's FEATURE_MAP), live wire payload field is
+    # `esm_class` (serving/schemas.py's SMPPTransaction) - canonical name
+    # matches the live wire spelling. NA for every SS7 row (excluded from
+    # ingestion/ss7.py's REQUIRED_FEATURE_COLS), not a data-quality gap.
 }
 
 # canonical label columns - output of labels/rule_labels.py, NEVER also

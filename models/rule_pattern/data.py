@@ -151,10 +151,14 @@ def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     """
     text_length = df["text"].fillna("").str.len().rename("text_length")
     text_decode_failed = df["text_decode_failed"].astype(int).rename("text_decode_failed")
-    source_dummies = pd.get_dummies(df["source"], prefix="source")
-    return pd.concat(
-        [df[BEHAVIORAL_COLS], df[["dcs"]], text_decode_failed, text_length, source_dummies], axis=1,
-    )
+    pieces = [df[BEHAVIORAL_COLS], df[["dcs"]], text_decode_failed, text_length]
+    # Same reasoning as models/anomaly/data.py's build_feature_matrix():
+    # `source` is dead weight (a constant column) once a run is restricted
+    # to one source (--sources SMPP/SS7 for a split model) - only add it
+    # when this run's df actually spans more than one source.
+    if df["source"].nunique() > 1:
+        pieces.append(pd.get_dummies(df["source"], prefix="source"))
+    return pd.concat(pieces, axis=1)
 
 
 def build_feature_matrix(

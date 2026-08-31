@@ -152,11 +152,22 @@ def build_feature_matrix(
     for col in COUNT_COLS:
         transformed[col] = np.log1p(transformed[col])
 
-    source_dummies = pd.get_dummies(transformed["source"], prefix="source")
+    # `source` is only a real feature when more than one source is present
+    # in this training run - a single-source run (e.g. --sources SMPP for
+    # a split model, see CLAUDE.md's "Split by source" note) would produce
+    # a constant one-hot column carrying zero information, just dead
+    # weight through StandardScaler. Combined-sources runs keep the dummy
+    # unchanged - same behavior as before.
     embedding_cols = [c for c in transformed.columns if c.startswith("emb_")]
-    other_cols = BEHAVIORAL_COLS + NEAR_DUP_COLS + list(source_dummies.columns)
+    other_cols = list(BEHAVIORAL_COLS) + list(NEAR_DUP_COLS)
+    pieces = [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS]]
+    if transformed["source"].nunique() > 1:
+        source_dummies = pd.get_dummies(transformed["source"], prefix="source")
+        other_cols += list(source_dummies.columns)
+        pieces.append(source_dummies)
+    pieces.append(transformed[embedding_cols])
 
-    combined = pd.concat([transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS], source_dummies, transformed[embedding_cols]], axis=1)
+    combined = pd.concat(pieces, axis=1)
 
     preprocessor = build_preprocessor(embedding_cols, other_cols, n_embedding_components)
     X = preprocessor.fit_transform(combined)
