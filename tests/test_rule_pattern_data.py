@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.anomaly.data import BEHAVIORAL_COLS
+from models.anomaly.data import BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL
 from models.rule_pattern.data import (
     build_feature_matrix,
     load_labelled_messages,
@@ -89,6 +89,24 @@ def test_all_behavioral_cols_present():
     _, _, feature_names, _ = build_feature_matrix(df)
     for col in BEHAVIORAL_COLS:
         assert col in feature_names
+
+
+def test_imsi_distinct_orig_col_present_when_available_nan_otherwise():
+    """SS7-only feature (see models/anomaly/data.py's comment) - must
+    still show up as a NaN-filled column when the source df doesn't have
+    it at all (SMPP's real case, and this test's df), not be silently
+    dropped from the feature matrix."""
+    df = _sample_df()
+    assert IMSI_DISTINCT_ORIG_COL not in df.columns
+    X, _, feature_names, _ = build_feature_matrix(df)
+    assert IMSI_DISTINCT_ORIG_COL in feature_names
+    idx = feature_names.index(IMSI_DISTINCT_ORIG_COL)
+    assert np.isnan(X[:, idx]).all()
+
+    df[IMSI_DISTINCT_ORIG_COL] = [1.0, np.nan, 3.0, 0.0, 2.0]
+    X, _, feature_names, _ = build_feature_matrix(df)
+    idx = feature_names.index(IMSI_DISTINCT_ORIG_COL)
+    assert np.array_equal(X[:, idx], df[IMSI_DISTINCT_ORIG_COL].to_numpy(), equal_nan=True)
 
 
 def test_fitted_is_empty_when_no_optional_features_requested():

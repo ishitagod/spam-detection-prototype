@@ -86,10 +86,15 @@ import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from models.anomaly.data import BEHAVIORAL_COLS, N_EMBEDDING_COMPONENTS, embedding_pca_pipeline
+from models.anomaly.data import (
+    BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, N_EMBEDDING_COMPONENTS, embedding_pca_pipeline,
+)
 
 CANONICAL_COLS = ["dcs", "text_decode_failed"]
-REQUIRED_COLS = ["source", "record_id", "rule_evaluated", "rule_flagged", "text"] + CANONICAL_COLS + BEHAVIORAL_COLS
+REQUIRED_COLS = (
+    ["source", "record_id", "rule_evaluated", "rule_flagged", "text"]
+    + CANONICAL_COLS + BEHAVIORAL_COLS + [IMSI_DISTINCT_ORIG_COL]
+)
 
 # Validated empirically (see module docstring) on the full real SS7 corpus,
 # not tuned against a target metric - a reasonable starting point, same
@@ -134,6 +139,15 @@ def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
         messages_path, usecols=lambda c: c in set(REQUIRED_COLS),
         dtype=dtypes,  # `text` deliberately left out - free text doesn't fit a fixed dtype
     )
+    # No dtype entry above for IMSI_DISTINCT_ORIG_COL on purpose - it's
+    # SS7-only (see models/anomaly/data.py's comment) and entirely absent
+    # from SMPP's file, so the lambda usecols() above silently drops it
+    # for SMPP rather than erroring. Add it back as all-NaN so every
+    # caller sees the same column regardless of source - LightGBM treats
+    # NaN as a genuine "missing" split, no imputation needed (same
+    # handling as `dcs` above).
+    if IMSI_DISTINCT_ORIG_COL not in df.columns:
+        df[IMSI_DISTINCT_ORIG_COL] = np.nan
     # source/record_id already forced to str via the dtype= dict above -
     # same convention as every other module in this codebase (a real bug
     # hit before: pandas can infer one source file's record_id/
@@ -151,7 +165,14 @@ def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     """
     text_length = df["text"].fillna("").str.len().rename("text_length")
     text_decode_failed = df["text_decode_failed"].astype(int).rename("text_decode_failed")
-    pieces = [df[BEHAVIORAL_COLS], df[["dcs"]], text_decode_failed, text_length]
+    # Absent entirely for a caller that didn't run it through
+    # load_labelled_messages() (e.g. a test fixture) - same "NaN means
+    # unknown, not missing" treatment as `dcs`, not a required column.
+    if IMSI_DISTINCT_ORIG_COL in df.columns:
+        imsi_col = df[[IMSI_DISTINCT_ORIG_COL]]
+    else:
+        imsi_col = pd.DataFrame({IMSI_DISTINCT_ORIG_COL: np.nan}, index=df.index)
+    pieces = [df[BEHAVIORAL_COLS], imsi_col, df[["dcs"]], text_decode_failed, text_length]
     # Same reasoning as models/anomaly/data.py's build_feature_matrix():
     # `source` is dead weight (a constant column) once a run is restricted
     # to one source (--sources SMPP/SS7 for a split model) - only add it

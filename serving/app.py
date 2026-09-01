@@ -92,7 +92,15 @@ def _reason_codes(row: dict, cold_start: bool) -> list[str]:
     cheap contribution scores... fast enough for the inline path") -
     thresholds below are illustrative, not fit to data. Only populated
     for a FRAUD prediction, matching the response contract's own example
-    (NOT_FRAUD -> reason_codes: [])."""
+    (NOT_FRAUD -> reason_codes: []).
+
+    TODO: these 5 codes are OUR OWN placeholder set, not validated against
+    the external spec's Table 8-4 enum (unknown as of writing - the one
+    example response seen so far used "PROMOTIONAL_CONTENT", which isn't
+    in this list). Revisit once Table 8-4 is available: align these
+    strings to the real enum values and consider a typed Enum here /
+    on ScoreResponse.FraudPredictionResult.reason_codes instead of
+    list[str], so an out-of-spec code can't silently go out."""
     codes = ["KNOWN_SPAM_PATTERN"]
     if row.get("sender_repeat_content_ratio_1hr", 0) >= 0.5:
         codes.append("REPEATED_CONTENT")

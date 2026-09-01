@@ -13,7 +13,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.anomaly.data import BEHAVIORAL_COLS, NEAR_DUP_COLS, build_feature_matrix, load_source_features
+from models.anomaly.data import (
+    BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, IMSI_DISTINCT_ORIG_KNOWN_COL,
+    NEAR_DUP_COLS, build_feature_matrix, load_source_features,
+)
 
 N_EMBEDDING_DIMS = 4  # small, for test speed - real data uses 384
 N_TEST_COMPONENTS = 2  # must be <= min(n_rows, N_EMBEDDING_DIMS) for PCA to be valid
@@ -95,9 +98,15 @@ def test_output_width_matches_n_components_plus_other_features():
     multi-source case, where the dummy DOES appear."""
     df = _sample_df()
     X, feature_names, _ = _build(df, n_components=2)
-    expected_width = 2 + len(BEHAVIORAL_COLS) + len(NEAR_DUP_COLS)
+    # +2 for IMSI_DISTINCT_ORIG_COL and its _known indicator - always
+    # added by build_feature_matrix() regardless of whether the input df
+    # has the column (absent here, same as SMPP's real file - see that
+    # column's comment in models/anomaly/data.py).
+    expected_width = 2 + len(BEHAVIORAL_COLS) + len(NEAR_DUP_COLS) + 2
     assert X.shape[1] == expected_width
     assert len(feature_names) == expected_width
+    assert IMSI_DISTINCT_ORIG_COL in feature_names
+    assert IMSI_DISTINCT_ORIG_KNOWN_COL in feature_names
 
 
 def test_pca_explained_variance_is_accessible():
@@ -132,14 +141,41 @@ def test_preprocessor_is_returned_and_reusable():
                 "near_dup_match_count_1hr", "near_dup_distinct_senders_1hr",
                 "near_dup_match_count_24hr", "near_dup_distinct_senders_24hr"]:
         transformed[col] = np.log1p(transformed[col])
+    # IMSI_DISTINCT_ORIG_COL absent from _sample_df() entirely (same as
+    # SMPP's real file) - build_feature_matrix() treats that as all-NaN:
+    # _known indicator is 0 everywhere, the count itself log1p(0) = 0.
+    transformed[IMSI_DISTINCT_ORIG_KNOWN_COL] = 0.0
+    transformed[IMSI_DISTINCT_ORIG_COL] = 0.0
     # _sample_df() is single-source (SMPP only) - no source dummy in this
     # path, see test_output_width_matches_n_components_plus_other_features().
     embedding_cols = [c for c in transformed.columns if c.startswith("emb_")]
+    imsi_cols = [IMSI_DISTINCT_ORIG_COL, IMSI_DISTINCT_ORIG_KNOWN_COL]
     combined = pd.concat(
-        [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS], transformed[embedding_cols]], axis=1,
+        [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS + imsi_cols], transformed[embedding_cols]], axis=1,
     )
     X_again = preprocessor.transform(combined)
     assert np.allclose(X, X_again)
+
+
+def test_imsi_distinct_orig_col_absent_and_null_both_get_known_zero():
+    """SMPP (column absent entirely) and SS7's own null-imsi rows (column
+    present, value NaN) must both land as _known=0, count=0 - "genuinely
+    unknown" collapsed to one representation, not two different ones."""
+    df = _sample_df()
+    df[IMSI_DISTINCT_ORIG_COL] = [np.nan, 3.0, np.nan, 0.0, 7.0]
+    X, feature_names, _ = _build(df)
+    known_idx = feature_names.index(IMSI_DISTINCT_ORIG_KNOWN_COL)
+    count_idx = feature_names.index(IMSI_DISTINCT_ORIG_COL)
+
+    # Reconstruct expected _known/log1p values the same way
+    # build_feature_matrix() does, then check relative order survives
+    # standardization (exact values depend on the fitted scaler).
+    known = df[IMSI_DISTINCT_ORIG_COL].notna().to_numpy(dtype=float)
+    assert (X[:, known_idx] > 0).tolist() == (known == 1).tolist()
+    # The two NaN rows (0, 2) must be indistinguishable on the known
+    # column regardless of whether NaN came from "column absent" or "this
+    # row's imsi is null" - both were fed through the exact same np.nan.
+    assert X[0, known_idx] == X[2, known_idx]
 
 
 def test_load_source_features_inner_joins_all_three_sources(tmp_path):

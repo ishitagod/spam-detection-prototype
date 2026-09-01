@@ -34,7 +34,11 @@ PREPROCESSING, two things, not one:
      features, not just a theoretical risk. PCA is applied via a
      ColumnTransformer (sklearn.compose) so it only touches the
      embedding columns - the 12 hand-built features pass through
-     unchanged into the same final joint StandardScaler.
+     unchanged into the same final joint StandardScaler. (The "12" above
+     is the ablation's real measured count at the time it ran - two more
+     hand-built columns, IMSI_DISTINCT_ORIG_COL and its _known indicator,
+     were added after; the imbalance direction the ablation found doesn't
+     change from +2 features, so it wasn't worth re-running for this.)
 """
 from pathlib import Path
 
@@ -49,6 +53,17 @@ BEHAVIORAL_COLS = [
     "sender_msgs_last_5min", "sender_msgs_last_1hr",
     "sender_unique_destinations_1hr", "sender_repeat_content_ratio_1hr",
 ]
+# SS7-only SIM-farming signal (features/behavioral.py's IMSI-LINKAGE note) -
+# kept OUT of BEHAVIORAL_COLS deliberately: unlike those 4, this column is
+# entirely ABSENT (not NaN-filled) from SMPP's messages_with_behavioral.csv,
+# so callers that read it need the presence check load_source_features()
+# does below, not a plain usecols=[...] that would raise on SMPP. Real SS7
+# data also has null imsi on ~31.7% of rows even where the column exists -
+# both cases collapse to the same "genuinely unknown" NaN, handled uniformly
+# in build_feature_matrix() (fillna(0) + a separate _known indicator, since
+# sklearn's Pipeline can't take NaN the way LightGBM natively can).
+IMSI_DISTINCT_ORIG_COL = "imsi_distinct_originators_1hr"
+IMSI_DISTINCT_ORIG_KNOWN_COL = f"{IMSI_DISTINCT_ORIG_COL}_known"
 NEAR_DUP_COLS = [
     "near_dup_match_count_1hr", "near_dup_max_similarity_1hr", "near_dup_distinct_senders_1hr",
     "near_dup_match_count_24hr", "near_dup_max_similarity_24hr", "near_dup_distinct_senders_24hr",
@@ -79,10 +94,19 @@ def load_source_features(source_dir: Path, messages_path: Path) -> pd.DataFrame:
     building the model's actual input matrix.
     """
     source_dir = Path(source_dir)
-    messages = pd.read_csv(
-        messages_path, low_memory=False,
-        usecols=["source", "record_id"] + BEHAVIORAL_COLS + ["rule_evaluated", "rule_flagged"],
+    # Lambda usecols (not a plain list) so a source file missing
+    # IMSI_DISTINCT_ORIG_COL entirely (SMPP - see that constant's comment
+    # above) is silently skipped rather than raising - a plain list would
+    # error on any name not present in the file's header.
+    wanted_cols = (
+        ["source", "record_id"] + BEHAVIORAL_COLS
+        + [IMSI_DISTINCT_ORIG_COL] + ["rule_evaluated", "rule_flagged"]
     )
+    messages = pd.read_csv(
+        messages_path, low_memory=False, usecols=lambda c: c in set(wanted_cols),
+    )
+    if IMSI_DISTINCT_ORIG_COL not in messages.columns:
+        messages[IMSI_DISTINCT_ORIG_COL] = np.nan
     messages["source"] = messages["source"].astype(str)
     messages["record_id"] = messages["record_id"].astype(str)
     messages["message_key"] = messages["source"] + "|" + messages["record_id"]
@@ -152,15 +176,30 @@ def build_feature_matrix(
     for col in COUNT_COLS:
         transformed[col] = np.log1p(transformed[col])
 
+    # IMSI_DISTINCT_ORIG_COL may be entirely absent (test fixtures, or any
+    # caller other than load_source_features() that didn't add it) - treat
+    # that the same as "present but NaN", not a required column, so the
+    # rest of this function has one code path either way.
+    if IMSI_DISTINCT_ORIG_COL not in transformed.columns:
+        transformed[IMSI_DISTINCT_ORIG_COL] = np.nan
+    # NaN means "genuinely unknown" here (no imsi at all for this source,
+    # or a null imsi on this SS7 row) - not zero. fillna(0) alone would
+    # fabricate "zero distinct originators" for rows where the thing this
+    # feature measures was never observed; the _known indicator lets the
+    # model tell the two apart instead of silently conflating them.
+    transformed[IMSI_DISTINCT_ORIG_KNOWN_COL] = transformed[IMSI_DISTINCT_ORIG_COL].notna().astype(float)
+    transformed[IMSI_DISTINCT_ORIG_COL] = np.log1p(transformed[IMSI_DISTINCT_ORIG_COL].fillna(0))
+
     # `source` is only a real feature when more than one source is present
     # in this training run - a single-source run (e.g. --sources SMPP for
     # a split model, see CLAUDE.md's "Split by source" note) would produce
     # a constant one-hot column carrying zero information, just dead
     # weight through StandardScaler. Combined-sources runs keep the dummy
     # unchanged - same behavior as before.
+    imsi_cols = [IMSI_DISTINCT_ORIG_COL, IMSI_DISTINCT_ORIG_KNOWN_COL]
     embedding_cols = [c for c in transformed.columns if c.startswith("emb_")]
-    other_cols = list(BEHAVIORAL_COLS) + list(NEAR_DUP_COLS)
-    pieces = [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS]]
+    other_cols = list(BEHAVIORAL_COLS) + list(NEAR_DUP_COLS) + imsi_cols
+    pieces = [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS + imsi_cols]]
     if transformed["source"].nunique() > 1:
         source_dummies = pd.get_dummies(transformed["source"], prefix="source")
         other_cols += list(source_dummies.columns)

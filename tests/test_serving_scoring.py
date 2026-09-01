@@ -13,6 +13,8 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from serving.canonical import CanonicalRow
@@ -74,3 +76,68 @@ def test_text_decode_failed_flag_carries_through():
     row = build_rule_pattern_row(canonical, {c: 0 for c in BEHAVIORAL_COLS})
     assert row["text_decode_failed"] == 1
     assert row["text_length"] == 0
+
+
+class _FakeTfidfVectorizer:
+    """Minimal stand-in for a fitted sklearn TfidfVectorizer - real
+    vocabulary/IDF weights don't matter here, only that
+    build_rule_pattern_row() calls .transform()/.get_feature_names_out()
+    the same way models/rule_pattern/data.py's build_feature_matrix() did
+    at training time and names columns tfidf_<token> from the result."""
+
+    def get_feature_names_out(self):
+        return np.array(["win", "prize"])
+
+    def transform(self, texts):
+        class _Sparse:
+            def toarray(self_):
+                return np.array([[0.6, 0.8]])
+        return _Sparse()
+
+
+class _FakeEmbeddingPcaPipeline:
+    """Minimal stand-in for a fitted (StandardScaler -> PCA) pipeline -
+    real 384-dim MiniLM input isn't needed here, only that
+    build_rule_pattern_row() feeds it embed_texts()'s raw output and
+    names the reduced columns emb_pca_<i>."""
+
+    def transform(self, raw_embeddings):
+        assert raw_embeddings.shape == (1, 4)  # matches the fake embed_texts below
+        return np.array([[1.5, -2.5]])
+
+
+def test_tfidf_columns_are_named_and_ordered_from_the_vectorizer(monkeypatch):
+    """Champion trained --with_tfidf: tfidf_* columns must appear, named
+    from the FITTED vectorizer's own vocabulary (get_feature_names_out()),
+    not assumed/hardcoded - a vocabulary change in training must show up
+    here automatically, not require a matching edit in this module."""
+    canonical = _row(text="win a prize")
+    row = build_rule_pattern_row(
+        canonical, {c: 0 for c in BEHAVIORAL_COLS},
+        tfidf_vectorizer=_FakeTfidfVectorizer(),
+    )
+    assert row["tfidf_win"] == 0.6
+    assert row["tfidf_prize"] == 0.8
+    assert "emb_pca_0" not in row  # no embedding_pca_pipeline given - not added
+
+
+def test_embedding_columns_use_champions_own_pca_pipeline(monkeypatch):
+    """Champion trained --with_embeddings: emb_pca_* columns must appear,
+    built by running the REAL live text through features/
+    text_embeddings.py's embed_texts() (mocked here to avoid loading real
+    MiniLM weights in a unit test) then the champion's own fitted PCA
+    pipeline - never a fresh/refit PCA."""
+    def fake_embed_texts(texts, **kwargs):
+        assert list(texts) == ["win a prize"]
+        return np.zeros((1, 4), dtype=np.float32)
+
+    monkeypatch.setattr("features.text_embeddings.embed_texts", fake_embed_texts)
+
+    canonical = _row(text="win a prize")
+    row = build_rule_pattern_row(
+        canonical, {c: 0 for c in BEHAVIORAL_COLS},
+        embedding_pca_pipeline=_FakeEmbeddingPcaPipeline(),
+    )
+    assert row["emb_pca_0"] == 1.5
+    assert row["emb_pca_1"] == -2.5
+    assert "tfidf_win" not in row  # no tfidf_vectorizer given - not added
