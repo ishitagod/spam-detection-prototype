@@ -4,6 +4,15 @@ Loads the rule_pattern_score champion and scores one canonical row.
 SCOPE: rule_pattern_score only (see serving/schemas.py's module docstring
 for why anomaly_score is a deliberate follow-up, not built here).
 
+SOURCE ROUTING: models/rule_pattern/train.py + models/compare_versions.py
+register a SEPARATE champion per source when trained --sources SMPP /
+--sources SS7 alone (CLAUDE.md's "Split by source" note) -
+rule_pattern_score_model_SMPP / rule_pattern_score_model_SS7, never a
+combined rule_pattern_score_model. This module therefore loads/caches a
+champion PER canonical.source, not one process-wide champion - there is
+no combined-sources fallback; a request for a source with no promoted
+champion raises ChampionUnavailableError naming that source specifically.
+
 FEATURE PARITY WITH TRAINING: whatever models/rule_pattern/train.py
 actually trained the champion with - the base 9-column frame
 (models/rule_pattern/data.py's _base_feature_frame(): BEHAVIORAL_COLS,
@@ -39,7 +48,8 @@ import numpy as np
 from models.registry import MLFLOW_TRACKING_URI
 from serving.canonical import CanonicalRow
 
-RULE_PATTERN_MODEL_NAME = "rule_pattern_score_model"
+RULE_PATTERN_MODEL_NAME = "rule_pattern_score_model"  # base name - the
+# actual registered model is always source-suffixed, see module docstring
 CHAMPION_ALIAS = "champion"
 
 BEHAVIORAL_COLS = [
@@ -49,10 +59,13 @@ BEHAVIORAL_COLS = [
 
 
 class ChampionUnavailableError(RuntimeError):
-    """No model currently holds CHAMPION_ALIAS for RULE_PATTERN_MODEL_NAME
-    - a real, expected state before the first models/compare_versions.py
-    promotion has ever run (see that module's get_champion_metric()
-    docstring for the same "no champion yet" case on the training side)."""
+    """No model currently holds CHAMPION_ALIAS for this source's
+    registered name (RULE_PATTERN_MODEL_NAME + "_" + source) - a real,
+    expected state before models/compare_versions.py has ever promoted a
+    champion for THAT source (see that module's get_champion_metric()
+    docstring for the same "no champion yet" case on the training side).
+    Each source is independent: SMPP having a champion doesn't mean SS7
+    does, or vice versa."""
 
 
 class ChampionUnsupportedError(RuntimeError):
@@ -74,28 +87,31 @@ class _LoadedRulePatternModel:
     # (StandardScaler -> PCA), only present if trained --with_embeddings
 
 
-_cached: _LoadedRulePatternModel | None = None  # process-wide cache, same
+_cached: dict[str, _LoadedRulePatternModel] = {}  # keyed by source ("SMPP"/
+# "SS7") - one process-wide cache entry per source-specific champion, same
 # "load once, reuse everywhere" convention as
 # features/text_embeddings.py's _model - loading a model off the MLflow
 # registry costs real time, not worth repeating per request.
 
 
-def _load_champion() -> _LoadedRulePatternModel:
-    global _cached
-    if _cached is not None:
-        return _cached
+def _load_champion(source: str) -> _LoadedRulePatternModel:
+    if source in _cached:
+        return _cached[source]
 
+    registered_name = f"{RULE_PATTERN_MODEL_NAME}_{source}"
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     client = mlflow.MlflowClient()
     try:
-        version = client.get_model_version_by_alias(RULE_PATTERN_MODEL_NAME, CHAMPION_ALIAS)
+        version = client.get_model_version_by_alias(registered_name, CHAMPION_ALIAS)
     except mlflow.exceptions.MlflowException as e:
         raise ChampionUnavailableError(
-            f"No {CHAMPION_ALIAS!r} version registered for {RULE_PATTERN_MODEL_NAME!r} - "
-            "run models/rule_pattern/train.py then models/compare_versions.py to promote one."
+            f"No {CHAMPION_ALIAS!r} version registered for {registered_name!r} - "
+            f"run `python -m models.rule_pattern.train --sources {source}` then "
+            f"`python -m models.compare_versions --experiment_name light_gbm_{source} "
+            f"--registered_name {registered_name} --metric_key test_overall_pr_auc` to promote one."
         ) from e
 
-    model = mlflow.lightgbm.load_model(f"models:/{RULE_PATTERN_MODEL_NAME}@{CHAMPION_ALIAS}")
+    model = mlflow.lightgbm.load_model(f"models:/{registered_name}@{CHAMPION_ALIAS}")
     feature_names = mlflow.artifacts.load_dict(
         f"runs:/{version.run_id}/feature_names.json"
     )["feature_names"]
@@ -114,18 +130,18 @@ def _load_champion() -> _LoadedRulePatternModel:
         if needs_embeddings else None
     )
 
-    _cached = _LoadedRulePatternModel(
+    _cached[source] = _LoadedRulePatternModel(
         model=model, feature_names=feature_names, version=str(version.version),
         tfidf_vectorizer=tfidf_vectorizer, embedding_pca_pipeline=embedding_pca_pipeline,
     )
-    return _cached
+    return _cached[source]
 
 
 def reset_cache() -> None:
     """Test hook - forces the next score_rule_pattern() call to reload
     from MLflow instead of reusing whatever this process already cached."""
     global _cached
-    _cached = None
+    _cached = {}
 
 
 def build_rule_pattern_row(
@@ -178,8 +194,10 @@ def build_rule_pattern_row(
 def score_rule_pattern(canonical: CanonicalRow, behavioral: dict) -> tuple[float, str, dict]:
     """Returns (probability, model_version, features_used) - probability
     is model.predict_proba(...)[:, 1], the same column
-    models/rule_pattern/train.py evaluates (P(rule_flagged==True))."""
-    loaded = _load_champion()
+    models/rule_pattern/train.py evaluates (P(rule_flagged==True)).
+    Routes to the champion registered for canonical.source specifically
+    (see module docstring) - SMPP and SS7 never share a champion."""
+    loaded = _load_champion(canonical.source)
     row = build_rule_pattern_row(
         canonical, behavioral,
         tfidf_vectorizer=loaded.tfidf_vectorizer,

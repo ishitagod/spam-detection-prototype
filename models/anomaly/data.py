@@ -164,13 +164,15 @@ def build_preprocessor(embedding_cols: list[str], other_cols: list[str], n_embed
     ])
 
 
-def build_feature_matrix(
-    df: pd.DataFrame, n_embedding_components: int = N_EMBEDDING_COMPONENTS,
-) -> tuple[np.ndarray, list[str], Pipeline]:
+def build_combined_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
     """
-    Returns (X, feature_names, fitted_preprocessor) - see
-    build_preprocessor()'s docstring for why the preprocessor is
-    returned rather than just applied.
+    The pre-preprocessor frame build_feature_matrix() fits/transforms -
+    factored out so callers that need the RAW input shape the returned
+    Pipeline actually expects (e.g. models/anomaly/train.py logging an
+    MLflow model signature for the full preprocessor+model pipeline) can
+    get it without duplicating this construction. Returns (combined,
+    embedding_cols, other_cols) - same three pieces build_feature_matrix()
+    passes to build_preprocessor().
     """
     transformed = df.copy()
     for col in COUNT_COLS:
@@ -207,6 +209,18 @@ def build_feature_matrix(
     pieces.append(transformed[embedding_cols])
 
     combined = pd.concat(pieces, axis=1)
+    return combined, embedding_cols, other_cols
+
+
+def build_feature_matrix(
+    df: pd.DataFrame, n_embedding_components: int = N_EMBEDDING_COMPONENTS,
+) -> tuple[np.ndarray, list[str], Pipeline]:
+    """
+    Returns (X, feature_names, fitted_preprocessor) - see
+    build_preprocessor()'s docstring for why the preprocessor is
+    returned rather than just applied.
+    """
+    combined, embedding_cols, other_cols = build_combined_frame(df)
 
     preprocessor = build_preprocessor(embedding_cols, other_cols, n_embedding_components)
     X = preprocessor.fit_transform(combined)

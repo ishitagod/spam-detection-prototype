@@ -72,6 +72,7 @@ import mlflow.lightgbm
 import mlflow.sklearn
 import numpy as np
 import pandas as pd
+from mlflow.models import infer_signature
 from sklearn.model_selection import train_test_split
 
 from models.anomaly.data import N_EMBEDDING_COMPONENTS
@@ -254,18 +255,41 @@ def run(
         )
         mlflow.log_metrics({**train_metrics, **test_metrics})
         mlflow.log_dict({"feature_names": feature_names}, "feature_names.json")
-        mlflow.lightgbm.log_model(model, name="model")
+
+        model_signature = infer_signature(X_train, model.predict_proba(X_train))
+        mlflow.lightgbm.log_model(
+            model, name="model", signature=model_signature, input_example=X_train[:5]
+        )
         # Each fitted transformer logged as its OWN artifact, not folded
         # into one sklearn Pipeline with the LightGBM model: each only
         # sees its own slice of columns (embedding_cols / text), not the
         # full feature matrix, so they don't chain the way
         # models/anomaly/train.py's single combined preprocessor+model
         # pipeline does. Must be loaded and applied in the same order at
-        # inference time later (train/serve skew otherwise).
+        # inference time later (train/serve skew otherwise). Signature/
+        # input_example for each are built from its OWN raw input (raw
+        # embedding columns / raw text), matching what serving/scoring.py
+        # actually feeds these transformers live - not X, which is the
+        # already-combined final feature matrix.
         if "embedding_pca_pipeline" in fitted:
-            mlflow.sklearn.log_model(fitted["embedding_pca_pipeline"], name="embedding_pca_pipeline")
+            embedding_cols = [c for c in df.columns if c.startswith("emb_")]
+            embedding_sample = df.loc[train_mask, embedding_cols].head(5).to_numpy(dtype=np.float64)
+            embedding_signature = infer_signature(
+                embedding_sample, fitted["embedding_pca_pipeline"].transform(embedding_sample)
+            )
+            mlflow.sklearn.log_model(
+                fitted["embedding_pca_pipeline"], name="embedding_pca_pipeline",
+                signature=embedding_signature, input_example=embedding_sample,
+            )
         if "tfidf_vectorizer" in fitted:
-            mlflow.sklearn.log_model(fitted["tfidf_vectorizer"], name="tfidf_vectorizer")
+            text_sample = df.loc[train_mask, "text"].fillna("").head(5).to_numpy()
+            tfidf_signature = infer_signature(
+                text_sample, fitted["tfidf_vectorizer"].transform(text_sample).toarray()
+            )
+            mlflow.sklearn.log_model(
+                fitted["tfidf_vectorizer"], name="tfidf_vectorizer",
+                signature=tfidf_signature, input_example=text_sample,
+            )
         print(
             f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={experiment_name})"
         )

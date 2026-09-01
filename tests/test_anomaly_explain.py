@@ -19,7 +19,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.anomaly.explain import build_interpretable_frame, make_predict_fn
+from models.anomaly.explain import (
+    build_interpretable_frame,
+    compute_shap_contributions,
+    make_predict_fn,
+    summarize_shap_importance,
+)
 
 
 def _sample_df(sources=("SMPP", "SMPP", "SS7", "SS7")) -> pd.DataFrame:
@@ -90,6 +95,55 @@ def test_predict_fn_reattaches_fixed_embedding_and_flips_sign():
     # is the FIXED value (1.0), not anything from `perturbed`.
     expected = -(frame["sender_msgs_last_1hr"].to_numpy(dtype=float)[:2] * 0.01 + 1.0)
     assert out == pytest.approx(expected)
+
+
+def test_compute_shap_contributions_negates_tree_explainer_output():
+    """compute_shap_contributions() must return the SIGN-FLIPPED raw
+    shap.TreeExplainer output (module docstring's SHAP SIGN CONVENTION) -
+    checked here against shap.TreeExplainer called directly on the same
+    fitted model/data, not re-derived from anomaly_score (no preprocessing
+    pipeline needed for this - just the negation itself)."""
+    shap = pytest.importorskip("shap")
+    from sklearn.ensemble import IsolationForest
+
+    rng = np.random.RandomState(0)
+    X = rng.normal(size=(50, 3))
+    iforest = IsolationForest(n_estimators=10, random_state=0).fit(X)
+
+    raw = shap.TreeExplainer(iforest).shap_values(X)
+    contributions = compute_shap_contributions(iforest, X)
+
+    assert contributions.shape == raw.shape
+    np.testing.assert_allclose(contributions, -raw)
+
+
+def test_summarize_shap_importance_collapses_embedding_columns():
+    feature_names = ["sender_msgs_last_1hr", "emb_pca_0", "emb_pca_1", "source_SMPP"]
+    # row 0: emb_pca_0=0.1, emb_pca_1=0.2 -> bucket contribution 0.3
+    # row 1: emb_pca_0=0.4, emb_pca_1=0.0 -> bucket contribution 0.4
+    contributions = np.array([
+        [1.0, 0.1, 0.2, 0.0],
+        [2.0, 0.4, 0.0, 1.0],
+    ])
+    summary = summarize_shap_importance(contributions, feature_names)
+
+    assert set(summary["feature"]) == {
+        "sender_msgs_last_1hr", "source_SMPP",
+        "content_embedding (sum of emb_pca_* |contribution|)",
+    }
+    bucket_row = summary[summary["feature"] == "content_embedding (sum of emb_pca_* |contribution|)"]
+    assert bucket_row["mean_abs_shap_contribution"].iloc[0] == pytest.approx((0.3 + 0.4) / 2)
+    # sorted descending by importance
+    assert summary["mean_abs_shap_contribution"].is_monotonic_decreasing
+
+
+def test_summarize_shap_importance_no_embedding_columns():
+    """No emb_pca_* columns present (e.g. a hypothetical no-embedding run)
+    - no bucket row should be added, every feature reported individually."""
+    feature_names = ["sender_msgs_last_1hr", "source_SMPP"]
+    contributions = np.array([[1.0, 0.0], [2.0, 1.0]])
+    summary = summarize_shap_importance(contributions, feature_names)
+    assert set(summary["feature"]) == {"sender_msgs_last_1hr", "source_SMPP"}
 
 
 def test_predict_fn_fills_missing_expected_columns_with_zero():

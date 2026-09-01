@@ -62,10 +62,11 @@ import mlflow
 import mlflow.sklearn
 import numpy as np
 import pandas as pd
+from mlflow.models import infer_signature
 from sklearn.ensemble import IsolationForest
 from sklearn.pipeline import Pipeline
 
-from models.anomaly.data import build_feature_matrix, load_source_features
+from models.anomaly.data import build_combined_frame, build_feature_matrix, load_source_features
 from models.metrics import evaluate_overall_and_per_source
 
 MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
@@ -229,7 +230,17 @@ def run(
         mlflow.log_dict({"feature_names": feature_names}, "feature_names.json")
 
         pipeline = Pipeline([("preprocessor", preprocessor), ("iforest", model)])
-        mlflow.sklearn.log_model(pipeline, name="model")
+        # Signature/input_example describe the RAW pre-preprocessor frame
+        # (build_combined_frame() - same construction build_feature_matrix()
+        # fits/transforms internally), since `pipeline` bundles the
+        # preprocessor itself - that's the actual input shape a caller of
+        # this logged model must supply, not the already-transformed X.
+        combined, _, _ = build_combined_frame(df)
+        input_example = combined.head(5)
+        signature = infer_signature(input_example, pipeline.predict(input_example))
+        mlflow.sklearn.log_model(
+            pipeline, name="model", signature=signature, input_example=input_example
+        )
         print(
             f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={experiment_name})"
         )

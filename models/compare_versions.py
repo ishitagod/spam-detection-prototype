@@ -77,8 +77,31 @@ def run(
 
     model_uri = _find_model_uri(challenger_run, artifact_path)
     version = mlflow.register_model(model_uri, registered_name)
-    mlflow.MlflowClient().set_registered_model_alias(registered_name, alias, version.version)
+    client = mlflow.MlflowClient()
+    client.set_registered_model_alias(registered_name, alias, version.version)
+    client.update_model_version(
+        name=registered_name, version=version.version,
+        description=_describe(challenger_run, metric_key, challenger_metric),
+    )
     print(f"PROMOTED: {registered_name} v{version.version} is now {alias!r}.")
+
+
+def _describe(run: mlflow.entities.Run, metric_key: str, metric_value: float) -> str:
+    """
+    Auto-generated model version description - free text nobody would
+    reliably fill in by hand every promotion (see run()'s docstring:
+    promotion is explicit but still a routine, repeated action). Pulled
+    entirely from what the run already logged, not asked for separately.
+    """
+    params = run.data.params
+    bits = [f"{metric_key}={metric_value:.4f}", f"run_id={run.info.run_id}"]
+    if "sources" in params:
+        bits.append(f"sources={params['sources']}")
+    if params.get("with_embeddings") == "True":
+        bits.append("with_embeddings")
+    if params.get("with_tfidf") == "True":
+        bits.append("with_tfidf")
+    return ", ".join(bits)
 
 
 def _find_model_uri(run: mlflow.entities.Run, artifact_path: str) -> str:
