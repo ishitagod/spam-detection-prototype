@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from features.behavioral_snapshot import compute_sender_snapshots
+from features.behavioral_snapshot import compute_imsi_snapshots, compute_sender_snapshots
 
 NOW = pd.Timestamp("2026-08-19T10:00:00")
 
@@ -199,6 +199,72 @@ def test_mixed_numeric_and_string_originators_do_not_break_output_dtype():
     ]
     result = run(rows)
     assert result["originator"].map(type).eq(str).all()
+
+
+IMSI_BASE = {"imsi": "IMSI1", "originator": "SENDER1", "timestamp": "2026-08-19T09:00:00"}
+
+
+def imsi_msg(**overrides) -> dict:
+    return {**IMSI_BASE, **overrides}
+
+
+def run_imsi(rows, now=NOW):
+    return compute_imsi_snapshots(pd.DataFrame(rows), now=now)
+
+
+def imsi_row_for(result, imsi):
+    match = result[result["imsi"] == imsi]
+    assert len(match) == 1, f"expected exactly one row for {imsi}, got {len(match)}"
+    return match.iloc[0]
+
+
+def test_imsi_null_rows_are_dropped_not_given_a_shared_identity():
+    """A row whose own imsi is null must not produce ANY imsi snapshot
+    row - not lumped into a shared '<NA>' identity (see module docstring
+    - same convention as features/behavioral.py's per-row version)."""
+    rows = [imsi_msg(imsi=None), imsi_msg(imsi="IMSI1")]
+    result = run_imsi(rows)
+    assert len(result) == 1
+    assert result.iloc[0]["imsi"] == "IMSI1"
+
+
+def test_imsi_distinct_originators_counts_within_long_window_only():
+    rows = [
+        imsi_msg(originator="A", timestamp="2026-08-19T09:10:00"),
+        imsi_msg(originator="B", timestamp="2026-08-19T09:20:00"),
+        imsi_msg(originator="A", timestamp="2020-01-01T00:00:00"),  # outside window
+    ]
+    result = run_imsi(rows)
+    row = imsi_row_for(result, "IMSI1")
+    assert row["imsi_distinct_originators_1hr"] == 2
+
+
+def test_imsi_with_no_recent_activity_still_gets_a_zeroed_row():
+    """Same 'every known entity gets a defined row' convention as
+    compute_sender_snapshots() - an imsi seen only outside the window
+    still gets a row, 0 not missing."""
+    rows = [imsi_msg(timestamp="2020-01-01T00:00:00")]
+    result = run_imsi(rows)
+    row = imsi_row_for(result, "IMSI1")
+    assert row["imsi_distinct_originators_1hr"] == 0
+
+
+def test_different_imsis_are_isolated():
+    rows = [
+        imsi_msg(imsi="IMSI1", originator="A", timestamp="2026-08-19T09:30:00"),
+        imsi_msg(imsi="IMSI2", originator="B", timestamp="2026-08-19T09:31:00"),
+    ]
+    result = run_imsi(rows)
+    assert len(result) == 2
+    assert imsi_row_for(result, "IMSI1")["imsi_distinct_originators_1hr"] == 1
+    assert imsi_row_for(result, "IMSI2")["imsi_distinct_originators_1hr"] == 1
+
+
+def test_all_null_imsi_returns_empty_frame_with_expected_columns():
+    rows = [imsi_msg(imsi=None)]
+    result = run_imsi(rows)
+    assert len(result) == 0
+    assert list(result.columns) == ["imsi", "event_timestamp", "imsi_distinct_originators_1hr"]
 
 
 if __name__ == "__main__":

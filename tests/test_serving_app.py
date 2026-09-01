@@ -1,11 +1,12 @@
 """
 pytest suite for serving/app.py's POST /v1/score endpoint - the response-
 contract shaping (status/recommended_action/fraud_results/reason_codes),
-not real model/Feast integration. serving.app.get_sender_features and
-serving.app.score_rule_pattern are monkeypatched so this runs without a
-promoted MLflow champion or an applied Feast store - both are exercised
-separately (tests/test_serving_scoring.py, serving/feature_lookup.py's own
-manual script).
+not real model/Feast integration. serving.app.get_sender_features,
+serving.app.get_imsi_features, and serving.app.score_rule_pattern are all
+monkeypatched so this runs without a promoted MLflow champion or an
+applied Feast store - both are exercised separately
+(tests/test_serving_scoring.py, serving/feature_lookup.py's own manual
+script).
 
 Run:
     pytest tests/test_serving_app.py -v
@@ -77,6 +78,10 @@ def client(monkeypatch):
             "sender_msgs_last_5min": 1, "sender_msgs_last_1hr": 5,
             "sender_unique_destinations_1hr": 3, "sender_repeat_content_ratio_1hr": 0.1,
         },
+    )
+    monkeypatch.setattr(
+        app_module, "get_imsi_features",
+        lambda imsi: {"imsi_distinct_originators_1hr": 2 if imsi else None},
     )
     return TestClient(app_module.app)
 

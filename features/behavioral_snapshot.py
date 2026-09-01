@@ -48,14 +48,17 @@ features/behavioral.py's point-in-time version exactly (same "first
 message is its own reference point, gets 0.0" convention), just computed
 once per sender instead of once per row.
 
-IMSI_DISTINCT_ORIGINATORS_1HR IS NOT HERE YET: features/behavioral.py has
-the training-time (point-in-time, per-row) version of this SIM-farming
-signal, keyed on `imsi`, not `sender_id` - a genuinely different entity
-(the physical SIM vs. the apparent sender identity, see that module's
-IMSI-LINKAGE note). Adding it to THIS snapshot/Feast path needs its own
-Feast entity and FeatureView keyed on imsi, not a column bolted onto the
-existing sender_id-keyed schema below - deliberately deferred rather than
-done wrong quickly.
+IMSI_DISTINCT_ORIGINATORS_1HR: compute_imsi_snapshots() below is the
+current-state counterpart to features/behavioral.py's training-time
+(point-in-time, per-row) version of this SIM-farming signal - keyed on
+`imsi`, not `sender_id`, a genuinely different entity (the physical SIM
+vs. the apparent sender identity, see that module's IMSI-LINKAGE note).
+Deliberately a SEPARATE function/output/entity from compute_sender_snapshots()
+above, not a column bolted onto the sender_id-keyed schema - feature_repo/
+definitions.py wires it to its own Feast entity (`imsi`) and FeatureView
+(`imsi_behavioral_stats`). SS7-only: SMPP has no IMSI concept, and rows
+with a null imsi are dropped entirely (not given a shared "<NA>" identity)
+- same reasoning as the training-time version.
 """
 import argparse
 import json
@@ -81,6 +84,10 @@ DEFAULT_MESSAGES_PATHS = [
     REPO_ROOT / "data" / "processed" / "SMPP" / "messages_with_behavioral.csv",
     REPO_ROOT / "data" / "processed" / "SS7" / "messages_with_behavioral.csv",
 ]
+# IMSI snapshot is SS7-only (see module docstring) - one messages file,
+# not a list, unlike DEFAULT_MESSAGES_PATHS above.
+DEFAULT_IMSI_SNAPSHOT_PATH = REPO_ROOT / "data" / "processed" / "feast_sources" / "imsi_behavioral_snapshot.parquet"
+DEFAULT_SS7_MESSAGES_PATH = REPO_ROOT / "data" / "processed" / "SS7" / "messages_with_behavioral.csv"
 
 DEFAULT_TOP_K_TEXTS = 20
 
@@ -100,6 +107,10 @@ SNAPSHOT_COLUMNS = [
     COL_MSGS_SHORT, COL_MSGS_LONG, COL_UNIQUE_DEST_LONG, COL_RECENT_TEXTS_JSON,
     COL_SENDER_AGE_DAYS,
 ]
+
+COL_IMSI = "imsi"
+COL_IMSI_DISTINCT_ORIG_LONG = "imsi_distinct_originators_1hr"
+IMSI_SNAPSHOT_COLUMNS = [COL_IMSI, COL_EVENT_TS, COL_IMSI_DISTINCT_ORIG_LONG]
 
 
 def compute_sender_snapshots(
@@ -229,6 +240,74 @@ def run_behavioral_snapshot(
     return snapshot
 
 
+def compute_imsi_snapshots(messages: pd.DataFrame, now: pd.Timestamp) -> pd.DataFrame:
+    """
+    One row per distinct non-null `imsi` seen in `messages` (SS7 only -
+    see module docstring), each showing the count of DISTINCT originators
+    seen behind that imsi in the trailing 1hr as of `now` - the
+    current-state counterpart to features/behavioral.py's per-row
+    imsi_distinct_originators_1hr, same "current state, not per-row
+    history" reframing as compute_sender_snapshots() above. Rows whose OWN
+    imsi is null are dropped entirely, not given a shared "<NA>" identity
+    - a null imsi means the physical SIM behind that message genuinely
+    isn't known, matching the training-time version's exact treatment
+    (features/behavioral.py's IMSI-LINKAGE note).
+    """
+    df = messages[messages[COL_IMSI].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=IMSI_SNAPSHOT_COLUMNS)
+
+    df[COL_IMSI] = df[COL_IMSI].astype(str)
+    df["originator"] = df["originator"].fillna("<NA>").astype(str)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed")
+
+    now64 = np.datetime64(now)
+    age = now64 - df["timestamp"].to_numpy()
+    zero = np.timedelta64(0, "ns")
+    # Same closed-left/open-right window as compute_sender_snapshots().
+    in_long = (age >= zero) & (age <= _LONG_WINDOW)
+
+    all_imsis = df[[COL_IMSI]].drop_duplicates()
+    distinct_orig = df[in_long].groupby(COL_IMSI)["originator"].nunique()
+
+    snapshot = all_imsis.set_index(COL_IMSI)
+    snapshot[COL_IMSI_DISTINCT_ORIG_LONG] = distinct_orig
+    snapshot[COL_IMSI_DISTINCT_ORIG_LONG] = (
+        snapshot[COL_IMSI_DISTINCT_ORIG_LONG].fillna(0).astype(np.int64)
+    )
+    snapshot[COL_EVENT_TS] = now
+
+    return snapshot.reset_index()[IMSI_SNAPSHOT_COLUMNS]
+
+
+def run_imsi_snapshot(
+    messages_path: Path, out_path: Path, now: pd.Timestamp | None = None
+) -> pd.DataFrame:
+    """SS7-only counterpart to run_behavioral_snapshot() above - one
+    messages file in, one imsi-keyed snapshot parquet out."""
+    now = now if now is not None else pd.Timestamp.now()
+
+    messages_path = Path(messages_path)
+    if not messages_path.exists():
+        print(f"  (skipping, not found) {messages_path}")
+        return pd.DataFrame()
+
+    print(f"  loading {messages_path} ...")
+    messages = pd.read_csv(
+        messages_path, low_memory=False,
+        usecols=lambda c: c in {"imsi", "originator", "timestamp"},
+    )
+    print(f"Computing IMSI snapshots for {len(messages)} row(s) as of {now} ...")
+    snapshot = compute_imsi_snapshots(messages, now=now)
+    print(f"  {len(snapshot)} distinct imsi(s)")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.to_parquet(out_path, index=False)
+    print(f"Wrote {len(snapshot)} rows to {out_path}")
+    return snapshot
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -237,6 +316,13 @@ def main():
     )
     parser.add_argument(
         "--out_path", type=str, default=str(DEFAULT_SNAPSHOT_PATH),
+    )
+    parser.add_argument(
+        "--ss7_messages_path", type=str, default=str(DEFAULT_SS7_MESSAGES_PATH),
+        help="Input for the IMSI snapshot (SS7-only, see module docstring).",
+    )
+    parser.add_argument(
+        "--imsi_out_path", type=str, default=str(DEFAULT_IMSI_SNAPSHOT_PATH),
     )
     parser.add_argument(
         "--now", type=str, default=None,
@@ -253,6 +339,7 @@ def main():
     args = parser.parse_args()
     now = pd.Timestamp(args.now) if args.now else None
     run_behavioral_snapshot([Path(p) for p in args.messages_paths], Path(args.out_path), now=now)
+    run_imsi_snapshot(Path(args.ss7_messages_path), Path(args.imsi_out_path), now=now)
 
 
 if __name__ == "__main__":

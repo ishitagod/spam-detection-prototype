@@ -32,9 +32,12 @@ FEATURE_REPO_DIR = REPO_ROOT / "feature_repo"
 
 sys.path.insert(0, str(REPO_ROOT))
 from features.behavioral_snapshot import (  # noqa: E402
+    DEFAULT_IMSI_SNAPSHOT_PATH,
     DEFAULT_MESSAGES_PATHS,
     DEFAULT_SNAPSHOT_PATH,
+    DEFAULT_SS7_MESSAGES_PATH,
     run_behavioral_snapshot,
+    run_imsi_snapshot,
 )
 
 # Feast CLI lives next to whichever Python this script is run with -
@@ -52,13 +55,16 @@ def _run_feast(args: list[str]) -> None:
 def refresh(now: pd.Timestamp | None = None) -> None:
     now = now if now is not None else pd.Timestamp.now()
 
-    print("=== 1/3: rebuild sender behavioral snapshot ===")
+    print("=== 1/4: rebuild sender behavioral snapshot ===")
     run_behavioral_snapshot(DEFAULT_MESSAGES_PATHS, DEFAULT_SNAPSHOT_PATH, now=now)
 
-    print("\n=== 2/3: feast apply (registry) ===")
+    print("\n=== 2/4: rebuild IMSI behavioral snapshot (SS7-only) ===")
+    run_imsi_snapshot(DEFAULT_SS7_MESSAGES_PATH, DEFAULT_IMSI_SNAPSHOT_PATH, now=now)
+
+    print("\n=== 3/4: feast apply (registry) ===")
     _run_feast(["apply"])
 
-    print("\n=== 3/3: feast materialize (online store) ===")
+    print("\n=== 4/4: feast materialize (online store) ===")
     # Wide, fixed start so a full re-snapshot always lands regardless of
     # what "now" is this run - this is a prototype-scale (~1k senders)
     # table rewritten in full each refresh, not an incremental stream, so

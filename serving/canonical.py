@@ -18,6 +18,10 @@ serving/scoring.py) - `source`, `originator`, `text`, `dcs`,
 lookups. Does not attempt every canonical column (e.g. SS7's `vlr_address`
 needs the SRI-response join batch ingestion does, not meaningful for a
 single live message and not consumed by rule_pattern_score anyway).
+`imsi` is the one exception carried through despite not being a
+CANONICAL_FEATURE_SCHEMA column itself - it's the Feast lookup KEY for
+imsi_distinct_originators_1hr (serving/feature_lookup.py's
+get_imsi_features()), SS7-only, always None for SMPP (no IMSI concept).
 """
 from dataclasses import dataclass
 
@@ -38,6 +42,7 @@ class CanonicalRow:
     timestamp: str
     dcs: float | None
     text_decode_failed: bool
+    imsi: str | None = None  # SS7-only, see module docstring
 
     @property
     def sender_id(self) -> str:
@@ -77,6 +82,7 @@ def map_ss7_transaction(txn: SS7Transaction) -> CanonicalRow:
         timestamp=timestamp,
         dcs=float(dcs) if dcs is not None else None,
         text_decode_failed=not text.strip(),
+        imsi=str(txn.imsi) if txn.imsi not in (None, "") else None,
     )
 
 

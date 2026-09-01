@@ -42,6 +42,15 @@ FEATURE_REFS = [
     "sender_repeat_content_ratio:sender_repeat_content_ratio_1hr",
 ]
 
+# SS7-only, keyed on `imsi` not `sender_id` (feature_repo/definitions.py's
+# `imsi` entity - see features/behavioral.py's IMSI-LINKAGE note). A
+# separate feature ref list/lookup function, not folded into
+# get_sender_features() above: a different entity means a different
+# Feast entity_rows key, not just another feature name.
+IMSI_FEATURE_REFS = [
+    "imsi_behavioral_stats:imsi_distinct_originators_1hr",
+]
+
 
 def get_sender_features(sender_id: str, candidate_text: str, store: FeatureStore | None = None) -> dict:
     """
@@ -63,6 +72,26 @@ def get_sender_features(sender_id: str, candidate_text: str, store: FeatureStore
         entity_rows=[{"sender_id": sender_id, "candidate_text": candidate_text}],
     ).to_dict()
     return {k: v[0] for k, v in result.items() if k not in ("sender_id", "candidate_text")}
+
+
+def get_imsi_features(imsi: str | None, store: FeatureStore | None = None) -> dict:
+    """
+    SS7-only counterpart to get_sender_features() above, keyed on `imsi`
+    (see IMSI_FEATURE_REFS). `imsi=None` (SMPP requests, or an SS7 request
+    whose own imsi is genuinely unknown) skips the Feast lookup entirely
+    and returns {"imsi_distinct_originators_1hr": None} directly - same
+    "honest unknown, not a fabricated 0" result an unrecognized imsi would
+    get back from Feast anyway, without paying for a lookup Feast can
+    never answer (there is no None entity to look up).
+    """
+    if imsi is None:
+        return {"imsi_distinct_originators_1hr": None}
+    store = store or FeatureStore(repo_path=str(FEATURE_REPO_DIR))
+    result = store.get_online_features(
+        features=IMSI_FEATURE_REFS,
+        entity_rows=[{"imsi": imsi}],
+    ).to_dict()
+    return {k: v[0] for k, v in result.items() if k != "imsi"}
 
 
 def main():

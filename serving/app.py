@@ -40,7 +40,7 @@ import time
 from fastapi import FastAPI
 
 from serving.canonical import map_smpp_transaction, map_ss7_transaction
-from serving.feature_lookup import get_sender_features
+from serving.feature_lookup import get_imsi_features, get_sender_features
 from serving.schemas import (
     FraudPredictionResult,
     ScoreRequest,
@@ -126,6 +126,13 @@ def score(request: ScoreRequest) -> ScoreResponse:
 
     try:
         behavioral = get_sender_features(canonical.sender_id, canonical.text)
+        # SS7-only, keyed on imsi not sender_id (serving/feature_lookup.py's
+        # get_imsi_features() docstring) - merged into the same dict since
+        # serving/scoring.py's build_rule_pattern_row() reads every feature
+        # from one `behavioral` mapping regardless of which entity it came
+        # from. canonical.imsi is None for SMPP / an SS7 request with no
+        # imsi - get_imsi_features() short-circuits that case itself.
+        behavioral = {**behavioral, **get_imsi_features(canonical.imsi)}
     except Exception as e:  # Feast store missing/unreachable, etc. - a
         # real operational failure, not a modeling one.
         return ScoreResponse(

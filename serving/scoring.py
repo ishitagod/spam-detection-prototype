@@ -14,9 +14,10 @@ no combined-sources fallback; a request for a source with no promoted
 champion raises ChampionUnavailableError naming that source specifically.
 
 FEATURE PARITY WITH TRAINING: whatever models/rule_pattern/train.py
-actually trained the champion with - the base 9-column frame
+actually trained the champion with - the base feature frame
 (models/rule_pattern/data.py's _base_feature_frame(): BEHAVIORAL_COLS,
-`dcs`, `text_decode_failed`, `text_length`, one-hot `source`), and
+imsi_distinct_originators_1hr, `dcs`, `text_decode_failed`, `text_length`,
+one-hot `source`), and
 OPTIONALLY TF-IDF (`tfidf_*`) and/or PCA-reduced MiniLM embeddings
 (`emb_pca_*`) if the champion was trained with --with_tfidf/
 --with_embeddings. This module rebuilds the base frame rather than
@@ -45,6 +46,7 @@ import mlflow.lightgbm
 import mlflow.sklearn
 import numpy as np
 
+from models.anomaly.data import IMSI_DISTINCT_ORIG_COL
 from models.registry import MLFLOW_TRACKING_URI
 from serving.canonical import CanonicalRow
 
@@ -148,12 +150,14 @@ def build_rule_pattern_row(
     canonical: CanonicalRow, behavioral: dict,
     tfidf_vectorizer=None, embedding_pca_pipeline=None,
 ) -> dict:
-    """The base 9 named columns models/rule_pattern/data.py's
+    """The base named columns models/rule_pattern/data.py's
     _base_feature_frame() builds for training, for one live row - see
     module docstring. `behavioral`: serving/feature_lookup.py's
-    get_sender_features() output (None per-key on a cold-start sender,
-    treated as 0 here - same convention models/anomaly/data.py's
-    plausibility_check() and this endpoint's cold_start flag use).
+    get_sender_features() output MERGED with get_imsi_features()'s (None
+    per-key on a cold-start sender, treated as 0 here for BEHAVIORAL_COLS
+    - same convention models/anomaly/data.py's plausibility_check() and
+    this endpoint's cold_start flag use - but NOT for
+    imsi_distinct_originators_1hr, which stays NaN on None, see below).
 
     tfidf_vectorizer/embedding_pca_pipeline: the champion's OWN fitted
     transformers (see _load_champion()) - when given, adds tfidf_*/
@@ -167,6 +171,15 @@ def build_rule_pattern_row(
     row["dcs"] = canonical.dcs if canonical.dcs is not None else np.nan  # LightGBM
     # has native missing-value handling - no imputation, same as training
     # (models/rule_pattern/data.py's _base_feature_frame() docstring).
+    # imsi_distinct_originators_1hr: RAW value or NaN, deliberately NOT
+    # 0-filled like BEHAVIORAL_COLS above and NOT log1p'd - mirrors
+    # _base_feature_frame() exactly (unlike models/anomaly/data.py's
+    # build_feature_matrix(), this model never log1p's it or adds a
+    # separate _known indicator; LightGBM's native missing-value handling
+    # covers both SMPP (no imsi concept) and an SS7 request whose imsi
+    # Feast doesn't recognize - both come back None from `behavioral`).
+    imsi_value = behavioral.get(IMSI_DISTINCT_ORIG_COL)
+    row[IMSI_DISTINCT_ORIG_COL] = imsi_value if imsi_value is not None else np.nan
     row["text_decode_failed"] = int(canonical.text_decode_failed)
     row["text_length"] = len(canonical.text or "")
     row["source_SMPP"] = int(canonical.source == "SMPP")

@@ -4,8 +4,9 @@ the SAME environment for this prototype" simplification looks like in
 practice - the online store exists so FastAPI can look up a sender's behavioral state in a
 single fast key-value read at inference time
 
-Two-piece design, because one of the four behavioral features can't be
-precomputed:
+Three-piece design - two entities, because one of the four
+sender-behavioral features can't be precomputed, plus a second entity
+entirely for an SS7-only signal:
   - `sender_behavioral_stats` (FeatureView, backed by
     features/behavioral_snapshot.py's materialized parquet): the pure
     sender-state features - sender_msgs_last_5min, sender_msgs_last_1hr,
@@ -13,14 +14,19 @@ precomputed:
     recent_text_counts_json, which exists ONLY to feed the on-demand view
     below, not as a feature in its own right.
   - `sender_repeat_content_ratio` (on-demand feature view): the fourth
-    feature, sender_repeat_content_ratio_1hr, needs the INCOMING
-    message's text - a value that doesn't exist until the actual
+    sender-keyed feature, sender_repeat_content_ratio_1hr, needs the
+    INCOMING message's text - a value that doesn't exist until the actual
     inference request arrives, so it cannot live in the online store like
     the other three. Feast's on-demand feature view is exactly the
     mechanism for "combine a stored feature with a request-time value at
     serving time" - see features/behavioral_snapshot.py's module
     docstring for why recent_text_counts_json is a top-K approximation,
     not the exact set.
+  - `imsi_behavioral_stats` (FeatureView, own entity `imsi`, near the
+    bottom of this file): imsi_distinct_originators_1hr, the SS7-only
+    SIM-farming signal - keyed on the physical SIM (`imsi`), a genuinely
+    different entity from `sender_id` above (the apparent sender identity
+    a message claims). See features/behavioral.py's IMSI-LINKAGE note.
 
 Apply / materialize :
     cd feature_repo
@@ -56,6 +62,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # on why the path lives there).
 sys.path.insert(0, str(REPO_ROOT))
 from features.behavioral_snapshot import (
+    DEFAULT_IMSI_SNAPSHOT_PATH as IMSI_SNAPSHOT_PATH,
     DEFAULT_SNAPSHOT_PATH as SNAPSHOT_PATH,
 )  # noqa: E402
 
@@ -150,3 +157,43 @@ def sender_repeat_content_ratio(inputs: pd.DataFrame) -> pd.DataFrame:
             counts = {}
         ratios.append(counts.get(candidate, 0) / n)
     return pd.DataFrame({"sender_repeat_content_ratio_1hr": ratios})
+
+
+# SS7's SIM-farming signal (features/behavioral.py's IMSI-LINKAGE note) -
+# keyed on `imsi`, a genuinely DIFFERENT entity from `sender_id` above:
+# sender_id is the apparent sender identity a message claims
+# (source|originator), imsi is the physical SIM behind it. SMPP has no
+# IMSI concept, so this entity/FeatureView is SS7-only - an SMPP request
+# never has an imsi to look up, and a request whose SS7 imsi hasn't been
+# seen in the last snapshot/materialize returns None the same "honest
+# unknown" way get_online_features() already does for an unknown
+# sender_id (see get_sender_features()'s docstring in
+# serving/feature_lookup.py).
+imsi = Entity(
+    name="imsi",
+    join_keys=["imsi"],
+    value_type=ValueType.STRING,
+    description=(
+        "Physical SIM identity behind an SS7 message - see "
+        "features/behavioral.py's IMSI-LINKAGE note for why this must be "
+        "its own entity rather than a column on sender_id."
+    ),
+)
+
+imsi_behavioral_snapshot_source = FileSource(
+    name="imsi_behavioral_snapshot_source",
+    path=str(IMSI_SNAPSHOT_PATH),
+    timestamp_field="event_timestamp",
+    description="features/behavioral_snapshot.py's compute_imsi_snapshots() output - refreshed by scripts/refresh_feast.py, not written by hand.",
+)
+
+imsi_behavioral_stats = FeatureView(
+    name="imsi_behavioral_stats",
+    entities=[imsi],
+    ttl=timedelta(hours=6),  # same TTL reasoning as sender_behavioral_stats above
+    schema=[
+        Field(name="imsi_distinct_originators_1hr", dtype=Int64),
+    ],
+    online=True,
+    source=imsi_behavioral_snapshot_source,
+)
