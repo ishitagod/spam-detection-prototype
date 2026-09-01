@@ -13,6 +13,5 @@ __pycache__/
 .venv/
 venv/
 
-# #Feast
-# feature_repo/data/*.db
+# Feast
 feature_repo/data/*.db
