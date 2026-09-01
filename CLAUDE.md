@@ -52,7 +52,7 @@ Goal: production-grade working demo first, then iterate.
 - Isolation Forest.
 - Unsupervised; no labels during training.
 - Features: MiniLM embedding + behavioral + FAISS features.
-- MiniLM: `all-MiniLM-L6-v2`.
+- MiniLM: `paraphrase-multilingual-MiniLM-L12-v2`.
 - PCA embeddings to 30 dimensions.
 - Validation against rule labels is allowed but labels must not influence training.
 
