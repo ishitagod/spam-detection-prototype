@@ -7,11 +7,17 @@ for batch training), one shared ScoreResponse out - see serving/app.py's
 module docstring for why there are two request parsers but one scoring
 path.
 
-SCOPE (see conversation this was built from): this first pass serves
-rule_pattern_score only - canonical + behavioral + source, no embeddings,
-no FAISS (per CLAUDE.md's rule-pattern model spec). anomaly_score is a
-deliberate follow-up once a live MiniLM + FAISS near-dup design is agreed
-on separately - see serving/scoring.py.
+SCOPE: rule_pattern_score (serving/scoring.py) drives fraud_results/
+recommended_action, per the external response contract this build has to
+match. anomaly_score (serving/anomaly_scoring.py) is scored alongside it
+and surfaced on ScoreResponse.anomaly_score for visibility - per
+CLAUDE.md's "Keep rule_pattern_score and anomaly_score separate. Do not
+average them. Disagreements between the two scores are valuable and
+should remain visible", it does NOT feed the FRAUD/NOT_FRAUD decision or
+recommended_action yet; that's a deliberate, disclosed follow-up (same
+staged-rollout status as LIME/SHAP - see serving/app.py's module
+docstring on _confidence/_reason_codes being disclosed heuristics, not
+final).
 """
 from typing import Annotated, Literal
 
@@ -147,3 +153,10 @@ class ScoreResponse(BaseModel):
     # actually models (SPAM_SMS) ever appear, even if the request asked
     # for others too (e.g. SMISHING).
     fraud_results: list[FraudPredictionResult] | None = None
+    # ADDITIVE field, not part of the external response contract's
+    # original spec - see module docstring's SCOPE note. None whenever
+    # anomaly scoring itself fails (no promoted champion yet, missing
+    # corpus for this source, etc.) - a rule_pattern_score success is
+    # never downgraded to FAILURE just because anomaly_score couldn't be
+    # computed, see serving/app.py's score().
+    anomaly_score: float | None = None

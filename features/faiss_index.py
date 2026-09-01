@@ -234,36 +234,13 @@ def compute_near_dup_features(
         # absolute into the FULL `embeddings`/`timestamps`.
         for j in range(batch_end - batch_start):
             i = batch_start + j
-            row_matches = matches[j]
-            row_sims = sims[j]
-
-            valid = row_matches >= 0
-            row_matches = row_matches[valid]
-            row_sims = row_sims[valid]
-
-            above_threshold = row_sims >= threshold
-            if above_threshold.all() and len(row_sims) == k:
-                # Every one of the k nearest (the most similarity could
-                # possibly return) still cleared threshold - there may be
-                # more real matches beyond rank k that this call can't see.
+            row_features, truncated = _near_dup_row_features(
+                matches[j], sims[j], k, timestamps[i], timestamps, originators, threshold, windows,
+            )
+            if truncated:
                 truncated_count += 1
-            row_matches = row_matches[above_threshold]
-            row_sims = row_sims[above_threshold]
-
-            # Point-in-time, shared across every window: strictly before
-            # message i. Excludes i itself automatically (age is never > 0
-            # against its own timestamp).
-            age = timestamps[i] - timestamps[row_matches]
-            earlier = age > np.timedelta64(0, "ns")
-
-            for name, window in windows.items():
-                keep = earlier & (age <= window)
-                if keep.any():
-                    columns[f"{COL_MATCH_COUNT}_{name}"][i] = keep.sum()
-                    columns[f"{COL_MAX_SIM}_{name}"][i] = row_sims[keep].max()
-                    columns[f"{COL_DISTINCT_SENDERS}_{name}"][i] = len(
-                        set(originators[row_matches[keep]])
-                    )
+            for key, value in row_features.items():
+                columns[key][i] = value
 
         batch_start = batch_end
 
@@ -275,6 +252,103 @@ def compute_near_dup_features(
         )
 
     return pd.DataFrame(columns)
+
+
+def _near_dup_row_features(
+    row_matches: np.ndarray,
+    row_sims: np.ndarray,
+    k: int,
+    query_timestamp: np.datetime64,
+    timestamps: np.ndarray,
+    originators: np.ndarray,
+    threshold: float,
+    windows: dict[str, np.timedelta64],
+) -> tuple[dict[str, float], bool]:
+    """
+    Per-query near-dup feature math, factored out of
+    compute_near_dup_features()'s inner loop so the batch path above and
+    the live single-query path below (compute_near_dup_features_for_live_query(),
+    for serving/anomaly_scoring.py) share ONE formula - never two
+    independently-maintained copies that could silently drift apart.
+
+    `row_matches`/`row_sims`: one query's raw top-K search() result
+    (absolute indices into `timestamps`/`originators`), NOT yet
+    threshold-filtered. Returns (features dict, truncated) - `truncated`
+    is True iff every one of the k nearest still cleared threshold (see
+    compute_near_dup_features()'s docstring on FAISS_MAX_MATCHES_PER_QUERY).
+    """
+    valid = row_matches >= 0
+    row_matches = row_matches[valid]
+    row_sims = row_sims[valid]
+
+    above_threshold = row_sims >= threshold
+    truncated = bool(above_threshold.all() and len(row_sims) == k)
+    row_matches = row_matches[above_threshold]
+    row_sims = row_sims[above_threshold]
+
+    # Point-in-time: strictly before the query's own timestamp. Excludes
+    # the query itself automatically when it's part of the same corpus
+    # (age is never > 0 against its own timestamp).
+    age = query_timestamp - timestamps[row_matches]
+    earlier = age > np.timedelta64(0, "ns")
+
+    features: dict[str, float] = {}
+    for name, window in windows.items():
+        keep = earlier & (age <= window)
+        if keep.any():
+            features[f"{COL_MATCH_COUNT}_{name}"] = int(keep.sum())
+            features[f"{COL_MAX_SIM}_{name}"] = float(row_sims[keep].max())
+            features[f"{COL_DISTINCT_SENDERS}_{name}"] = len(set(originators[row_matches[keep]]))
+        else:
+            features[f"{COL_MATCH_COUNT}_{name}"] = 0
+            features[f"{COL_MAX_SIM}_{name}"] = 0.0
+            features[f"{COL_DISTINCT_SENDERS}_{name}"] = 0
+    return features, truncated
+
+
+def compute_near_dup_features_for_live_query(
+    index: "faiss.Index",
+    query_embedding: np.ndarray,
+    query_timestamp: np.datetime64,
+    timestamps: np.ndarray,
+    originators: np.ndarray,
+    threshold: float = FAISS_NEAR_DUP_THRESHOLD,
+    windows: dict[str, np.timedelta64] | None = None,
+    max_matches_per_query: int = FAISS_MAX_MATCHES_PER_QUERY,
+) -> dict[str, float]:
+    """
+    Single-query counterpart to compute_near_dup_features(), for live
+    serving (serving/anomaly_scoring.py) rather than batch training - one
+    request's message against an ALREADY-BUILT index over a static
+    historical corpus (this prototype has no live/streaming corpus - see
+    that module's docstring for why reusing the same historical corpus as
+    "recent traffic" is the deliberate, disclosed design here).
+
+    No query-batching or chunking here (unlike the batch path) - a single
+    live request is one query, not millions of historical rows; the same
+    FAISS_MAX_MATCHES_PER_QUERY cap is reused as-is since a FlatIP index's
+    per-query search cost is dominated by corpus size (index.ntotal), not
+    by k - capping k tighter here wouldn't meaningfully help latency.
+
+    `index`: pre-built over the historical corpus's embeddings (see
+    build_index()) - NOT rebuilt here; caller (serving/anomaly_scoring.py)
+    owns load-once caching, same convention as serving/scoring.py's
+    champion cache. `timestamps`/`originators`: same corpus, same row
+    order the index was built from - position i corresponds 1:1 to the
+    index's internal vector i.
+    """
+    windows = windows if windows is not None else DEFAULT_WINDOWS
+    k = min(max_matches_per_query, index.ntotal)
+    sims, matches = index.search(query_embedding.reshape(1, -1), k)
+    features, truncated = _near_dup_row_features(
+        matches[0], sims[0], k, query_timestamp, timestamps, originators, threshold, windows,
+    )
+    if truncated:
+        print(
+            f"  WARNING: live query hit the {k}-candidate cap - its real "
+            "near-dup count may be higher than what's recorded."
+        )
+    return features
 
 
 def compute_near_dup_features_chunked(

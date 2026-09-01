@@ -1,8 +1,11 @@
 """
 FastAPI service - CLAUDE.md's "Next: 1. FastAPI service combining both
-scores" step, THIS PASS covers rule_pattern_score only (see
-serving/schemas.py's module docstring for why anomaly_score is a
-deliberate follow-up).
+scores" step. Both scores are computed: rule_pattern_score
+(serving/scoring.py) drives fraud_results/recommended_action per the
+external response contract; anomaly_score (serving/anomaly_scoring.py) is
+computed alongside it and surfaced on ScoreResponse.anomaly_score for
+visibility only - see serving/schemas.py's module docstring for why it
+doesn't gate the FRAUD/NOT_FRAUD decision yet.
 
 ONE endpoint, TWO request parsers, ONE scoring path: SMPP and SS7 carry
 genuinely different raw wire fields (serving/schemas.py's
@@ -39,6 +42,9 @@ import time
 
 from fastapi import FastAPI
 
+from serving.anomaly_scoring import score_anomaly
+from serving.anomaly_scoring import ChampionUnavailableError as AnomalyChampionUnavailableError
+from serving.anomaly_scoring import CorpusUnavailableError
 from serving.canonical import map_smpp_transaction, map_ss7_transaction
 from serving.feature_lookup import get_imsi_features, get_sender_features
 from serving.schemas import (
@@ -179,6 +185,22 @@ def score(request: ScoreRequest) -> ScoreResponse:
             break
 
     recommended_action = "BLOCK" if any(r.prediction == "FRAUD" for r in fraud_results) else "PASS"
+
+    # Independent of rule_pattern_score above - a failure here (no
+    # promoted anomaly champion yet, no corpus for this source, etc.)
+    # must NOT turn a successful rule_pattern_score result into
+    # status=FAILURE; anomaly_score is surfaced for visibility, not a
+    # required part of this response (see schemas.ScoreResponse's
+    # anomaly_score docstring).
+    try:
+        anomaly_score, _, _ = score_anomaly(canonical, behavioral)
+    except (AnomalyChampionUnavailableError, CorpusUnavailableError) as e:
+        print(f"anomaly_score unavailable for {reference!r}: {e}")
+        anomaly_score = None
+    except Exception as e:
+        print(f"anomaly_score failed for {reference!r}: {e}")
+        anomaly_score = None
+
     processing_time_ms = int((time.perf_counter() - start) * 1000)
 
     return ScoreResponse(
@@ -188,4 +210,5 @@ def score(request: ScoreRequest) -> ScoreResponse:
         processing_time_ms=processing_time_ms,
         model_version=model_version,
         fraud_results=fraud_results,
+        anomaly_score=anomaly_score,
     )

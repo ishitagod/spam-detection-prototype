@@ -98,12 +98,46 @@ def train_lightgbm(
     learning_rate: float = 0.1,
     max_depth: int = -1,
     random_state: int = 42,
+    colsample_bytree: float = 1.0,
+    min_child_samples: int = 20,
+    reg_alpha: float = 0.0,
+    reg_lambda: float = 0.0,
 ) -> lgb.LGBMClassifier:
+    """
+    colsample_bytree/min_child_samples/reg_alpha/reg_lambda default to
+    LightGBM's own library defaults - unless explicitly overridden via
+    train.py's CLI, behavior is unchanged from before these existed.
+
+    These are the real anti-single-feature-dominance knobs, added after a
+    real observation (SS7 --with_tfidf champion, models/rule_pattern/
+    explain.py's SHAP output): tfidf_https alone accounted for a large
+    swing in a live prediction (risk_score 0 -> 96 from adding one token).
+    That may be a genuinely correct learned pattern (this model's scope is
+    known rule-engine patterns, not novel spam - CLAUDE.md), not
+    necessarily a bug to eliminate - but it's also a real production risk
+    (trivially evadable by not using that literal string). Three
+    independent levers, not one, since they attack different mechanisms:
+      - colsample_bytree < 1.0: randomly excludes some features from each
+        tree, so no single feature can be the split at every tree's root.
+      - min_child_samples > 20: requires more rows per leaf, so a leaf
+        specialized around one rare-but-strong token needs more support.
+      - reg_alpha/reg_lambda > 0: L1/L2 penalty on leaf weights directly
+        discourages the large leaf-value swing that produces a near-100
+        risk_score jump from one token flipping.
+    None of these are tuned/validated yet - starting points to experiment
+    with via PR-AUC/log loss (does regularizing hurt the real metric) and
+    re-running explain.py (does it actually reduce tfidf_https's SHAP
+    magnitude), not assumed to be correct as-is.
+    """
     model = lgb.LGBMClassifier(
         n_estimators=n_estimators,
         learning_rate=learning_rate,
         max_depth=max_depth,
         random_state=random_state,
+        colsample_bytree=colsample_bytree,
+        min_child_samples=min_child_samples,
+        reg_alpha=reg_alpha,
+        reg_lambda=reg_lambda,
         verbosity=-1,
     )
     model.fit(X_train, y_train)
@@ -118,6 +152,10 @@ def run(
     learning_rate: float,
     max_depth: int,
     random_state: int,
+    colsample_bytree: float = 1.0,
+    min_child_samples: int = 20,
+    reg_alpha: float = 0.0,
+    reg_lambda: float = 0.0,
     with_embeddings: bool = False,
     n_embedding_components: int = N_EMBEDDING_COMPONENTS,
     with_tfidf: bool = False,
@@ -184,6 +222,10 @@ def run(
         learning_rate=learning_rate,
         max_depth=max_depth,
         random_state=random_state,
+        colsample_bytree=colsample_bytree,
+        min_child_samples=min_child_samples,
+        reg_alpha=reg_alpha,
+        reg_lambda=reg_lambda,
     )
 
     train_score = model.predict_proba(X_train)[:, 1]
@@ -235,6 +277,10 @@ def run(
                 "learning_rate": learning_rate,
                 "max_depth": max_depth,
                 "random_state": random_state,
+                "colsample_bytree": colsample_bytree,
+                "min_child_samples": min_child_samples,
+                "reg_alpha": reg_alpha,
+                "reg_lambda": reg_lambda,
                 "with_embeddings": with_embeddings,
                 "with_tfidf": with_tfidf,
                 **(
@@ -305,6 +351,23 @@ def main():
     parser.add_argument("--max_depth", type=int, default=-1)
     parser.add_argument("--random_state", type=int, default=42)
     parser.add_argument(
+        "--colsample_bytree", type=float, default=1.0,
+        help="Fraction of features randomly sampled per tree - lower (e.g. 0.7) so no "
+        "single feature (e.g. a highly-discriminative tfidf_* token) can be the split "
+        "at every tree's root. See train_lightgbm()'s docstring.",
+    )
+    parser.add_argument(
+        "--min_child_samples", type=int, default=20,
+        help="Minimum rows per leaf - raise (e.g. 50) to require more support before a "
+        "leaf specializes around one rare-but-strong token.",
+    )
+    parser.add_argument(
+        "--reg_alpha", type=float, default=0.0, help="L1 regularization on leaf weights.",
+    )
+    parser.add_argument(
+        "--reg_lambda", type=float, default=0.0, help="L2 regularization on leaf weights.",
+    )
+    parser.add_argument(
         "--with_embeddings",
         action="store_true",
         help="Add PCA-reduced text embeddings as features - not useful until "
@@ -336,6 +399,10 @@ def main():
         args.learning_rate,
         args.max_depth,
         args.random_state,
+        colsample_bytree=args.colsample_bytree,
+        min_child_samples=args.min_child_samples,
+        reg_alpha=args.reg_alpha,
+        reg_lambda=args.reg_lambda,
         with_embeddings=args.with_embeddings,
         n_embedding_components=args.n_embedding_components,
         with_tfidf=args.with_tfidf,

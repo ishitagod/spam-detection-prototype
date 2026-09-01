@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.anomaly.data import (
     BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, IMSI_DISTINCT_ORIG_KNOWN_COL,
-    NEAR_DUP_COLS, build_feature_matrix, load_source_features,
+    NEAR_DUP_COLS, build_combined_frame, build_feature_matrix, load_source_features,
 )
 
 N_EMBEDDING_DIMS = 4  # small, for test speed - real data uses 384
@@ -176,6 +176,23 @@ def test_imsi_distinct_orig_col_absent_and_null_both_get_known_zero():
     # column regardless of whether NaN came from "column absent" or "this
     # row's imsi is null" - both were fed through the exact same np.nan.
     assert X[0, known_idx] == X[2, known_idx]
+
+
+def test_known_sources_forces_both_dummy_columns_for_a_single_row():
+    """A single live row (serving/anomaly_scoring.py's case) has
+    nunique()==1 by construction - without known_sources, source dummies
+    would be silently dropped even though the fitted preprocessor still
+    expects both source_SMPP/source_SS7 columns (it was fit on a
+    combined-sources training df)."""
+    df = _sample_df(n=1)
+    combined, _, other_cols = build_combined_frame(df)
+    assert "source_SMPP" not in other_cols  # old behavior unaffected
+
+    combined, _, other_cols = build_combined_frame(df, known_sources=["SMPP", "SS7"])
+    assert "source_SMPP" in other_cols
+    assert "source_SS7" in other_cols
+    assert combined["source_SMPP"].iloc[0] == 1
+    assert combined["source_SS7"].iloc[0] == 0
 
 
 def test_load_source_features_inner_joins_all_three_sources(tmp_path):

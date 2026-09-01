@@ -164,7 +164,9 @@ def build_preprocessor(embedding_cols: list[str], other_cols: list[str], n_embed
     ])
 
 
-def build_combined_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+def build_combined_frame(
+    df: pd.DataFrame, known_sources: list[str] | None = None,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
     """
     The pre-preprocessor frame build_feature_matrix() fits/transforms -
     factored out so callers that need the RAW input shape the returned
@@ -173,6 +175,15 @@ def build_combined_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], lis
     get it without duplicating this construction. Returns (combined,
     embedding_cols, other_cols) - same three pieces build_feature_matrix()
     passes to build_preprocessor().
+
+    `known_sources`: forces one-hot columns for EVERY name in this list to
+    exist in the output, regardless of how many distinct `source` values
+    `df` itself contains - for serving/anomaly_scoring.py's single live
+    row, where `df["source"].nunique()` is always 1 and would otherwise
+    silently drop whichever source_* column the fitted preprocessor still
+    expects (it was fit on a combined-sources df where both existed).
+    None (default, every training caller) preserves the old nunique()>1
+    behavior exactly - unaffected by this parameter.
     """
     transformed = df.copy()
     for col in COUNT_COLS:
@@ -202,7 +213,14 @@ def build_combined_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], lis
     embedding_cols = [c for c in transformed.columns if c.startswith("emb_")]
     other_cols = list(BEHAVIORAL_COLS) + list(NEAR_DUP_COLS) + imsi_cols
     pieces = [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS + imsi_cols]]
-    if transformed["source"].nunique() > 1:
+    if known_sources is not None:
+        source_dummies = pd.get_dummies(
+            transformed["source"].astype(pd.CategoricalDtype(categories=sorted(known_sources))),
+            prefix="source",
+        )
+        other_cols += list(source_dummies.columns)
+        pieces.append(source_dummies)
+    elif transformed["source"].nunique() > 1:
         source_dummies = pd.get_dummies(transformed["source"], prefix="source")
         other_cols += list(source_dummies.columns)
         pieces.append(source_dummies)

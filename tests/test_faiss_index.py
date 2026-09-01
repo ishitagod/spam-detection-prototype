@@ -20,7 +20,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from features.faiss_index import compute_near_dup_features, compute_near_dup_features_chunked
+from features.faiss_index import (
+    build_index,
+    compute_near_dup_features,
+    compute_near_dup_features_chunked,
+    compute_near_dup_features_for_live_query,
+)
 
 THRESHOLD = 0.92
 WINDOWS = {"w": np.timedelta64(1, "h")}  # single named window - keeps most assertions simple
@@ -310,6 +315,58 @@ def test_chunked_catches_a_match_straddling_a_chunk_boundary():
     )
     m4 = result[result["message_key"] == "m4"].iloc[0]
     assert m4["near_dup_match_count_w"] == 1
+
+
+def test_live_query_matches_batch_path_for_an_equivalent_query():
+    """serving/anomaly_scoring.py's per-request path must produce the
+    EXACT same numbers the batch training path would for an equivalent
+    query - this is the whole point of sharing _near_dup_row_features()
+    between the two, not maintaining two independently-written formulas."""
+    corpus_embeddings = np.array(
+        [BASE, unit_vec(0.85), unit_vec(0.5)], dtype=np.float32
+    )
+    corpus_rows = [
+        row("m0", originator="S1", timestamp="2026-08-19T09:00:00"),
+        row("m1", originator="S2", timestamp="2026-08-19T09:30:00"),
+        row("m2", originator="S3", timestamp="2026-08-19T09:45:00"),
+    ]
+    # Batch path: append the query as a 4th row of the SAME corpus, so
+    # compute_near_dup_features() scores it against exactly the other 3.
+    batch_result = run(
+        list(corpus_embeddings) + [BASE],
+        corpus_rows + [row("query", originator="Sq", timestamp="2026-08-19T10:00:00")],
+    )
+    batch_row = batch_result[batch_result["message_key"] == "query"].iloc[0]
+
+    # Live path: index built over ONLY the 3 corpus rows, query passed
+    # separately - what serving/anomaly_scoring.py actually does.
+    index = build_index(corpus_embeddings)
+    id_map = pd.DataFrame(corpus_rows)
+    timestamps = pd.to_datetime(id_map["timestamp"]).to_numpy()
+    originators = id_map["originator"].astype(str).to_numpy()
+    live_features = compute_near_dup_features_for_live_query(
+        index, BASE, np.datetime64("2026-08-19T10:00:00"),
+        timestamps, originators, threshold=THRESHOLD, windows=WINDOWS,
+    )
+
+    assert live_features["near_dup_match_count_w"] == batch_row["near_dup_match_count_w"]
+    assert live_features["near_dup_max_similarity_w"] == pytest.approx(batch_row["near_dup_max_similarity_w"])
+    assert live_features["near_dup_distinct_senders_w"] == batch_row["near_dup_distinct_senders_w"]
+    assert live_features["near_dup_match_count_w"] == 1  # only m0 (identical) clears 0.92
+
+
+def test_live_query_with_no_corpus_matches_gives_zero():
+    index = build_index(np.array([unit_vec(0.0)], dtype=np.float32))
+    id_map = pd.DataFrame([row("m0", timestamp="2026-08-19T09:00:00")])
+    timestamps = pd.to_datetime(id_map["timestamp"]).to_numpy()
+    originators = id_map["originator"].astype(str).to_numpy()
+    features = compute_near_dup_features_for_live_query(
+        index, BASE, np.datetime64("2026-08-19T10:00:00"), timestamps, originators,
+        threshold=THRESHOLD, windows=WINDOWS,
+    )
+    assert features["near_dup_match_count_w"] == 0
+    assert features["near_dup_max_similarity_w"] == 0.0
+    assert features["near_dup_distinct_senders_w"] == 0
 
 
 if __name__ == "__main__":
