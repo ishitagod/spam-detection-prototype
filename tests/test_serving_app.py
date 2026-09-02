@@ -1,7 +1,11 @@
 """
-pytest suite for serving/app.py's POST /v1/score endpoint - the response-
-contract shaping (status/recommended_action/fraud_results/reason_codes),
-not real model/Feast integration. serving.app.get_sender_features,
+pytest suite for serving/app.py's POST /v1/score/smpp and /v1/score/ss7
+endpoints - the response-contract shaping (status/recommended_action/
+fraud_results/reason_codes), not real model/Feast integration. Both routes
+share the same _score() body, so most cases below exercise it via whichever
+route matches the payload's protocol; only the request-shape/routing checks
+near the bottom care about hitting the "wrong" route on purpose.
+serving.app.get_sender_features,
 serving.app.get_imsi_features, and serving.app.score_rule_pattern are all
 monkeypatched so this runs without a promoted MLflow champion or an
 applied Feast store - both are exercised separately
@@ -98,7 +102,7 @@ def _mock_score(probability: float):
 
 def test_high_probability_returns_fraud_block(client, monkeypatch):
     monkeypatch.setattr(app_module, "score_rule_pattern", _mock_score(0.95))
-    resp = client.post("/v1/score", json=SS7_PAYLOAD)
+    resp = client.post("/v1/score/ss7", json=SS7_PAYLOAD)
     assert resp.status_code == 200
     body = resp.json()
 
@@ -116,7 +120,7 @@ def test_high_probability_returns_fraud_block(client, monkeypatch):
 
 def test_low_probability_returns_not_fraud_pass(client, monkeypatch):
     monkeypatch.setattr(app_module, "score_rule_pattern", _mock_score(0.05))
-    resp = client.post("/v1/score", json=SMPP_PAYLOAD)
+    resp = client.post("/v1/score/smpp", json=SMPP_PAYLOAD)
     body = resp.json()
 
     assert body["recommended_action"] == "PASS"
@@ -129,7 +133,7 @@ def test_low_probability_returns_not_fraud_pass(client, monkeypatch):
 def test_smishing_only_request_returns_empty_fraud_results(client, monkeypatch):
     monkeypatch.setattr(app_module, "score_rule_pattern", _mock_score(0.9))
     payload = {**SS7_PAYLOAD, "fraud_types": ["SMISHING"]}
-    resp = client.post("/v1/score", json=payload)
+    resp = client.post("/v1/score/ss7", json=payload)
     body = resp.json()
 
     assert body["status"] == "SUCCESS"
@@ -144,7 +148,7 @@ def test_empty_fraud_types_evaluates_all_supported_not_nothing(client, monkeypat
     list)."""
     monkeypatch.setattr(app_module, "score_rule_pattern", _mock_score(0.9))
     payload = {**SS7_PAYLOAD, "fraud_types": []}
-    resp = client.post("/v1/score", json=payload)
+    resp = client.post("/v1/score/ss7", json=payload)
     body = resp.json()
 
     assert body["status"] == "SUCCESS"
@@ -157,7 +161,7 @@ def test_champion_unavailable_returns_failure_status_not_http_error(client, monk
         raise ChampionUnavailableError("no champion promoted yet")
 
     monkeypatch.setattr(app_module, "score_rule_pattern", raise_unavailable)
-    resp = client.post("/v1/score", json=SS7_PAYLOAD)
+    resp = client.post("/v1/score/ss7", json=SS7_PAYLOAD)
 
     assert resp.status_code == 200  # status/error_message carry outcome, not the HTTP line
     body = resp.json()
@@ -168,5 +172,18 @@ def test_champion_unavailable_returns_failure_status_not_http_error(client, monk
 
 def test_unknown_protocol_is_rejected_by_request_validation(client):
     bad_payload = {**SS7_PAYLOAD, "protocol": "XYZ"}
-    resp = client.post("/v1/score", json=bad_payload)
+    resp = client.post("/v1/score/ss7", json=bad_payload)
+    assert resp.status_code == 422
+
+
+def test_smpp_payload_rejected_on_ss7_route(client):
+    """The two routes are now separate request shapes, not one
+    discriminated union - posting an SMPP transaction to /v1/score/ss7 (or
+    vice versa) must fail request validation, not silently mis-route."""
+    resp = client.post("/v1/score/ss7", json=SMPP_PAYLOAD)
+    assert resp.status_code == 422
+
+
+def test_ss7_payload_rejected_on_smpp_route(client):
+    resp = client.post("/v1/score/smpp", json=SS7_PAYLOAD)
     assert resp.status_code == 422

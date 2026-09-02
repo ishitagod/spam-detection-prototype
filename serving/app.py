@@ -7,15 +7,20 @@ computed alongside it and surfaced on ScoreResponse.anomaly_score for
 visibility only - see serving/schemas.py's module docstring for why it
 doesn't gate the FRAUD/NOT_FRAUD decision yet.
 
-ONE endpoint, TWO request parsers, ONE scoring path: SMPP and SS7 carry
-genuinely different raw wire fields (serving/schemas.py's
-SMPPTransaction/SS7Transaction), but CLAUDE.md is explicit that both must
-map to the same canonical schema before touching any model ("SMPP and SS7
-must map to the same canonical schema before shared ML", "Start with one
-shared model; split by source only if segment evaluation justifies it") -
-so protocol-specific parsing lives in serving/canonical.py, and everything
-from there on (Feast lookup, scoring, response-building) is shared,
-`source` carried through as a feature rather than a routing key.
+TWO endpoints (/v1/score/smpp, /v1/score/ss7), ONE scoring path: SMPP and
+SS7 carry genuinely different raw wire fields (serving/schemas.py's
+SMPPTransaction/SS7Transaction) and now get separate routes/request
+models too - but CLAUDE.md is still explicit that both must map to the
+same canonical schema before touching any model ("SMPP and SS7 must map
+to the same canonical schema before shared ML", "Start with one shared
+model; split by source only if segment evaluation justifies it") - so
+protocol-specific parsing lives in serving/canonical.py, and everything
+from there on (Feast lookup, scoring, response-building) is shared via
+`_score()`, `source` carried through as a feature rather than a routing
+key for the MODEL side (rule_pattern_score is separately source-suffixed
+per model, see serving/scoring.py - that split is independent of this
+one, which is purely about having two request shapes/routes instead of a
+discriminated union on one).
 
 RESPONSE CONTRACT is an external spec (reference/status/error_message/
 recommended_action/processing_time_ms/model_version/fraud_results) - see
@@ -45,13 +50,13 @@ from fastapi import FastAPI
 from serving.anomaly_scoring import score_anomaly
 from serving.anomaly_scoring import ChampionUnavailableError as AnomalyChampionUnavailableError
 from serving.anomaly_scoring import CorpusUnavailableError
-from serving.canonical import map_smpp_transaction, map_ss7_transaction
+from serving.canonical import CanonicalRow, map_smpp_transaction, map_ss7_transaction
 from serving.feature_lookup import get_imsi_features, get_sender_features
 from serving.schemas import (
     FraudPredictionResult,
-    ScoreRequest,
     ScoreResponse,
     SMPPScoreRequest,
+    SS7ScoreRequest,
 )
 from serving.scoring import (
     BEHAVIORAL_COLS,
@@ -119,16 +124,24 @@ def _reason_codes(row: dict, cold_start: bool) -> list[str]:
     return codes
 
 
-@app.post("/v1/score", response_model=ScoreResponse)
-def score(request: ScoreRequest) -> ScoreResponse:
+@app.post("/v1/score/smpp", response_model=ScoreResponse)
+def score_smpp(request: SMPPScoreRequest) -> ScoreResponse:
+    return _score(request, map_smpp_transaction(request.transaction))
+
+
+@app.post("/v1/score/ss7", response_model=ScoreResponse)
+def score_ss7(request: SS7ScoreRequest) -> ScoreResponse:
+    return _score(request, map_ss7_transaction(request.transaction))
+
+
+def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow) -> ScoreResponse:
+    """Shared body behind both routes above - request-shape/canonical-
+    mapping is the only thing that differs per protocol (see module
+    docstring); everything from here on (Feast lookup, both scores,
+    response-building) is identical regardless of which endpoint was
+    hit."""
     start = time.perf_counter()
     reference = request.transaction.reference
-
-    canonical = (
-        map_smpp_transaction(request.transaction)
-        if isinstance(request, SMPPScoreRequest)
-        else map_ss7_transaction(request.transaction)
-    )
 
     try:
         behavioral = get_sender_features(canonical.sender_id, canonical.text)

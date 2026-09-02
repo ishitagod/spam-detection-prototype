@@ -112,3 +112,11 @@ Score-per-message, one parquet file per source
 `anomaly_score` (the actual, sign-flipped `decision_function` output) and
 a min-max normalized `anomaly_score_normalized` (0-1, easy to eyeball)
 alongside it.
+
+## What to do with the output: clustering into candidate fraud types
+
+`anomaly_score` alone ranks anomalies, it doesn't group or type them.
+See `docs/experiments/anomaly_clustering.md` for the DBSCAN-based
+clustering workflow (`models/anomaly/cluster_discovery.py`) that turns
+this ranked list into hand-labelable candidate fraud-type clusters — the
+concrete next step for this model's output, not a hypothetical one.

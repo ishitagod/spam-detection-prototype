@@ -105,16 +105,6 @@ Goal: production-grade working demo first, then iterate.
   fails in a way that looks like a pickling/serialization internals
   mismatch rather than a logic bug, check for the same cause before
   assuming it's this project's code.
-- Text embedding is the one genuinely expensive step in the whole
-  pipeline: ~14ms per DISTINCT text on CPU (measured, not estimated) -
-  the full ~8.2M-row dataset would be a ~21hr job. Prototype-scale
-  default is to sample (`features/text_embeddings.py --sample_n`); a
-  full run is a deliberate later step once downstream FAISS/Isolation
-  Forest results validate the approach at sample scale. Every embeddings
-  output directory carries an `embeddings_sample_info.txt` disclosure
-  file when it's a sample, removed automatically on a real full run, so
-  nobody finds `embeddings.npy` later and assumes full coverage without
-  checking.
 
 ## File layout
 
@@ -148,7 +138,9 @@ spam-detection-prototype/
 │   ├── metrics.py               # shared PR-AUC/log-loss eval, single-class-skip guard - used by both models below
 │   ├── anomaly/
 │   │   ├── data.py               # feature join (embeddings+behavioral+near-dup) + preprocessing pipeline
-│   │   └── train.py              # Isolation Forest training - see docs/experiments/anomaly.md
+│   │   ├── train.py              # Isolation Forest training - see docs/experiments/anomaly.md
+│   │   ├── cluster_discovery.py  # DBSCAN on top-anomaly rows -> candidate fraud-type clusters - see docs/experiments/anomaly_clustering.md
+│   │   └── inspect_clusters.py   # hand-labeling helper: prints/exports cluster samples for naming - see docs/experiments/anomaly_clustering.md
 │   └── rule_pattern/
 │       ├── data.py               # rule_evaluated==True feature/label prep
 │       └── train.py              # LightGBM training - see docs/experiments/rule_pattern.md
@@ -169,6 +161,7 @@ spam-detection-prototype/
 │   ├── experiments/
 │   │   ├── faiss.md                       # near-dup index design + tuning evidence
 │   │   ├── anomaly.md                     # Isolation Forest design + tuning evidence
+│   │   ├── anomaly_clustering.md          # DBSCAN clustering workflow: anomaly_score -> hand-labelable fraud-type clusters
 │   │   └── rule_pattern.md                # LightGBM design + tuning evidence
 │   ├── feature_catalog.md                 # what's servable from Feast - name/type/meaning per feature
 │   ├── prototype_plan.md

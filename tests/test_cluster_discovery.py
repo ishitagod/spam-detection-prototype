@@ -43,7 +43,7 @@ def _two_clusters_plus_outlier() -> np.ndarray:
 
 def test_run_dbscan_groups_each_tight_blob_into_its_own_cluster():
     X = _two_clusters_plus_outlier()
-    labels = run_dbscan(X, eps=1.0, min_samples=3)
+    labels = run_dbscan(X, eps=1.0, min_samples=3, n_jobs=1)
     blob_a_labels = set(labels[:6])
     blob_b_labels = set(labels[6:12])
     assert len(blob_a_labels) == 1  # all of blob A shares one label
@@ -53,7 +53,7 @@ def test_run_dbscan_groups_each_tight_blob_into_its_own_cluster():
 
 def test_run_dbscan_far_outlier_is_noise():
     X = _two_clusters_plus_outlier()
-    labels = run_dbscan(X, eps=1.0, min_samples=3)
+    labels = run_dbscan(X, eps=1.0, min_samples=3, n_jobs=1)
     assert labels[-1] == -1
 
 

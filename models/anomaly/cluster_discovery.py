@@ -49,6 +49,14 @@ Usage:
     python -m models.anomaly.cluster_discovery
     python -m models.anomaly.cluster_discovery --anomaly_percentile 95 --min_samples 8
     python -m models.anomaly.cluster_discovery --eps 2.1   # override the auto-suggested eps
+
+SCALE WARNING - read before raising --anomaly_percentile's default pool
+size: at FULL (non-sampled) dataset scale, the default --anomaly_percentile
+90 selects hundreds of thousands of candidate rows - DBSCAN over that many
+rows in this feature space's dimensionality is a real, observed crash (see
+MAX_RECOMMENDED_CANDIDATES below), not a theoretical risk. `run()` refuses
+above that many candidates without --force. Use a tighter
+--anomaly_percentile (99-99.9) at full scale instead of --force.
 """
 import argparse
 from pathlib import Path
@@ -75,6 +83,22 @@ MLFLOW_EXPERIMENT_NAME = "fraud_type_cluster_discovery"
 # PCA-component-space can't map that back to "this is a flooding burst"
 # the way "mean sender_msgs_last_1hr=8,200" can.
 SUMMARY_RAW_COLS = BEHAVIORAL_COLS + NEAR_DUP_COLS
+
+# Documented starting point, not a proven-correct constant (same honesty
+# convention as FAISS_NEAR_DUP_THRESHOLD/N_EMBEDDING_COMPONENTS) - real,
+# observed failure mode above this: running the default --anomaly_percentile
+# 90 against a FULL (non-sampled) 8.2M-row dataset selected 824,823
+# candidate rows, and DBSCAN's neighbor search over that many rows at this
+# feature-space's dimensionality (~40+) exhausted system memory badly
+# enough to crash the whole machine (VS Code included), not just the
+# Python process. This tool was sized against the sample-scale run
+# (tens of thousands of candidates), not full-scale - see
+# docs/experiments/anomaly_clustering.md. `run()` refuses to proceed past
+# this many candidate rows without `--force`, on purpose: the fix is
+# almost always a tighter --anomaly_percentile (this tool exists to
+# characterize the EXTREME tail into a hand-reviewable number of
+# clusters, not to cluster 10% of all traffic), not overriding this.
+MAX_RECOMMENDED_CANDIDATES = 50_000
 
 
 def suggest_eps(X: np.ndarray, min_samples: int) -> float:
@@ -156,8 +180,14 @@ def select_anomalous_subset(
     return df[mask].reset_index(drop=True), X[mask]
 
 
-def run_dbscan(X: np.ndarray, eps: float, min_samples: int) -> np.ndarray:
-    model = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1)
+def run_dbscan(X: np.ndarray, eps: float, min_samples: int, n_jobs: int) -> np.ndarray:
+    # n_jobs is a real CLI knob, not hardcoded -1 (all cores) - see
+    # MAX_RECOMMENDED_CANDIDATES's docstring: each parallel worker holds
+    # its own chunk of the neighbor-search tree, so more workers means
+    # more concurrent memory, not just more speed, once a run is anywhere
+    # near candidate-count-heavy. -1 is still available (pass explicitly)
+    # for a candidate pool small enough that this doesn't matter.
+    model = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=n_jobs)
     return model.fit_predict(X)
 
 
@@ -198,6 +228,8 @@ def run(
     anomaly_percentile: float,
     eps: float | None,
     min_samples: int,
+    n_jobs: int = 4,
+    force: bool = False,
 ) -> None:
     print(f"Loading features + anomaly scores for sources: {sources} ...")
     df, X, _ = load_features_and_scores(sources, data_dir)
@@ -211,11 +243,21 @@ def run(
             "points. Raise the candidate pool (lower --anomaly_percentile) or "
             "lower --min_samples."
         )
+    if len(df_subset) > MAX_RECOMMENDED_CANDIDATES and not force:
+        raise ValueError(
+            f"{len(df_subset)} candidate rows selected, above "
+            f"MAX_RECOMMENDED_CANDIDATES ({MAX_RECOMMENDED_CANDIDATES}) - see "
+            "this module's docstring for the real crash this guards against "
+            "(DBSCAN on ~800k rows exhausted system memory badly enough to "
+            "take down the whole machine, not just this process). Raise "
+            "--anomaly_percentile to shrink the candidate pool (e.g. 99.5 for "
+            "~top 0.5%), or pass --force to proceed anyway at your own risk."
+        )
 
     resolved_eps = eps if eps is not None else suggest_eps(X_subset, min_samples)
 
-    print(f"Running DBSCAN (eps={resolved_eps:.4f}, min_samples={min_samples}) on {len(X_subset)} rows ...")
-    labels = run_dbscan(X_subset, resolved_eps, min_samples)
+    print(f"Running DBSCAN (eps={resolved_eps:.4f}, min_samples={min_samples}, n_jobs={n_jobs}) on {len(X_subset)} rows ...")
+    labels = run_dbscan(X_subset, resolved_eps, min_samples, n_jobs)
     n_clusters = len(set(labels.tolist()) - {-1})
     n_noise = int((labels == -1).sum())
     print(f"  {n_clusters} cluster(s) found, {n_noise} row(s) unclustered (noise, label -1)")
@@ -224,16 +266,28 @@ def run(
     print("Cluster summary (see module docstring - this feeds human hand-labeling, not a formal metric):")
     print_cluster_summary(summary)
 
+    # dataset_label names which source(s) this run actually clustered
+    dataset_label = "+".join(sorted(sources))
+
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
     with mlflow.start_run():
+        mlflow.log_input(
+            mlflow.data.from_pandas(
+                df_subset,
+                source=",".join(str(data_dir / s / "anomaly_scores.parquet") for s in sources),
+                name=dataset_label,
+            ),
+            context="clustering",
+        )
         mlflow.log_params({
-            "sources": ",".join(sources),
+            "dataset": dataset_label,
             "anomaly_percentile": anomaly_percentile,
             "n_candidate_rows": len(df_subset),
             "eps": resolved_eps,
             "eps_was_auto_suggested": eps is None,
             "min_samples": min_samples,
+            "n_jobs": n_jobs,
         })
         mlflow.log_metrics({"n_clusters": n_clusters, "n_noise": n_noise})
         mlflow.log_dict(summary, "cluster_summary.json")
@@ -269,8 +323,25 @@ def main():
         help="DBSCAN eps. Default: auto-suggested from k-distance (see suggest_eps()).",
     )
     parser.add_argument("--min_samples", type=int, default=5)
+    parser.add_argument(
+        "--n_jobs", type=int, default=4,
+        help="DBSCAN parallel workers. Default 4, not -1 (all cores) - see "
+        "run_dbscan()'s docstring: more workers means more CONCURRENT memory "
+        "for the neighbor search, not just more speed, once the candidate "
+        "pool is anywhere near MAX_RECOMMENDED_CANDIDATES-sized.",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Proceed even if the selected candidate pool exceeds "
+        "MAX_RECOMMENDED_CANDIDATES - see that constant's docstring for the "
+        "real crash this normally guards against. Use a tighter "
+        "--anomaly_percentile instead unless you specifically need this.",
+    )
     args = parser.parse_args()
-    run(args.sources, Path(args.data_dir), args.anomaly_percentile, args.eps, args.min_samples)
+    run(
+        args.sources, Path(args.data_dir), args.anomaly_percentile, args.eps,
+        args.min_samples, n_jobs=args.n_jobs, force=args.force,
+    )
 
 
 if __name__ == "__main__":

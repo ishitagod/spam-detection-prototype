@@ -5,14 +5,12 @@ and scores one canonical row - the anomaly_score counterpart to
 serving/scoring.py's score_rule_pattern(), following serving/schemas.py's
 "deliberate follow-up" note now that this design is settled.
 
-MODEL ROUTING: unlike rule_pattern_score (serving/scoring.py - always
-source-suffixed), anomaly_score has NOT been split by source (no real
-per-source gap has justified it - see scripts/check_source_split_justified.py
-and CLAUDE.md's "Start with one shared model; split by source only if
-segment evaluation justifies it"). This module therefore loads ONE
-process-wide champion, registered as ANOMALY_MODEL_NAME with no source
-suffix - if a split is ever justified, this needs the same per-source
-cache-keyed-by-source pattern serving/scoring.py already uses.
+MODEL ROUTING: split by source, same as rule_pattern_score
+(serving/scoring.py) - scripts/check_source_split_justified.py justified
+it, so this loads a per-source champion registered as
+f"{ANOMALY_MODEL_NAME}_{source}" (anomaly_SMPP / anomaly_SS7), cached in
+a dict keyed by source, same pattern serving/scoring.py already uses -
+SMPP and SS7 never share a champion.
 
 THE HARD PART - NEAR-DUP FEATURES AT SERVING TIME: Isolation Forest needs
 near_dup_match_count/max_similarity/distinct_senders for both windows
@@ -63,7 +61,8 @@ from models.anomaly.data import IMSI_DISTINCT_ORIG_COL, build_combined_frame
 from models.registry import MLFLOW_TRACKING_URI
 from serving.canonical import CanonicalRow
 
-ANOMALY_MODEL_NAME = "anomaly_score_model"  # combined, no source suffix - see module docstring
+ANOMALY_MODEL_NAME = "anomaly"  # base name - actual registered model is
+# source-suffixed (anomaly_SMPP / anomaly_SS7), see module docstring
 CHAMPION_ALIAS = "champion"
 KNOWN_SOURCES = ["SMPP", "SS7"]
 
@@ -76,10 +75,12 @@ DEFAULT_DATA_DIR = Path("data/processed")
 
 
 class ChampionUnavailableError(RuntimeError):
-    """No model currently holds CHAMPION_ALIAS for ANOMALY_MODEL_NAME - a
-    real, expected state before models/compare_versions.py has ever
-    promoted an anomaly_score champion (see serving/scoring.py's
-    identical error for rule_pattern_score)."""
+    """No model currently holds CHAMPION_ALIAS for this source's
+    registered name (ANOMALY_MODEL_NAME + "_" + source) - a real, expected
+    state before models/compare_versions.py has ever promoted a champion
+    for THAT source (see serving/scoring.py's identical error for
+    rule_pattern_score). Each source is independent: SMPP having a
+    champion doesn't mean SS7 does, or vice versa."""
 
 
 class CorpusUnavailableError(RuntimeError):
@@ -101,32 +102,34 @@ class _LoadedCorpus:
     originators: np.ndarray
 
 
-_cached_model: _LoadedAnomalyModel | None = None
+_cached_model: dict[str, _LoadedAnomalyModel] = {}  # keyed by source - one
+# process-wide cache entry per source-specific champion, same reasoning as
+# serving/scoring.py's per-source champion cache (real cost, load once).
 _cached_corpus: dict[str, _LoadedCorpus] = {}  # keyed by source - each
 # source's corpus is loaded/indexed independently, same reasoning as
 # serving/scoring.py's per-source champion cache (real cost, load once).
 
 
-def _load_champion() -> _LoadedAnomalyModel:
-    global _cached_model
-    if _cached_model is not None:
-        return _cached_model
+def _load_champion(source: str) -> _LoadedAnomalyModel:
+    if source in _cached_model:
+        return _cached_model[source]
 
+    registered_name = f"{ANOMALY_MODEL_NAME}_{source}"
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     client = mlflow.MlflowClient()
     try:
-        version = client.get_model_version_by_alias(ANOMALY_MODEL_NAME, CHAMPION_ALIAS)
+        version = client.get_model_version_by_alias(registered_name, CHAMPION_ALIAS)
     except mlflow.exceptions.MlflowException as e:
         raise ChampionUnavailableError(
-            f"No {CHAMPION_ALIAS!r} version registered for {ANOMALY_MODEL_NAME!r} - "
-            f"run `python -m models.anomaly.train` then `python -m models.compare_versions "
-            f"--experiment_name isolation_forest --registered_name {ANOMALY_MODEL_NAME} "
-            f"--metric_key overall_pr_auc` to promote one."
+            f"No {CHAMPION_ALIAS!r} version registered for {registered_name!r} - "
+            f"run `python -m models.anomaly.train --sources {source}` then "
+            f"`python -m models.compare_versions --experiment_name isolation_forest_{source} "
+            f"--registered_name {registered_name} --metric_key overall_pr_auc` to promote one."
         ) from e
 
-    pipeline = mlflow.sklearn.load_model(f"models:/{ANOMALY_MODEL_NAME}@{CHAMPION_ALIAS}")
-    _cached_model = _LoadedAnomalyModel(pipeline=pipeline, version=str(version.version))
-    return _cached_model
+    pipeline = mlflow.sklearn.load_model(f"models:/{registered_name}@{CHAMPION_ALIAS}")
+    _cached_model[source] = _LoadedAnomalyModel(pipeline=pipeline, version=str(version.version))
+    return _cached_model[source]
 
 
 def _load_corpus(source: str, data_dir: Path) -> _LoadedCorpus:
@@ -171,7 +174,7 @@ def reset_cache() -> None:
     champion and rebuild every source's corpus index instead of reusing
     whatever this process already cached."""
     global _cached_model, _cached_corpus
-    _cached_model = None
+    _cached_model = {}
     _cached_corpus = {}
 
 
@@ -221,7 +224,7 @@ def score_anomaly(
     them. Disagreements between the two scores are valuable and should
     remain visible."
     """
-    loaded = _load_champion()
+    loaded = _load_champion(canonical.source)
     corpus = _load_corpus(canonical.source, data_dir)
 
     # Lazy import: features/text_embeddings.py pulls in
