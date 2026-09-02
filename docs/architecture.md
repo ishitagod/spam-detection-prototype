@@ -80,7 +80,13 @@ Goal: production-grade working demo first, then iterate.
 - LIME (explainability, both model types) - not yet wired
 - SHAP (explainability, added alongside LIME - not yet decided which is
   primary vs. supplementary; revisit once both are wired in)
-- FastAPI (inference service) - not yet built
+- FastAPI (inference service) - `serving/app.py`, one `POST /v1/score`
+  endpoint. rule_pattern_score (`serving/scoring.py`) drives the
+  FRAUD/NOT_FRAUD decision per the external response contract;
+  anomaly_score (`serving/anomaly_scoring.py`) is computed alongside it
+  and surfaced on the response for visibility only - see
+  `docs/ml/modeling.md`'s two-score section for why neither is averaged
+  into the other.
 
 ## Known blockers / environment notes
 
@@ -147,7 +153,12 @@ spam-detection-prototype/
 │       ├── data.py               # rule_evaluated==True feature/label prep
 │       └── train.py              # LightGBM training - see docs/experiments/rule_pattern.md
 ├── serving/
-│   └── feature_lookup.py       # manual online-lookup test script (predict.py-style) - no FastAPI service yet
+│   ├── feature_lookup.py       # get_sender_features()/get_imsi_features() - Feast online-lookup helpers
+│   ├── canonical.py            # live SMPP/SS7 request -> CanonicalRow (single-message canonical mapping)
+│   ├── schemas.py              # request/response contracts (external spec) for the FastAPI endpoint
+│   ├── scoring.py               # rule_pattern_score - loads the per-source champion, scores one row
+│   ├── anomaly_scoring.py       # anomaly_score - combined champion + live FAISS near-dup vs. the historical corpus
+│   └── app.py                  # POST /v1/score - the FastAPI service itself
 ├── pipeline.py                 # top-level orchestrator: ingestion -> reassembly -> behavioral -> text_embeddings -> faiss, per source
 ├── tests/                      # pytest suite, one file per module above
 ├── notebooks/                  # ad-hoc real-data exploration (see individual notebook docstrings/markdown cells)

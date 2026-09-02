@@ -73,15 +73,17 @@ outright in both models' output.
 ## MLflow conventions
 
 - Tracking URI: `sqlite:///mlflow.db` for every experiment below.
-- Real candidate models get their own experiment name: `anomaly_score`,
-  `rule_pattern_score`.
+- Real candidate models get their own experiment name: `isolation_forest`
+  (models/anomaly/train.py::MLFLOW_EXPERIMENT_NAME), `light_gbm`
+  (models/rule_pattern/train.py::MLFLOW_EXPERIMENT_NAME).
 - A variant that isn't ready to be treated as a real candidate gets a
-  SEPARATE experiment name, on purpose - e.g.
-  `rule_pattern_score_with_embeddings` (not yet a meaningful comparison,
-  see `docs/experiments/rule_pattern.md`) and `anomaly_score_diagnostics`
-  (one-off ablation runs, see `docs/experiments/anomaly.md`). This keeps
-  early/throwaway/diagnostic runs from ever being mistaken for a real
-  baseline in the MLflow UI.
+  SEPARATE experiment name, on purpose - any `--with_embeddings`/
+  `--with_tfidf` LightGBM run routes to `rule_pattern_score_experimental`
+  (not yet a meaningful comparison, see `docs/experiments/rule_pattern.md`),
+  and a `--sources SMPP`/`--sources SS7`-restricted run of either model
+  gets its own source-suffixed experiment (e.g. `isolation_forest_SMPP`).
+  This keeps early/throwaway/split-model runs from ever being mistaken
+  for the real combined baseline in the MLflow UI.
 - Champion/challenger promotion is explicit in code, not left to MLflow
   to decide (same convention as the earlier `mlflow_demo/` project's
   `compare_versions.py`) - not yet needed here since there's only one
@@ -90,14 +92,25 @@ outright in both models' output.
 ## Status
 
 Completed: MiniLM embeddings, FAISS near-dup features, Isolation Forest
-training, LightGBM training - see the experiments docs for each.
+training, LightGBM training, FastAPI service (`serving/app.py`) computing
+BOTH scores per request - see the experiments docs for each model, and
+`docs/architecture.md`'s file-layout section for the serving/ modules.
+
+anomaly_score at serving time reuses each source's existing HISTORICAL
+corpus (embeddings.npy) as the near-dup comparison set, live-queried
+per request and windowed against the request's own declared timestamp -
+see `serving/anomaly_scoring.py`'s module docstring for why (no
+streaming corpus exists in this prototype) and the same staleness caveat
+already accepted for Feast's batch-refreshed behavioral features.
+anomaly_score is surfaced on the response for visibility only; it does
+NOT gate the FRAUD/NOT_FRAUD decision yet (see "Two separate scores, not
+one blended score" above).
 
 Not yet built:
-1. FastAPI service combining both scores into one dual-score response.
-2. LIME wiring for both model types.
-3. SHAP wiring/evaluation - added alongside LIME, not yet decided which
+1. LIME wiring for both model types.
+2. SHAP wiring/evaluation - added alongside LIME, not yet decided which
    is primary vs. supplementary.
-4. A full (non-sampled) `text_embeddings.py` run - both FAISS and
+3. A full (non-sampled) `text_embeddings.py` run - both FAISS and
    Isolation Forest currently train on the sampled subset
    (`--sample_n`); see `docs/architecture.md`'s "Known blockers" section
    for the real cost (~21hr full run) driving that choice.
