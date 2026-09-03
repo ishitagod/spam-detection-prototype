@@ -40,6 +40,14 @@ FEATURE_REFS = [
     "sender_behavioral_stats:sender_msgs_last_1hr",
     "sender_behavioral_stats:sender_unique_destinations_1hr",
     "sender_repeat_content_ratio:sender_repeat_content_ratio_1hr",
+    # Tier 0 additions - see feature_repo/definitions.py's schema comment
+    # and features/behavioral_snapshot.py's docstring. sender_age_days was
+    # already stored/materialized before this - it just was never
+    # requested here.
+    "sender_behavioral_stats:sender_age_days",
+    "sender_behavioral_stats:sender_recipient_diversity_ratio_5min",
+    "sender_behavioral_stats:sender_recipient_diversity_ratio_1hr",
+    "sender_behavioral_stats:sender_velocity_zscore_5min",
 ]
 
 # SS7-only, keyed on `imsi` not `sender_id` (feature_repo/definitions.py's

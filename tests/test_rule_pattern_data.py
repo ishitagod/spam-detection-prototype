@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.anomaly.data import BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL
+from models.anomaly.data import BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL
 from models.rule_pattern.data import (
     build_feature_matrix,
     load_labelled_messages,
@@ -32,6 +32,20 @@ def _sample_df(n=5):
         "sender_msgs_last_1hr": [0, 10, 100, 1000, 16971],
         "sender_unique_destinations_1hr": [0, 1, 5, 20, 100],
         "sender_repeat_content_ratio_1hr": [0.0, 0.1, 0.5, 0.9, 1.0],
+        # Tier 0 additions - same values as tests/test_anomaly_data.py's
+        # _sample_df() for consistency, see models/anomaly/data.py's
+        # BEHAVIORAL_COLS comment. sender_velocity_zscore_5min
+        # deliberately NOT included, same reasoning as
+        # IMSI_DISTINCT_ORIG_COL below (see test_imsi_distinct_orig_col_
+        # present_when_available_nan_otherwise for the mirrored test).
+        "sender_age_days": [0.0, 0.5, 1.0, 1.5, 2.0],
+        "sender_recipient_diversity_ratio_5min": [0.0, 0.25, 0.5, 0.75, 1.0],
+        "sender_recipient_diversity_ratio_1hr": [0.0, 0.2, 0.4, 0.6, 1.0],
+        # Unlike the anomaly model's test fixture, included directly here
+        # (with a real NaN) - LightGBM's native NaN handling means there's
+        # no _known-indicator reconstruction to keep in sync, so there's
+        # no reason to leave it out the way IMSI is left out below.
+        "sender_velocity_zscore_5min": [np.nan, -1.2, 0.0, 0.8, 2.1],
         "rule_evaluated": [True, True, True, False, False],
         "rule_flagged": [True, False, True, None, None],
     })
@@ -89,6 +103,20 @@ def test_all_behavioral_cols_present():
     _, _, feature_names, _ = build_feature_matrix(df)
     for col in BEHAVIORAL_COLS:
         assert col in feature_names
+
+
+def test_sender_velocity_zscore_col_present_and_nan_preserved():
+    """Mirrors test_nan_dcs_does_not_crash_left_for_lightgbm_to_handle()
+    above - SENDER_VELOCITY_ZSCORE_COL's real NaN (row 0, see
+    _sample_df()) must stay NaN, not get imputed - LightGBM's native
+    missing-value handling, no _known indicator needed here (unlike
+    models/anomaly/data.py's sklearn Pipeline)."""
+    df = _sample_df()
+    X, _, feature_names, _ = build_feature_matrix(df)
+    assert SENDER_VELOCITY_ZSCORE_COL in feature_names
+    idx = feature_names.index(SENDER_VELOCITY_ZSCORE_COL)
+    assert np.isnan(X[0, idx])
+    assert list(X[1:, idx]) == [-1.2, 0.0, 0.8, 2.1]
 
 
 def test_imsi_distinct_orig_col_present_when_available_nan_otherwise():
@@ -178,6 +206,7 @@ def test_build_feature_matrix_with_embeddings_base_features_stay_unscaled():
     df = pd.DataFrame({
         "source": ["SMPP"] * 5, "record_id": [str(i) for i in range(5)],
         "text": ["hi"] * 5, "dcs": [0.0] * 5, "text_decode_failed": [False] * 5,
+        **{c: [0] * 5 for c in BEHAVIORAL_COLS},
         "sender_msgs_last_5min": [0, 1, 2, 3, 4], "sender_msgs_last_1hr": [0, 10, 100, 1000, 16971],
         "sender_unique_destinations_1hr": [0] * 5, "sender_repeat_content_ratio_1hr": [0.0] * 5,
         "rule_flagged": [True, False, True, False, True],

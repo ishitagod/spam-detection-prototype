@@ -188,6 +188,70 @@ def test_sender_age_days_clips_negative_age_from_future_timestamps():
     assert row["sender_age_days"] == 0.0
 
 
+def test_recipient_diversity_ratio_matches_unique_destinations_over_msg_count():
+    rows = [
+        msg(timestamp="2026-08-19T09:56:00", destination="A"),  # within 5min window
+        msg(timestamp="2026-08-19T09:57:00", destination="A"),  # within 5min window (dup dest)
+        msg(timestamp="2026-08-19T09:30:00", destination="B"),  # within 1hr only
+    ]
+    result = run(rows)
+    row = row_for(result, "SMPP|SENDER1")
+    # 5min window: 2 messages, 1 unique destination (A) -> ratio 0.5
+    assert row["sender_msgs_last_5min"] == 2
+    assert row["sender_recipient_diversity_ratio_5min"] == pytest.approx(0.5)
+    # 1hr window: 3 messages, 2 unique destinations (A, B) -> ratio 2/3
+    assert row["sender_msgs_last_1hr"] == 3
+    assert row["sender_recipient_diversity_ratio_1hr"] == pytest.approx(2 / 3)
+
+
+def test_recipient_diversity_ratio_is_zero_not_nan_with_no_recent_activity():
+    """Same cold-start convention as features/behavioral.py's per-row
+    version - 0 messages degenerates to ratio 0.0, not NaN/undefined."""
+    rows = [msg(timestamp="2020-01-01T00:00:00")]  # long outside every window
+    result = run(rows)
+    row = row_for(result, "SMPP|SENDER1")
+    assert row["sender_recipient_diversity_ratio_5min"] == 0.0
+    assert row["sender_recipient_diversity_ratio_1hr"] == 0.0
+
+
+def test_velocity_zscore_is_nan_with_fewer_than_two_prior_readings():
+    """Mirrors features/behavioral.py's own cold-start convention - a
+    sender with too little history for a real baseline gets NaN, not a
+    fabricated 0 (see module docstring's VELOCITY Z-SCORE note)."""
+    rows = [
+        msg(timestamp="2026-08-19T09:58:00"),
+        msg(timestamp="2026-08-19T09:59:00"),
+    ]
+    result = run(rows)
+    row = row_for(result, "SMPP|SENDER1")
+    assert pd.isna(row["sender_velocity_zscore_5min"])
+
+
+def test_velocity_zscore_matches_training_time_last_row_value():
+    """The snapshot's value must be EXACTLY the last row's
+    velocity_zscore_short from features/behavioral.py's own per-row
+    training computation over the same messages - this reuses that
+    function directly rather than re-implementing the same Welford
+    statistic a second time (see module docstring), so this test checks
+    that reuse actually holds, not just that SOME number comes out."""
+    from features.behavioral import compute_behavioral_features
+
+    rows = [
+        msg(timestamp=f"2026-08-19T09:{m:02d}:00", destination=f"D{m}")
+        for m in range(0, 10, 2)  # 5 messages, 2 minutes apart
+    ]
+    df = pd.DataFrame(rows)
+    trained = compute_behavioral_features(df)
+    expected = trained.sort_values("timestamp")["sender_velocity_zscore_5min"].iloc[-1]
+
+    result = run(rows)
+    row = row_for(result, "SMPP|SENDER1")
+    if pd.isna(expected):
+        assert pd.isna(row["sender_velocity_zscore_5min"])
+    else:
+        assert row["sender_velocity_zscore_5min"] == pytest.approx(expected)
+
+
 def test_mixed_numeric_and_string_originators_do_not_break_output_dtype():
     """SS7 originators can be inferred as int64 by pandas for one file and
     str for another before concatenation - the snapshot must normalize to

@@ -59,18 +59,13 @@ import mlflow.sklearn
 import numpy as np
 import shap
 
-from models.anomaly.data import IMSI_DISTINCT_ORIG_COL
+from models.anomaly.data import BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL
 from models.registry import MLFLOW_TRACKING_URI
 from serving.canonical import CanonicalRow
 
 RULE_PATTERN_MODEL_NAME = "rule_pattern_score_model"  # base name - the
 # actual registered model is always source-suffixed, see module docstring
 CHAMPION_ALIAS = "champion"
-
-BEHAVIORAL_COLS = [
-    "sender_msgs_last_5min", "sender_msgs_last_1hr",
-    "sender_unique_destinations_1hr", "sender_repeat_content_ratio_1hr",
-]
 
 
 class ChampionUnavailableError(RuntimeError):
@@ -200,6 +195,14 @@ def build_rule_pattern_row(
     # Feast doesn't recognize - both come back None from `behavioral`).
     imsi_value = behavioral.get(IMSI_DISTINCT_ORIG_COL)
     row[IMSI_DISTINCT_ORIG_COL] = imsi_value if imsi_value is not None else np.nan
+    # sender_velocity_zscore_5min: same RAW-value-or-NaN treatment as IMSI
+    # above, for the same reason - kept OUT of BEHAVIORAL_COLS deliberately
+    # (models/anomaly/data.py's comment) since it can be a genuine NaN
+    # (cold-start sender, <2 prior readings), which LightGBM handles
+    # natively - a 0-fill here would fabricate "exactly average burst
+    # size" for a sender with no real baseline yet.
+    velocity_value = behavioral.get(SENDER_VELOCITY_ZSCORE_COL)
+    row[SENDER_VELOCITY_ZSCORE_COL] = velocity_value if velocity_value is not None else np.nan
     row["text_decode_failed"] = int(canonical.text_decode_failed)
     row["text_length"] = len(canonical.text or "")
     row["source_SMPP"] = int(canonical.source == "SMPP")

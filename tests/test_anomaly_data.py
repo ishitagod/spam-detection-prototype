@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.anomaly.data import (
     BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, IMSI_DISTINCT_ORIG_KNOWN_COL,
-    NEAR_DUP_COLS, build_combined_frame, build_feature_matrix, load_source_features,
+    NEAR_DUP_COLS, SENDER_VELOCITY_ZSCORE_COL, SENDER_VELOCITY_ZSCORE_KNOWN_COL,
+    build_combined_frame, build_feature_matrix, load_source_features,
 )
 
 N_EMBEDDING_DIMS = 4  # small, for test speed - real data uses 384
@@ -32,6 +33,16 @@ def _sample_df(n=5):
         "sender_msgs_last_1hr": [0, 10, 100, 1000, 16971],
         "sender_unique_destinations_1hr": [0, 1, 5, 20, 100],
         "sender_repeat_content_ratio_1hr": [0.0, 0.1, 0.5, 0.9, 1.0],
+        # Tier 0 additions (see models/anomaly/data.py's BEHAVIORAL_COLS
+        # comment) - sender_age_days real range is 0.0-2.0 in this
+        # prototype's fixed 2-day CDR sample; diversity ratios are 0-1
+        # like sender_repeat_content_ratio_1hr above. SENDER_VELOCITY_ZSCORE_COL
+        # is deliberately NOT included here, same reasoning as
+        # IMSI_DISTINCT_ORIG_COL below - left absent by default, exercised
+        # explicitly by its own dedicated test.
+        "sender_age_days": [0.0, 0.5, 1.0, 1.5, 2.0],
+        "sender_recipient_diversity_ratio_5min": [0.0, 0.25, 0.5, 0.75, 1.0],
+        "sender_recipient_diversity_ratio_1hr": [0.0, 0.2, 0.4, 0.6, 1.0],
         "near_dup_match_count_1hr": [0, 0, 5, 50, 362],
         "near_dup_max_similarity_1hr": [0.0, 0.0, 0.93, 0.99, 1.0],
         "near_dup_distinct_senders_1hr": [0, 0, 1, 2, 4],
@@ -98,15 +109,19 @@ def test_output_width_matches_n_components_plus_other_features():
     multi-source case, where the dummy DOES appear."""
     df = _sample_df()
     X, feature_names, _ = _build(df, n_components=2)
-    # +2 for IMSI_DISTINCT_ORIG_COL and its _known indicator - always
+    # +2 for IMSI_DISTINCT_ORIG_COL and its _known indicator, +2 more for
+    # SENDER_VELOCITY_ZSCORE_COL and its _known indicator - both always
     # added by build_feature_matrix() regardless of whether the input df
-    # has the column (absent here, same as SMPP's real file - see that
+    # has the column (absent here, same as SMPP's real file for IMSI, and
+    # same deliberate omission from _sample_df() for velocity - see that
     # column's comment in models/anomaly/data.py).
-    expected_width = 2 + len(BEHAVIORAL_COLS) + len(NEAR_DUP_COLS) + 2
+    expected_width = 2 + len(BEHAVIORAL_COLS) + len(NEAR_DUP_COLS) + 2 + 2
     assert X.shape[1] == expected_width
     assert len(feature_names) == expected_width
     assert IMSI_DISTINCT_ORIG_COL in feature_names
     assert IMSI_DISTINCT_ORIG_KNOWN_COL in feature_names
+    assert SENDER_VELOCITY_ZSCORE_COL in feature_names
+    assert SENDER_VELOCITY_ZSCORE_KNOWN_COL in feature_names
 
 
 def test_pca_explained_variance_is_accessible():
@@ -146,12 +161,20 @@ def test_preprocessor_is_returned_and_reusable():
     # _known indicator is 0 everywhere, the count itself log1p(0) = 0.
     transformed[IMSI_DISTINCT_ORIG_KNOWN_COL] = 0.0
     transformed[IMSI_DISTINCT_ORIG_COL] = 0.0
+    # SENDER_VELOCITY_ZSCORE_COL: also absent from _sample_df() entirely
+    # (deliberate, see that fixture's comment) - same "_known=0, value=0"
+    # treatment as IMSI above, except NOT log1p'd (see
+    # models/anomaly/data.py's build_combined_frame()).
+    transformed[SENDER_VELOCITY_ZSCORE_KNOWN_COL] = 0.0
+    transformed[SENDER_VELOCITY_ZSCORE_COL] = 0.0
     # _sample_df() is single-source (SMPP only) - no source dummy in this
     # path, see test_output_width_matches_n_components_plus_other_features().
     embedding_cols = [c for c in transformed.columns if c.startswith("emb_")]
     imsi_cols = [IMSI_DISTINCT_ORIG_COL, IMSI_DISTINCT_ORIG_KNOWN_COL]
+    velocity_cols = [SENDER_VELOCITY_ZSCORE_COL, SENDER_VELOCITY_ZSCORE_KNOWN_COL]
     combined = pd.concat(
-        [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS + imsi_cols], transformed[embedding_cols]], axis=1,
+        [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS + imsi_cols + velocity_cols], transformed[embedding_cols]],
+        axis=1,
     )
     X_again = preprocessor.transform(combined)
     assert np.allclose(X, X_again)
@@ -175,6 +198,26 @@ def test_imsi_distinct_orig_col_absent_and_null_both_get_known_zero():
     # The two NaN rows (0, 2) must be indistinguishable on the known
     # column regardless of whether NaN came from "column absent" or "this
     # row's imsi is null" - both were fed through the exact same np.nan.
+    assert X[0, known_idx] == X[2, known_idx]
+
+
+def test_sender_velocity_zscore_absent_and_null_both_get_known_zero():
+    """Mirrors test_imsi_distinct_orig_col_absent_and_null_both_get_known_zero()
+    above, for SENDER_VELOCITY_ZSCORE_COL: a df that never had the column
+    at all (this fixture's default - see _sample_df()'s comment) and a
+    df where specific rows are NaN (a real, if rare, case - features/
+    behavioral.py's VELOCITY note: fewer than 2 prior readings, or zero
+    variance) must both land as _known=0."""
+    df = _sample_df()
+    assert SENDER_VELOCITY_ZSCORE_COL not in df.columns
+    df[SENDER_VELOCITY_ZSCORE_COL] = [np.nan, -1.2, np.nan, 0.5, 2.3]
+    X, feature_names, _ = _build(df)
+    known_idx = feature_names.index(SENDER_VELOCITY_ZSCORE_KNOWN_COL)
+
+    known = df[SENDER_VELOCITY_ZSCORE_COL].notna().to_numpy(dtype=float)
+    assert (X[:, known_idx] > 0).tolist() == (known == 1).tolist()
+    # The two NaN rows (0, 2) must be indistinguishable on the known
+    # column, same reasoning as the IMSI test above.
     assert X[0, known_idx] == X[2, known_idx]
 
 

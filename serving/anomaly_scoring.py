@@ -57,7 +57,9 @@ import numpy as np
 import pandas as pd
 
 from features.faiss_index import build_index, compute_near_dup_features_for_live_query
-from models.anomaly.data import IMSI_DISTINCT_ORIG_COL, build_combined_frame
+from models.anomaly.data import (
+    BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL, build_combined_frame,
+)
 from models.registry import MLFLOW_TRACKING_URI
 from serving.canonical import CanonicalRow
 
@@ -66,10 +68,6 @@ ANOMALY_MODEL_NAME = "anomaly"  # base name - actual registered model is
 CHAMPION_ALIAS = "champion"
 KNOWN_SOURCES = ["SMPP", "SS7"]
 
-BEHAVIORAL_COLS = [
-    "sender_msgs_last_5min", "sender_msgs_last_1hr",
-    "sender_unique_destinations_1hr", "sender_repeat_content_ratio_1hr",
-]
 
 DEFAULT_DATA_DIR = Path("data/processed")
 
@@ -201,6 +199,14 @@ def build_anomaly_row(
     row = {col: (behavioral.get(col) or 0) for col in BEHAVIORAL_COLS}
     imsi_value = behavioral.get(IMSI_DISTINCT_ORIG_COL)
     row[IMSI_DISTINCT_ORIG_COL] = imsi_value if imsi_value is not None else np.nan
+    # sender_velocity_zscore_5min: same RAW-value-or-NaN treatment as IMSI
+    # above - kept OUT of BEHAVIORAL_COLS deliberately (models/anomaly/
+    # data.py's comment) since build_combined_frame() below needs the real
+    # None-vs-real distinction to build this column's _known indicator
+    # correctly; a 0-fill here would fabricate "known, exactly average"
+    # for a cold-start sender with no real baseline yet.
+    velocity_value = behavioral.get(SENDER_VELOCITY_ZSCORE_COL)
+    row[SENDER_VELOCITY_ZSCORE_COL] = velocity_value if velocity_value is not None else np.nan
     row.update(near_dup_features)
     row["source"] = canonical.source
     for i, value in enumerate(embedding.reshape(-1)):

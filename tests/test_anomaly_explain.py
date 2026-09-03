@@ -35,6 +35,11 @@ def _sample_df(sources=("SMPP", "SMPP", "SS7", "SS7")) -> pd.DataFrame:
         "sender_msgs_last_1hr": [10, 20, 30, 40][:n],
         "sender_unique_destinations_1hr": [1, 2, 3, 4][:n],
         "sender_repeat_content_ratio_1hr": [0.1, 0.2, 0.3, 0.4][:n],
+        # Tier 0 additions - see models/anomaly/data.py's BEHAVIORAL_COLS
+        # comment. All three: 0-1 ratios / small day-counts, no log1p.
+        "sender_age_days": [0.0, 0.5, 1.0, 1.5][:n],
+        "sender_recipient_diversity_ratio_5min": [0.0, 0.25, 0.5, 0.75][:n],
+        "sender_recipient_diversity_ratio_1hr": [0.0, 0.2, 0.4, 0.6][:n],
         "near_dup_match_count_1hr": [0, 1, 2, 3][:n],
         "near_dup_max_similarity_1hr": [0.0, 0.5, 0.6, 0.7][:n],
         "near_dup_distinct_senders_1hr": [0, 1, 1, 2][:n],

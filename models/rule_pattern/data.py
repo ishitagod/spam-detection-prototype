@@ -87,13 +87,14 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from models.anomaly.data import (
-    BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, N_EMBEDDING_COMPONENTS, embedding_pca_pipeline,
+    BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, N_EMBEDDING_COMPONENTS, SENDER_VELOCITY_ZSCORE_COL,
+    embedding_pca_pipeline,
 )
 
 CANONICAL_COLS = ["dcs", "text_decode_failed"]
 REQUIRED_COLS = (
     ["source", "record_id", "rule_evaluated", "rule_flagged", "text"]
-    + CANONICAL_COLS + BEHAVIORAL_COLS + [IMSI_DISTINCT_ORIG_COL]
+    + CANONICAL_COLS + BEHAVIORAL_COLS + [IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL]
 )
 
 # Validated empirically (see module docstring) on the full real SS7 corpus,
@@ -127,6 +128,12 @@ def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
         "dcs": "float64", "text_decode_failed": bool,
         "sender_msgs_last_5min": "int64", "sender_msgs_last_1hr": "int64",
         "sender_unique_destinations_1hr": "int64", "sender_repeat_content_ratio_1hr": "float64",
+        "sender_age_days": "float64",
+        "sender_recipient_diversity_ratio_5min": "float64", "sender_recipient_diversity_ratio_1hr": "float64",
+        "sender_velocity_zscore_5min": "float64",  # can be NaN - a plain
+        # float64 column already handles that fine, unlike rule_flagged's
+        # nullable "boolean" below (True/False/NA trichotomy needs the
+        # extension dtype; a NaN float doesn't need one).
         # pandas' nullable extension dtype, not plain bool: rule_flagged
         # is genuinely True/False/NA (labels/rule_labels.py - NA is a
         # real, distinct value, not missing data to impute), and without
@@ -172,7 +179,18 @@ def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         imsi_col = df[[IMSI_DISTINCT_ORIG_COL]]
     else:
         imsi_col = pd.DataFrame({IMSI_DISTINCT_ORIG_COL: np.nan}, index=df.index)
-    pieces = [df[BEHAVIORAL_COLS], imsi_col, df[["dcs"]], text_decode_failed, text_length]
+    # SENDER_VELOCITY_ZSCORE_COL: same "absent -> NaN, not a required
+    # column" treatment - unlike IMSI this IS present for every row of
+    # every source in the real file (see models/anomaly/data.py's
+    # comment), so absence here only happens for a test fixture that
+    # didn't include it. Raw NaN passthrough, no _known indicator needed
+    # (unlike models/anomaly/data.py's sklearn Pipeline, LightGBM handles
+    # NaN natively - same reasoning as `dcs` above).
+    if SENDER_VELOCITY_ZSCORE_COL in df.columns:
+        velocity_col = df[[SENDER_VELOCITY_ZSCORE_COL]]
+    else:
+        velocity_col = pd.DataFrame({SENDER_VELOCITY_ZSCORE_COL: np.nan}, index=df.index)
+    pieces = [df[BEHAVIORAL_COLS], imsi_col, velocity_col, df[["dcs"]], text_decode_failed, text_length]
     # Same reasoning as models/anomaly/data.py's build_feature_matrix():
     # `source` is dead weight (a constant column) once a run is restricted
     # to one source (--sources SMPP/SS7 for a split model) - only add it

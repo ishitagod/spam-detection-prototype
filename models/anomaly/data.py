@@ -35,10 +35,16 @@ PREPROCESSING, two things, not one:
      ColumnTransformer (sklearn.compose) so it only touches the
      embedding columns - the 12 hand-built features pass through
      unchanged into the same final joint StandardScaler. (The "12" above
-     is the ablation's real measured count at the time it ran - two more
-     hand-built columns, IMSI_DISTINCT_ORIG_COL and its _known indicator,
-     were added after; the imbalance direction the ablation found doesn't
-     change from +2 features, so it wasn't worth re-running for this.)
+     is the ablation's real measured count at the time it ran - six more
+     hand-built columns were added after: IMSI_DISTINCT_ORIG_COL + its
+     _known indicator, SENDER_VELOCITY_ZSCORE_COL + its _known indicator,
+     and two new BEHAVIORAL_COLS entries (sender_age_days,
+     sender_recipient_diversity_ratio_5min/1hr count as +3, not +2 -
+     see that list's own comment) added for the "bank marketing vs spam"
+     gap. The imbalance direction the ablation found doesn't change from
+     a few more hand-built columns against 384 embedding dimensions, so
+     it wasn't worth re-running check_embedding_dominance.py for this -
+     revisit if a future ablation ever suggests otherwise.)
 """
 from pathlib import Path
 
@@ -52,7 +58,24 @@ from sklearn.preprocessing import StandardScaler
 BEHAVIORAL_COLS = [
     "sender_msgs_last_5min", "sender_msgs_last_1hr",
     "sender_unique_destinations_1hr", "sender_repeat_content_ratio_1hr",
+    "sender_age_days",
+    "sender_recipient_diversity_ratio_5min", "sender_recipient_diversity_ratio_1hr",
 ]
+# sender_velocity_zscore_5min is DELIBERATELY kept OUT of BEHAVIORAL_COLS,
+# same reason as IMSI_DISTINCT_ORIG_COL below: it CAN be NaN (fewer than 2
+# prior same-sender readings, or zero variance - see
+# features/behavioral.py's VELOCITY note) so it needs the same
+# fillna(0)-plus-_known-indicator treatment build_combined_frame() applies
+# to IMSI, which a plain BEHAVIORAL_COLS passthrough doesn't give it.
+# UNLIKE IMSI, this column IS present for every row of every source (not
+# SS7-only) - real measured NaN rate is negligible (<0.1% of rows, both
+# sources) but still real, and sklearn's Pipeline can't take ANY NaN.
+# This is the sender-relative burst signal the "any bulk sender looks
+# anomalous" problem needs: a bank's normal marketing blast scores near
+# its OWN typical burst size (z-score near 0), where a spam sender's burst
+# (against its own usually-quiet or brand-new baseline) doesn't.
+SENDER_VELOCITY_ZSCORE_COL = "sender_velocity_zscore_5min"
+SENDER_VELOCITY_ZSCORE_KNOWN_COL = f"{SENDER_VELOCITY_ZSCORE_COL}_known"
 # SS7-only SIM-farming signal (features/behavioral.py's IMSI-LINKAGE note) -
 # kept OUT of BEHAVIORAL_COLS deliberately: unlike those 4, this column is
 # entirely ABSENT (not NaN-filled) from SMPP's messages_with_behavioral.csv,
@@ -100,7 +123,8 @@ def load_source_features(source_dir: Path, messages_path: Path) -> pd.DataFrame:
     # error on any name not present in the file's header.
     wanted_cols = (
         ["source", "record_id"] + BEHAVIORAL_COLS
-        + [IMSI_DISTINCT_ORIG_COL] + ["rule_evaluated", "rule_flagged"]
+        + [IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL]
+        + ["rule_evaluated", "rule_flagged"]
     )
     messages = pd.read_csv(
         messages_path, low_memory=False, usecols=lambda c: c in set(wanted_cols),
@@ -203,6 +227,20 @@ def build_combined_frame(
     transformed[IMSI_DISTINCT_ORIG_KNOWN_COL] = transformed[IMSI_DISTINCT_ORIG_COL].notna().astype(float)
     transformed[IMSI_DISTINCT_ORIG_COL] = np.log1p(transformed[IMSI_DISTINCT_ORIG_COL].fillna(0))
 
+    # SENDER_VELOCITY_ZSCORE_COL: same _known-indicator treatment as IMSI
+    # above, NOT log1p'd (already roughly z-score-shaped, can be negative -
+    # see BEHAVIORAL_COLS' comment on why this column is handled here
+    # rather than living in that list directly). fillna(0) is a genuinely
+    # neutral default for a z-score specifically (0 = "exactly at this
+    # sender's own typical burst size"), not a fabricated count like 0
+    # would be for IMSI - still paired with a _known indicator so the
+    # model can tell "genuinely average" from "no baseline existed yet"
+    # if that distinction carries real signal.
+    if SENDER_VELOCITY_ZSCORE_COL not in transformed.columns:
+        transformed[SENDER_VELOCITY_ZSCORE_COL] = np.nan
+    transformed[SENDER_VELOCITY_ZSCORE_KNOWN_COL] = transformed[SENDER_VELOCITY_ZSCORE_COL].notna().astype(float)
+    transformed[SENDER_VELOCITY_ZSCORE_COL] = transformed[SENDER_VELOCITY_ZSCORE_COL].fillna(0.0)
+
     # `source` is only a real feature when more than one source is present
     # in this training run - a single-source run (e.g. --sources SMPP for
     # a split model, see CLAUDE.md's "Split by source" note) would produce
@@ -210,9 +248,10 @@ def build_combined_frame(
     # weight through StandardScaler. Combined-sources runs keep the dummy
     # unchanged - same behavior as before.
     imsi_cols = [IMSI_DISTINCT_ORIG_COL, IMSI_DISTINCT_ORIG_KNOWN_COL]
+    velocity_cols = [SENDER_VELOCITY_ZSCORE_COL, SENDER_VELOCITY_ZSCORE_KNOWN_COL]
     embedding_cols = [c for c in transformed.columns if c.startswith("emb_")]
-    other_cols = list(BEHAVIORAL_COLS) + list(NEAR_DUP_COLS) + imsi_cols
-    pieces = [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS + imsi_cols]]
+    other_cols = list(BEHAVIORAL_COLS) + list(NEAR_DUP_COLS) + imsi_cols + velocity_cols
+    pieces = [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS + imsi_cols + velocity_cols]]
     if known_sources is not None:
         source_dummies = pd.get_dummies(
             transformed["source"].astype(pd.CategoricalDtype(categories=sorted(known_sources))),

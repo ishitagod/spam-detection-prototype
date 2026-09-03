@@ -48,6 +48,32 @@ features/behavioral.py's point-in-time version exactly (same "first
 message is its own reference point, gets 0.0" convention), just computed
 once per sender instead of once per row.
 
+RECIPIENT DIVERSITY RATIOS (sender_recipient_diversity_ratio_5min/_1hr):
+unique destinations / message count in the same window, as of `now` -
+plain groupby-aggregate math (unique_dest_short/msgs_short,
+unique_dest_long/msgs_long), 0.0 when the window has no messages at all,
+same cold-start convention as features/behavioral.py's per-row version.
+
+VELOCITY Z-SCORE (sender_velocity_zscore_5min): genuinely NOT a plain
+groupby-aggregate like the fields above - it's this sender's CURRENT
+msgs_last_5min reading judged against a running Welford baseline built
+from their own ENTIRE message history, which is inherently sequential
+(features/behavioral.py's VELOCITY note). Rather than a second, drift-
+prone implementation of that same Welford recurrence, this reuses
+features/behavioral.py's `_sliding_window_features()` directly - one call
+per sender over their full timestamp-sorted history, taking the LAST
+row's `velocity_zscore_short` (the training-time z-score of this sender's
+own most-recent message, computed against their history strictly before
+it) as the snapshot value. This is NOT "if a message arrived this exact
+instant" (there's no live recompute here) - it's "as of this sender's
+last real message", the same staleness-bounded-by-refresh-cadence
+convention every other field in this snapshot already has (see
+docs/feature_catalog.md's "Online freshness = last refresh, not live") -
+not a new kind of approximation, just applied to a new field. NaN when
+undefined for the same reason as training (fewer than 2 prior readings,
+or zero variance) - left as NaN (Float64 in Feast, handles it natively),
+not fabricated to 0.
+
 IMSI_DISTINCT_ORIGINATORS_1HR: compute_imsi_snapshots() below is the
 current-state counterpart to features/behavioral.py's training-time
 (point-in-time, per-row) version of this SIM-farming signal - keyed on
@@ -67,7 +93,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from features.behavioral import REQUIRED_COLS, _window_timedelta64
+from features.behavioral import (
+    COL_RECIPIENT_DIVERSITY_LONG,
+    COL_RECIPIENT_DIVERSITY_SHORT,
+    COL_UNIQUE_DEST_SHORT,
+    COL_VELOCITY_ZSCORE_SHORT,
+    REQUIRED_COLS,
+    _sliding_window_features,
+    _window_timedelta64,
+)
 from config.settings import BEHAVIORAL_LONG_WINDOW, BEHAVIORAL_SHORT_WINDOW
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -106,6 +140,11 @@ SNAPSHOT_COLUMNS = [
     COL_SENDER_ID, "source", "originator", COL_EVENT_TS,
     COL_MSGS_SHORT, COL_MSGS_LONG, COL_UNIQUE_DEST_LONG, COL_RECENT_TEXTS_JSON,
     COL_SENDER_AGE_DAYS,
+    # Tier 0 additions (see module docstring's RECIPIENT DIVERSITY RATIOS /
+    # VELOCITY Z-SCORE notes) - column names imported from
+    # features/behavioral.py rather than redefined, single source of truth.
+    COL_RECIPIENT_DIVERSITY_SHORT, COL_RECIPIENT_DIVERSITY_LONG,
+    COL_VELOCITY_ZSCORE_SHORT,
 ]
 
 COL_IMSI = "imsi"
@@ -160,7 +199,10 @@ def compute_sender_snapshots(
         subset=COL_SENDER_ID
     )
 
-    msgs_short = df[in_short].groupby(COL_SENDER_ID).size()
+    short_df = df[in_short]
+    short_grouped = short_df.groupby(COL_SENDER_ID)
+    msgs_short = short_grouped.size()
+    uniq_dest_short = short_grouped["destination"].nunique()
     long_df = df[in_long]
     long_grouped = long_df.groupby(COL_SENDER_ID)
     msgs_long = long_grouped.size()
@@ -178,14 +220,44 @@ def compute_sender_snapshots(
     # SENDER_AGE_DAYS note.
     first_seen_all_time = df.groupby(COL_SENDER_ID)["timestamp"].min()
 
+    # VELOCITY Z-SCORE, as-of-now - see module docstring. NOT a window
+    # filter or a simple groupby-aggregate: replays EVERY message this
+    # sender ever sent (not just in_short/in_long) through
+    # features/behavioral.py's own _sliding_window_features(), sorted by
+    # (sender, timestamp) exactly like compute_behavioral_features() does,
+    # then takes each sender's LAST row's velocity_zscore_short. mergesort
+    # (stable) for deterministic re-runs, same reasoning as that module.
+    sort_cols = pd.DataFrame({"sender": df[COL_SENDER_ID], "ts": df["timestamp"]})
+    order = sort_cols.sort_values(["sender", "ts"], kind="mergesort").index.to_numpy()
+    sender_sorted = df[COL_SENDER_ID].to_numpy()[order]
+    ts_sorted = df["timestamp"].to_numpy()[order]
+    dest_sorted = df["destination"].to_numpy()[order]
+    text_sorted = df["text"].to_numpy()[order]
+
+    group_change = np.empty(len(df), dtype=bool)
+    group_change[0] = True
+    if len(df) > 1:
+        group_change[1:] = sender_sorted[1:] != sender_sorted[:-1]
+    group_starts = np.flatnonzero(group_change)
+    group_ends = np.append(group_starts[1:], len(df))
+
+    velocity_zscore_now = {}
+    for start, end in zip(group_starts, group_ends):
+        wf = _sliding_window_features(
+            ts_sorted[start:end], dest_sorted[start:end], text_sorted[start:end]
+        )
+        velocity_zscore_now[sender_sorted[start]] = wf.velocity_zscore_short[-1]
+
     snapshot = all_senders.set_index(COL_SENDER_ID)
     snapshot[COL_MSGS_SHORT] = msgs_short
     snapshot[COL_MSGS_LONG] = msgs_long
+    snapshot[COL_UNIQUE_DEST_SHORT] = uniq_dest_short
     snapshot[COL_UNIQUE_DEST_LONG] = uniq_dest_long
     snapshot[COL_RECENT_TEXTS_JSON] = recent_texts_json
     snapshot[COL_SENDER_AGE_DAYS] = first_seen_all_time
     snapshot[COL_MSGS_SHORT] = snapshot[COL_MSGS_SHORT].fillna(0).astype(np.int64)
     snapshot[COL_MSGS_LONG] = snapshot[COL_MSGS_LONG].fillna(0).astype(np.int64)
+    snapshot[COL_UNIQUE_DEST_SHORT] = snapshot[COL_UNIQUE_DEST_SHORT].fillna(0).astype(np.int64)
     snapshot[COL_UNIQUE_DEST_LONG] = snapshot[COL_UNIQUE_DEST_LONG].fillna(0).astype(np.int64)
     snapshot[COL_RECENT_TEXTS_JSON] = snapshot[COL_RECENT_TEXTS_JSON].fillna("{}")
     # clip(lower=0): a sender whose only message(s) are all after `now`
@@ -194,6 +266,25 @@ def compute_sender_snapshots(
     snapshot[COL_SENDER_AGE_DAYS] = (
         (now64 - snapshot[COL_SENDER_AGE_DAYS].to_numpy()) / np.timedelta64(1, "D")
     ).clip(min=0)
+    # Recipient diversity ratios - see module docstring. 0.0, not NaN, when
+    # the window has zero messages (same cold-start convention as
+    # features/behavioral.py's per-row version - "no history" degenerates
+    # to 0 unique-destinations-of-0-messages either way).
+    snapshot[COL_RECIPIENT_DIVERSITY_SHORT] = np.where(
+        snapshot[COL_MSGS_SHORT] > 0,
+        snapshot[COL_UNIQUE_DEST_SHORT] / snapshot[COL_MSGS_SHORT].replace(0, 1),
+        0.0,
+    )
+    snapshot[COL_RECIPIENT_DIVERSITY_LONG] = np.where(
+        snapshot[COL_MSGS_LONG] > 0,
+        snapshot[COL_UNIQUE_DEST_LONG] / snapshot[COL_MSGS_LONG].replace(0, 1),
+        0.0,
+    )
+    # Every sender in `all_senders` has an entry here by construction (the
+    # sort/group-run loop above covers ALL of df, not just in_short/
+    # in_long) - a plain .map(), no fillna needed, NaN passes through
+    # naturally for senders with <2 prior readings (see module docstring).
+    snapshot[COL_VELOCITY_ZSCORE_SHORT] = snapshot.index.map(velocity_zscore_now)
     snapshot[COL_EVENT_TS] = now
 
     return snapshot.reset_index()[SNAPSHOT_COLUMNS]

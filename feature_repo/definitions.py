@@ -10,9 +10,10 @@ entirely for an SS7-only signal:
   - `sender_behavioral_stats` (FeatureView, backed by
     features/behavioral_snapshot.py's materialized parquet): the pure
     sender-state features - sender_msgs_last_5min, sender_msgs_last_1hr,
-    sender_unique_destinations_1hr, sender_age_days - plus
-    recent_text_counts_json, which exists ONLY to feed the on-demand view
-    below, not as a feature in its own right.
+    sender_unique_destinations_1hr, sender_age_days,
+    sender_recipient_diversity_ratio_5min/1hr, sender_velocity_zscore_5min -
+    plus recent_text_counts_json, which exists ONLY to feed the on-demand
+    view below, not as a feature in its own right.
   - `sender_repeat_content_ratio` (on-demand feature view): the fourth
     sender-keyed feature, sender_repeat_content_ratio_1hr, needs the
     INCOMING message's text - a value that doesn't exist until the actual
@@ -106,6 +107,16 @@ sender_behavioral_stats = FeatureView(
         # ALL-TIME aggregate (not windowed like the four above) - see
         # features/behavioral_snapshot.py's SENDER_AGE_DAYS docstring note.
         Field(name="sender_age_days", dtype=Float64),
+        # Tier 0 additions (features/behavioral_snapshot.py's RECIPIENT
+        # DIVERSITY RATIOS / VELOCITY Z-SCORE docstring notes) - the
+        # "bank marketing vs spam" gap: bulk/near-dup traffic shape alone
+        # can't tell a legitimate registered bulk sender apart from a
+        # spam campaign.
+        Field(name="sender_recipient_diversity_ratio_5min", dtype=Float64),
+        Field(name="sender_recipient_diversity_ratio_1hr", dtype=Float64),
+        # Can be NaN (fewer than 2 prior readings, or zero variance) -
+        # Float64 handles that natively, no imputation at this layer.
+        Field(name="sender_velocity_zscore_5min", dtype=Float64),
     ],
     online=True,
     source=sender_behavioral_snapshot_source,

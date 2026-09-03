@@ -113,6 +113,12 @@ def _summary_df_and_labels():
         "sender_msgs_last_1hr": [1, 2, 100, 110, 105],
         "sender_unique_destinations_1hr": [1, 1, 50, 55, 52],
         "sender_repeat_content_ratio_1hr": [0.0, 0.0, 0.9, 0.95, 0.92],
+        # Tier 0 additions - see models/anomaly/data.py's BEHAVIORAL_COLS
+        # comment. summarize_clusters()'s SUMMARY_RAW_COLS pulls these in
+        # automatically now (BEHAVIORAL_COLS + NEAR_DUP_COLS).
+        "sender_age_days": [0.1, 0.2, 1.0, 1.1, 1.05],
+        "sender_recipient_diversity_ratio_5min": [1.0, 0.5, 0.5, 0.5, 0.5],
+        "sender_recipient_diversity_ratio_1hr": [1.0, 0.5, 0.5, 0.5, 0.5],
         "near_dup_match_count_1hr": [0, 0, 40, 45, 42],
         "near_dup_max_similarity_1hr": [0.0, 0.0, 0.98, 0.99, 0.97],
         "near_dup_distinct_senders_1hr": [0, 0, 3, 4, 3],

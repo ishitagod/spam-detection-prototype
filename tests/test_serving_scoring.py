@@ -17,6 +17,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from models.anomaly.data import SENDER_VELOCITY_ZSCORE_COL
 from serving.canonical import CanonicalRow
 from serving.scoring import BEHAVIORAL_COLS, build_rule_pattern_row
 
@@ -36,6 +37,8 @@ def test_known_sender_uses_real_behavioral_values():
     behavioral = {
         "sender_msgs_last_5min": 3, "sender_msgs_last_1hr": 40,
         "sender_unique_destinations_1hr": 12, "sender_repeat_content_ratio_1hr": 0.75,
+        "sender_age_days": 5.5, "sender_recipient_diversity_ratio_5min": 0.4,
+        "sender_recipient_diversity_ratio_1hr": 0.6,
     }
     row = build_rule_pattern_row(canonical, behavioral)
 
@@ -63,6 +66,24 @@ def test_missing_dcs_becomes_nan_not_zero():
     canonical = _row(dcs=None)
     row = build_rule_pattern_row(canonical, {c: 1 for c in BEHAVIORAL_COLS})
     assert math.isnan(row["dcs"])
+
+
+def test_missing_velocity_zscore_becomes_nan_not_zero():
+    """Same reasoning as test_missing_dcs_becomes_nan_not_zero() above,
+    for SENDER_VELOCITY_ZSCORE_COL - a cold-start sender (or one Feast
+    doesn't recognize) must stay NaN, not silently become 0 (which would
+    fabricate 'exactly average burst size')."""
+    canonical = _row()
+    behavioral = {c: 1 for c in BEHAVIORAL_COLS}  # SENDER_VELOCITY_ZSCORE_COL deliberately absent
+    row = build_rule_pattern_row(canonical, behavioral)
+    assert math.isnan(row[SENDER_VELOCITY_ZSCORE_COL])
+
+
+def test_real_velocity_zscore_value_carries_through():
+    canonical = _row()
+    behavioral = {**{c: 1 for c in BEHAVIORAL_COLS}, SENDER_VELOCITY_ZSCORE_COL: -1.7}
+    row = build_rule_pattern_row(canonical, behavioral)
+    assert row[SENDER_VELOCITY_ZSCORE_COL] == -1.7
 
 
 def test_source_one_hot_is_mutually_exclusive():
