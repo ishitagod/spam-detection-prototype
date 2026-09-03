@@ -15,7 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.anomaly.data import (
     BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, IMSI_DISTINCT_ORIG_KNOWN_COL,
-    NEAR_DUP_COLS, SENDER_VELOCITY_ZSCORE_COL, SENDER_VELOCITY_ZSCORE_KNOWN_COL,
+    NEAR_DUP_COLS, SENDER_AGE_BUCKET_COLS, SENDER_AGE_BUCKET_EDGES_DAYS,
+    SENDER_AGE_BUCKET_LABELS, SENDER_AGE_DAYS_COL,
+    SENDER_DIVERSITY_LONG_COL, SENDER_DIVERSITY_LONG_KNOWN_COL,
+    SENDER_DIVERSITY_MIN_MSGS, SENDER_DIVERSITY_SHORT_COL,
+    SENDER_DIVERSITY_SHORT_KNOWN_COL,
+    SENDER_VELOCITY_ZSCORE_COL, SENDER_VELOCITY_ZSCORE_KNOWN_COL,
     build_combined_frame, build_feature_matrix, load_source_features,
 )
 
@@ -114,14 +119,31 @@ def test_output_width_matches_n_components_plus_other_features():
     # added by build_feature_matrix() regardless of whether the input df
     # has the column (absent here, same as SMPP's real file for IMSI, and
     # same deliberate omission from _sample_df() for velocity - see that
-    # column's comment in models/anomaly/data.py).
-    expected_width = 2 + len(BEHAVIORAL_COLS) + len(NEAR_DUP_COLS) + 2 + 2
+    # column's comment in models/anomaly/data.py). SENDER_AGE_DAYS_COL is
+    # REPLACED (not added to) by SENDER_AGE_BUCKET_COLS - one raw column
+    # becomes len(SENDER_AGE_BUCKET_COLS) bucket dummies instead (see that
+    # constant's comment) - hence "-1" for the raw column BEHAVIORAL_COLS
+    # would otherwise count, "+len(...)" for the bucket dummies that
+    # replace it.
+    # +2 more for each diversity ratio's _known indicator (SENDER_DIVERSITY_
+    # SHORT_COL/LONG_COL themselves are still present by name - only gated,
+    # not replaced the way age is - so no "-1" for those, unlike age).
+    expected_width = (
+        2 + (len(BEHAVIORAL_COLS) - 1) + len(NEAR_DUP_COLS) + 2 + 2 + 2 + len(SENDER_AGE_BUCKET_COLS)
+    )
     assert X.shape[1] == expected_width
     assert len(feature_names) == expected_width
     assert IMSI_DISTINCT_ORIG_COL in feature_names
     assert IMSI_DISTINCT_ORIG_KNOWN_COL in feature_names
     assert SENDER_VELOCITY_ZSCORE_COL in feature_names
     assert SENDER_VELOCITY_ZSCORE_KNOWN_COL in feature_names
+    assert SENDER_AGE_DAYS_COL not in feature_names  # bucketed, not passed raw
+    for col in SENDER_AGE_BUCKET_COLS:
+        assert col in feature_names
+    assert SENDER_DIVERSITY_SHORT_COL in feature_names  # gated, not replaced
+    assert SENDER_DIVERSITY_SHORT_KNOWN_COL in feature_names
+    assert SENDER_DIVERSITY_LONG_COL in feature_names
+    assert SENDER_DIVERSITY_LONG_KNOWN_COL in feature_names
 
 
 def test_pca_explained_variance_is_accessible():
@@ -167,13 +189,39 @@ def test_preprocessor_is_returned_and_reusable():
     # models/anomaly/data.py's build_combined_frame()).
     transformed[SENDER_VELOCITY_ZSCORE_KNOWN_COL] = 0.0
     transformed[SENDER_VELOCITY_ZSCORE_COL] = 0.0
+    # SENDER_AGE_DAYS_COL: bucketed, not passed raw - same pd.cut() +
+    # get_dummies() reconstruction as build_combined_frame() itself uses
+    # (see that function's comment on why this replaces the raw column
+    # rather than adding to it).
+    age_bucket = pd.cut(
+        transformed[SENDER_AGE_DAYS_COL],
+        bins=SENDER_AGE_BUCKET_EDGES_DAYS, labels=SENDER_AGE_BUCKET_LABELS,
+    )
+    age_bucket_dummies = pd.get_dummies(age_bucket, prefix="sender_age_bucket")
+    # SENDER_DIVERSITY_SHORT_COL/LONG_COL: gated on the ORIGINAL (pre-
+    # log1p) message counts - same reconstruction as build_combined_frame()
+    # itself uses (see that function's comment).
+    below_min_short = df["sender_msgs_last_5min"] < SENDER_DIVERSITY_MIN_MSGS
+    transformed.loc[below_min_short, SENDER_DIVERSITY_SHORT_COL] = np.nan
+    transformed[SENDER_DIVERSITY_SHORT_KNOWN_COL] = transformed[SENDER_DIVERSITY_SHORT_COL].notna().astype(float)
+    transformed[SENDER_DIVERSITY_SHORT_COL] = transformed[SENDER_DIVERSITY_SHORT_COL].fillna(0.0)
+    below_min_long = df["sender_msgs_last_1hr"] < SENDER_DIVERSITY_MIN_MSGS
+    transformed.loc[below_min_long, SENDER_DIVERSITY_LONG_COL] = np.nan
+    transformed[SENDER_DIVERSITY_LONG_KNOWN_COL] = transformed[SENDER_DIVERSITY_LONG_COL].notna().astype(float)
+    transformed[SENDER_DIVERSITY_LONG_COL] = transformed[SENDER_DIVERSITY_LONG_COL].fillna(0.0)
     # _sample_df() is single-source (SMPP only) - no source dummy in this
     # path, see test_output_width_matches_n_components_plus_other_features().
+    non_age_behavioral_cols = [c for c in BEHAVIORAL_COLS if c != SENDER_AGE_DAYS_COL]
     embedding_cols = [c for c in transformed.columns if c.startswith("emb_")]
     imsi_cols = [IMSI_DISTINCT_ORIG_COL, IMSI_DISTINCT_ORIG_KNOWN_COL]
     velocity_cols = [SENDER_VELOCITY_ZSCORE_COL, SENDER_VELOCITY_ZSCORE_KNOWN_COL]
+    diversity_known_cols = [SENDER_DIVERSITY_SHORT_KNOWN_COL, SENDER_DIVERSITY_LONG_KNOWN_COL]
     combined = pd.concat(
-        [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS + imsi_cols + velocity_cols], transformed[embedding_cols]],
+        [
+            transformed[non_age_behavioral_cols + NEAR_DUP_COLS + imsi_cols + velocity_cols + diversity_known_cols],
+            age_bucket_dummies,
+            transformed[embedding_cols],
+        ],
         axis=1,
     )
     X_again = preprocessor.transform(combined)
@@ -199,6 +247,31 @@ def test_imsi_distinct_orig_col_absent_and_null_both_get_known_zero():
     # column regardless of whether NaN came from "column absent" or "this
     # row's imsi is null" - both were fed through the exact same np.nan.
     assert X[0, known_idx] == X[2, known_idx]
+
+
+def test_sender_diversity_ratio_gated_below_min_msgs_known_zero_above_kept():
+    """Real measured failure this gate exists for: a ratio computed on a
+    tiny message count is trivially extreme (1 destination / 1 message =
+    1.0) regardless of real diversity - see SENDER_DIVERSITY_MIN_MSGS's
+    comment. Rows below the threshold must land as known=0, value=0
+    (genuinely unreliable, not a real reading); rows at/above it keep
+    their real ratio with known=1."""
+    df = _sample_df()
+    df["sender_msgs_last_5min"] = [0, 1, 2, 3, 4]  # first 3 below MIN_MSGS=3
+    df["sender_recipient_diversity_ratio_5min"] = [1.0, 1.0, 1.0, 0.4, 0.6]
+    X, feature_names, _ = _build(df)
+    known_idx = feature_names.index(SENDER_DIVERSITY_SHORT_KNOWN_COL)
+    value_idx = feature_names.index(SENDER_DIVERSITY_SHORT_COL)
+
+    below_min = (df["sender_msgs_last_5min"] < SENDER_DIVERSITY_MIN_MSGS).to_numpy()
+    assert (X[:, known_idx] > 0).tolist() == (~below_min).tolist()
+    # The three below-threshold rows must be indistinguishable on the
+    # known column, regardless of what spuriously-extreme value (1.0
+    # here) their raw ratio happened to be.
+    assert X[0, known_idx] == X[1, known_idx] == X[2, known_idx]
+    # Their gated VALUE must also collapse to the same thing (0.0, pre-
+    # scaling) rather than leaking the spurious 1.0 through.
+    assert X[0, value_idx] == X[1, value_idx] == X[2, value_idx]
 
 
 def test_sender_velocity_zscore_absent_and_null_both_get_known_zero():

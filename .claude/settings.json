@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": [
+      "Bash(ls *)",
+      "Bash(cd *)"
+    ]
+  }
+}

@@ -19,6 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from models.anomaly.data import SENDER_DIVERSITY_MIN_MSGS
 from models.anomaly.explain import (
     build_interpretable_frame,
     compute_shap_contributions,
@@ -73,6 +74,39 @@ def test_interpretable_frame_drops_source_dummy_for_single_source():
     df = _sample_df(sources=("SMPP", "SMPP", "SMPP", "SMPP"))
     frame = build_interpretable_frame(df)
     assert not any(c.startswith("source_") for c in frame.columns)
+
+
+def test_interpretable_frame_buckets_sender_age_days_not_raw():
+    """A real fitted pipeline's ColumnTransformer expects
+    sender_age_bucket_* dummies, not the raw day count (see
+    models/anomaly/data.py's SENDER_AGE_BUCKET_EDGES_DAYS comment) -
+    getting this wrong here silently corrupts X_transformed for both
+    SHAP and LIME (see build_interpretable_frame()'s docstring), so this
+    checks the real failure mode, not just a cosmetic column rename."""
+    df = _sample_df()
+    frame = build_interpretable_frame(df)
+    assert "sender_age_days" not in frame.columns
+    bucket_cols = [c for c in frame.columns if c.startswith("sender_age_bucket_")]
+    assert len(bucket_cols) == 5
+    # Exactly one bucket is 1 per row - the real-row invariant the
+    # docstring's "no real row can be all-zero-buckets" note depends on.
+    assert (frame[bucket_cols].sum(axis=1) == 1).all()
+
+
+def test_interpretable_frame_gates_diversity_ratio_below_min_msgs():
+    """Mirrors models/anomaly/data.py's build_combined_frame() gating -
+    a real fitted pipeline expects sender_recipient_diversity_ratio_5min
+    paired with a _known indicator, not the raw (spuriously-extreme-on-
+    tiny-samples) ratio - see build_interpretable_frame()'s docstring."""
+    df = _sample_df()
+    df["sender_msgs_last_5min"] = [1, 2, 3, 4][: len(df)]  # first two below MIN_MSGS=3
+    frame = build_interpretable_frame(df)
+    assert "sender_recipient_diversity_ratio_5min_known" in frame.columns
+    below_min = (df["sender_msgs_last_5min"] < SENDER_DIVERSITY_MIN_MSGS).to_numpy()
+    assert (
+        frame["sender_recipient_diversity_ratio_5min_known"].to_numpy() > 0
+    ).tolist() == (~below_min).tolist()
+    assert (frame.loc[below_min, "sender_recipient_diversity_ratio_5min"] == 0.0).all()
 
 
 def test_interpretable_frame_log1ps_count_cols_not_ratios():

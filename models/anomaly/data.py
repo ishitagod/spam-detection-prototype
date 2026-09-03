@@ -87,6 +87,62 @@ SENDER_VELOCITY_ZSCORE_KNOWN_COL = f"{SENDER_VELOCITY_ZSCORE_COL}_known"
 # sklearn's Pipeline can't take NaN the way LightGBM natively can).
 IMSI_DISTINCT_ORIG_COL = "imsi_distinct_originators_1hr"
 IMSI_DISTINCT_ORIG_KNOWN_COL = f"{IMSI_DISTINCT_ORIG_COL}_known"
+
+# sender_age_days is kept in BEHAVIORAL_COLS above (still read from CSV/
+# Feast/serving unchanged, still passed RAW to rule_pattern_score - see
+# models/rule_pattern/data.py's _base_feature_frame(), which never calls
+# build_combined_frame() below) but is DELIBERATELY NOT passed raw into
+# Isolation Forest - real measured failure (docs/experiments/anomaly.md /
+# the conversation this was built from): in this prototype's fixed ~2-day
+# CDR sample, sender_age_days only ever ranges 0.0-2.0, so "brand new
+# sender" is trivially separable by isolation splits regardless of
+# content - real measured result, top-0.1%-by-anomaly_score median
+# sender_age_days (0.625) vs overall median (1.247), with a clean
+# monotonic gradient and precision@top-0.1% BELOW the naive baseline.
+# Bucketed into coarse, REAL-WORLD-meaningful edges instead (not fit to
+# this dataset's own narrow range, which would just re-encode the same
+# problem) - collapses the fine-grained ordering isolation splits were
+# exploiting, while staying genuinely useful once production data spans
+# weeks/months and a truly-old sender becomes rare again (right now,
+# nearly everything falls in the two lowest buckets - that's expected and
+# fine, it's what actually fixes the problem on this sample; the buckets
+# above that are for when they eventually start populating).
+SENDER_AGE_DAYS_COL = "sender_age_days"
+SENDER_AGE_BUCKET_EDGES_DAYS = [-np.inf, 1 / 24, 1, 7, 30, np.inf]  # hour, day, week, month
+SENDER_AGE_BUCKET_LABELS = ["lt_1hr", "1hr_to_1day", "1day_to_7day", "7day_to_30day", "gte_30day"]
+SENDER_AGE_BUCKET_COLS = [f"sender_age_bucket_{label}" for label in SENDER_AGE_BUCKET_LABELS]
+
+# sender_recipient_diversity_ratio_5min/1hr are kept in BEHAVIORAL_COLS
+# above (still read raw, still passed RAW to rule_pattern_score - see
+# models/rule_pattern/data.py, which never calls build_combined_frame()
+# below) but NOT passed raw into Isolation Forest either - a DIFFERENT
+# failure mode from sender_age_days above, even more severe by real
+# measurement: this ratio is unique_destinations / message_count in the
+# window, so a sender with only 1 message in that window gets a
+# TRIVIALLY extreme ratio (1.0 - one destination out of one message,
+# guaranteed) regardless of real behavioral diversity. Bucketing the
+# VALUE (like age above) wouldn't fix this - a ratio of 1.0 from 1
+# message and a ratio of 1.0 from 20 messages would still land in the
+# same bucket, treated identically, even though only the second one
+# means anything. Real measured result: top-0.1%-by-anomaly_score MEAN
+# sender_recipient_diversity_ratio_5min (0.718) vs overall MEDIAN
+# (0.002) - ~48x enrichment by mean, effectively unbounded by median.
+# Fixed by gating on the underlying message count instead - below
+# SENDER_DIVERSITY_MIN_MSGS messages in that window, the ratio is
+# genuinely unreliable (not just an extreme value), treated as unknown
+# via the SAME NaN -> fillna(0) + _known-indicator pattern as
+# SENDER_VELOCITY_ZSCORE_COL/IMSI_DISTINCT_ORIG_COL above, rather than a
+# sharp, spurious 0/1 the model can trivially isolate on.
+SENDER_DIVERSITY_MIN_MSGS = 3  # starting point, not tuned against a real
+# target - same "documented, not proven" status as
+# FAISS_NEAR_DUP_THRESHOLD/N_EMBEDDING_COMPONENTS.
+SENDER_DIVERSITY_SHORT_COL = "sender_recipient_diversity_ratio_5min"
+SENDER_DIVERSITY_SHORT_KNOWN_COL = f"{SENDER_DIVERSITY_SHORT_COL}_known"
+SENDER_DIVERSITY_SHORT_MSGS_COL = "sender_msgs_last_5min"  # gate column - same window
+SENDER_DIVERSITY_LONG_COL = "sender_recipient_diversity_ratio_1hr"
+SENDER_DIVERSITY_LONG_KNOWN_COL = f"{SENDER_DIVERSITY_LONG_COL}_known"
+SENDER_DIVERSITY_LONG_MSGS_COL = "sender_msgs_last_1hr"  # gate column - same window
+
 NEAR_DUP_COLS = [
     "near_dup_match_count_1hr", "near_dup_max_similarity_1hr", "near_dup_distinct_senders_1hr",
     "near_dup_match_count_24hr", "near_dup_max_similarity_24hr", "near_dup_distinct_senders_24hr",
@@ -241,17 +297,63 @@ def build_combined_frame(
     transformed[SENDER_VELOCITY_ZSCORE_KNOWN_COL] = transformed[SENDER_VELOCITY_ZSCORE_COL].notna().astype(float)
     transformed[SENDER_VELOCITY_ZSCORE_COL] = transformed[SENDER_VELOCITY_ZSCORE_COL].fillna(0.0)
 
+    # SENDER_AGE_DAYS_COL: bucketed, NOT passed raw - see
+    # SENDER_AGE_BUCKET_EDGES_DAYS's comment above for why (real measured
+    # failure on this dataset's narrow 0.0-2.0 range). pd.cut with an
+    # explicit `labels=` always yields ALL SENDER_AGE_BUCKET_LABELS as
+    # categories regardless of which bins this particular df actually
+    # populates - verified this holds even for a single-row df - so
+    # get_dummies() below always produces all SENDER_AGE_BUCKET_COLS, the
+    # same "single live row must still match the fitted preprocessor's
+    # expected columns" guarantee `known_sources` gives `source` below,
+    # without needing an equivalent parameter here.
+    age_bucket = pd.cut(
+        transformed[SENDER_AGE_DAYS_COL],
+        bins=SENDER_AGE_BUCKET_EDGES_DAYS, labels=SENDER_AGE_BUCKET_LABELS,
+    )
+    age_bucket_dummies = pd.get_dummies(age_bucket, prefix="sender_age_bucket")
+
+    # SENDER_DIVERSITY_SHORT_COL/LONG_COL: gated on the underlying message
+    # count, NOT passed raw - see SENDER_DIVERSITY_MIN_MSGS's comment above
+    # for why (real measured failure, more severe than age's). Uses `df`
+    # (the original, pre-log1p frame), not `transformed` - the COUNT_COLS
+    # loop above already log1p'd transformed[*_MSGS_COL] in place, and the
+    # gate needs the REAL message count, not its log1p'd value.
+    below_min_short = df[SENDER_DIVERSITY_SHORT_MSGS_COL] < SENDER_DIVERSITY_MIN_MSGS
+    transformed.loc[below_min_short, SENDER_DIVERSITY_SHORT_COL] = np.nan
+    transformed[SENDER_DIVERSITY_SHORT_KNOWN_COL] = transformed[SENDER_DIVERSITY_SHORT_COL].notna().astype(float)
+    transformed[SENDER_DIVERSITY_SHORT_COL] = transformed[SENDER_DIVERSITY_SHORT_COL].fillna(0.0)
+
+    below_min_long = df[SENDER_DIVERSITY_LONG_MSGS_COL] < SENDER_DIVERSITY_MIN_MSGS
+    transformed.loc[below_min_long, SENDER_DIVERSITY_LONG_COL] = np.nan
+    transformed[SENDER_DIVERSITY_LONG_KNOWN_COL] = transformed[SENDER_DIVERSITY_LONG_COL].notna().astype(float)
+    transformed[SENDER_DIVERSITY_LONG_COL] = transformed[SENDER_DIVERSITY_LONG_COL].fillna(0.0)
+
     # `source` is only a real feature when more than one source is present
     # in this training run - a single-source run (e.g. --sources SMPP for
     # a split model, see CLAUDE.md's "Split by source" note) would produce
     # a constant one-hot column carrying zero information, just dead
     # weight through StandardScaler. Combined-sources runs keep the dummy
     # unchanged - same behavior as before.
+    raw_passthrough_behavioral_cols = [
+        c for c in BEHAVIORAL_COLS
+        if c not in (SENDER_AGE_DAYS_COL, SENDER_DIVERSITY_SHORT_COL, SENDER_DIVERSITY_LONG_COL)
+    ]
     imsi_cols = [IMSI_DISTINCT_ORIG_COL, IMSI_DISTINCT_ORIG_KNOWN_COL]
     velocity_cols = [SENDER_VELOCITY_ZSCORE_COL, SENDER_VELOCITY_ZSCORE_KNOWN_COL]
+    diversity_cols = [
+        SENDER_DIVERSITY_SHORT_COL, SENDER_DIVERSITY_SHORT_KNOWN_COL,
+        SENDER_DIVERSITY_LONG_COL, SENDER_DIVERSITY_LONG_KNOWN_COL,
+    ]
     embedding_cols = [c for c in transformed.columns if c.startswith("emb_")]
-    other_cols = list(BEHAVIORAL_COLS) + list(NEAR_DUP_COLS) + imsi_cols + velocity_cols
-    pieces = [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS + imsi_cols + velocity_cols]]
+    other_cols = (
+        raw_passthrough_behavioral_cols + list(NEAR_DUP_COLS) + imsi_cols + velocity_cols
+        + diversity_cols + SENDER_AGE_BUCKET_COLS
+    )
+    pieces = [
+        transformed[raw_passthrough_behavioral_cols + NEAR_DUP_COLS + imsi_cols + velocity_cols + diversity_cols],
+        age_bucket_dummies,
+    ]
     if known_sources is not None:
         source_dummies = pd.get_dummies(
             transformed["source"].astype(pd.CategoricalDtype(categories=sorted(known_sources))),

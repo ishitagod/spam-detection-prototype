@@ -25,24 +25,48 @@ python -m models.rule_pattern.train --n_estimators 200 --learning_rate 0.05
 
 ## Real label composition (worth knowing before reading metrics)
 
-Verified across the FULL raw dataset, not a sample:
-- **SMPP**: 2,693 `rule_evaluated` rows, ALL flagged - zero
-  confirmed-clean.
-- **SS7**: 349,962 `rule_evaluated` rows, split 284,073 flagged / 65,889
-  confirmed-clean.
+Verified across the FULL raw dataset, not a sample - re-measured this
+session against the current `messages_with_behavioral.csv` files:
+- **SMPP**: 139,546 `rule_evaluated` rows, 2,692 flagged (1.9%) / 136,854
+  confirmed-clean (98.1%).
+- **SS7**: 2,654,369 `rule_evaluated` rows, 284,073 flagged (10.7%) /
+  2,370,296 confirmed-clean (89.3%).
 
-Two consequences:
-1. SMPP-only PR-AUC is mathematically undefined (one class only) and is
-   skipped, not silently computed wrong (`models/metrics.py`).
-2. Spam is the MAJORITY of this rule-evaluated pool overall (~85%), not
-   the minority - the usual "spam is rare" imbalance framing is backwards
-   here. This is an artifact of WHICH messages the rule engine bothers to
-   evaluate (the same point applies to `anomaly_score`'s validation
-   metric - see `docs/experiments/anomaly.md`), not the true
-   traffic-wide spam rate. No explicit class-weighting is applied here
-   for that reason - not obviously warranted given the real, measured
-   composition, rather than assumed from the generic "imbalanced spam"
-   prior.
+Both counts grew a lot since an earlier snapshot of this doc (SMPP
+2,693 -> 139,546, ~52x; SS7 349,962 -> 2,654,369, ~7.6x) as real full
+ingestion completed - and the composition flipped along with the scale,
+not just the row counts:
+
+1. **SMPP-only PR-AUC is no longer mathematically undefined.** This doc
+   used to say SMPP was 2,693/2,693 flagged (zero confirmed-clean), so
+   `models/metrics.py`'s single-class-skip guard always triggered for
+   SMPP-only slices. That was true when measured; it isn't anymore - SMPP
+   now has a real confirmed-clean population (98.1%), so a real,
+   computable SMPP-only PR-AUC exists. (The "Evaluation" section below
+   still shows an old "SMPP skipped" result - flagged there too, not left
+   standing as if still current.)
+2. **Spam is now a MINORITY of this rule-evaluated pool for both
+   sources** (SS7 10.7%, SMPP 1.9%) - the OPPOSITE of what this doc used
+   to say (spam as the ~85% majority). That "~85%" figure was computed
+   from the earlier, much smaller ingestion snapshot - the mechanism it
+   was describing wasn't wrong, just the magnitude and direction. The
+   underlying point still holds: this composition is an artifact of
+   WHICH messages the rule engine bothers to evaluate (the same point
+   applies to `anomaly_score`'s validation metric - see
+   `docs/experiments/anomaly.md`), not the true traffic-wide spam rate -
+   it's just now the usual "spam is rare" imbalance direction rather than
+   the inverted one this doc previously described.
+
+**Open question, not resolved here**: this doc previously concluded "no
+explicit class-weighting is applied... not obviously warranted" -
+reasoned from the OLD (wrong-direction) spam-majority composition. With
+the real numbers, both sources are now genuinely imbalanced toward
+confirmed-clean (SS7 89.3%, SMPP 98.1%) - the opposite imbalance
+direction from what justified that original conclusion. Whether
+class-weighting is actually warranted now is a real, open modeling
+question that needs someone to actually retrain/evaluate with it - flag
+it here rather than silently keeping the stale conclusion or silently
+flipping it to the opposite claim without evidence.
 
 This is also genuinely a much bigger training pool than the anomaly
 model's: LightGBM reads straight from the FULL
@@ -82,10 +106,17 @@ on BOTH train and test sets - a large train/test gap is the actual
 overfitting signal to watch for, given this pool's small-for-SMPP /
 imbalanced-for-SS7 shape.
 
-**Real result**: test PR-AUC 0.999 (SS7/overall; SMPP skipped, no
-confirmed-clean labels) - expected, not remarkable: it's reconstructing
-the rule engine's own boundary from the same signal rules use, not
-evidence it generalizes to novel spam.
+**Real result**: test PR-AUC 0.999 (SS7/overall) - expected, not
+remarkable: it's reconstructing the rule engine's own boundary from the
+same signal rules use, not evidence it generalizes to novel spam. SMPP
+was skipped when this was last measured (zero confirmed-clean rows at
+the time, per the old composition numbers this doc used to show above).
+Per the real label composition now, SMPP has a real confirmed-clean
+population (98.1% of 139,546 rows), so a real SMPP-only PR-AUC is
+computable - this doc doesn't have that number yet, since it needs an
+actual re-run of `models.rule_pattern.train --sources SMPP`, not a
+fabricated figure here. Flagging the stale "SMPP skipped" claim rather
+than leaving it standing as if still accurate.
 
 ## `--with_embeddings`: built, not yet useful
 
@@ -98,12 +129,17 @@ still swamp this model's other ~10 features. Logged to a SEPARATE MLflow
 experiment (`rule_pattern_score_with_embeddings`) so an early, tiny-sample
 run never gets mistaken for a real baseline candidate.
 
-**Not useful today**: the embedding sample only overlaps ~1% of the
-`rule_evaluated` pool - as of writing, ~18/2,693 SMPP and ~2,635/349,962
-SS7 `rule_evaluated` rows (under 1% either way). This flag exists so the
-comparison is one command away once `features/text_embeddings.py`'s
-full-dataset run is done, not something to run expecting a meaningful
-result right now.
+**Now actually usable, not yet tried**: `features/text_embeddings.py`'s
+full-dataset (non-sampled) run is done (see `docs/experiments/anomaly.md`'s
+"Current scale") - the ~1% overlap problem this section used to describe
+(an embedding SAMPLE covering only ~18/2,693 SMPP and ~2,635/349,962 SS7
+`rule_evaluated` rows) no longer applies. Re-checked directly against the
+current `embeddings_id_map.parquet` files this session: embeddings now
+cover 139,546/139,546 (100%) of SMPP's and 2,654,369/2,654,369 (100%) of
+SS7's current `rule_evaluated` pool. The comparison this flag exists for
+is genuinely runnable with a meaningful result now, not just "one command
+away" - it hasn't actually been run/evaluated yet as of this doc edit, so
+no result is claimed here.
 
 **Why it's worth doing eventually, not just a nice-to-have**: the
 baseline (no-embeddings) model's own feature importances show

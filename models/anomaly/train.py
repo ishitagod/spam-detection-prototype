@@ -35,7 +35,12 @@ never fed into training. `evaluate_against_rule_labels()` computes real
 PR-AUC and log loss (per README.md's stated evaluation convention:
 PR-AUC/log loss primary, evaluated overall + per source), checking
 whether anomaly_score actually ranks real rule-confirmed spam above
-rule-confirmed clean.
+rule-confirmed clean. Also logs precision@top-K% (models/metrics.py's
+evaluate_precision_at_k(), at 0.1/0.5/1.0/5.0% by default) alongside
+PR-AUC - more honest than the full PR-AUC curve for how this project
+actually uses the score (only the extreme top ever gets acted on, see
+models/anomaly/cluster_discovery.py), though it's still restricted to
+the same rule_evaluated pool - see the honesty note right below.
 
 BE HONEST ABOUT WHAT THIS METRIC DOES AND DOESN'T PROVE: it measures
 agreement with patterns the RULE ENGINE ALREADY KNOWS - the exact
@@ -67,7 +72,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.pipeline import Pipeline
 
 from models.anomaly.data import build_combined_frame, build_feature_matrix, load_source_features
-from models.metrics import evaluate_overall_and_per_source
+from models.metrics import evaluate_overall_and_per_source, evaluate_precision_at_k
 
 MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
 MLFLOW_EXPERIMENT_NAME = "isolation_forest"
@@ -137,12 +142,24 @@ def evaluate_against_rule_labels(df: pd.DataFrame, anomaly_score: np.ndarray) ->
     then per source - an aggregate number can hide one source
     performing badly, and SMPP/SS7's labelled pools look very different
     (see the data reality check in README.md).
+
+    Also computes precision@top-K% (models/metrics.py's
+    evaluate_precision_at_k()) on the SAME (y_true, score) pair -
+    PR-AUC integrates over every threshold, most of which nothing in
+    this project ever operates at; precision at the percentiles this
+    system actually thresholds at (cluster_discovery.py's
+    --anomaly_percentile) is the more honest operational number. Same
+    "known-pattern-only" ceiling as the PR-AUC above applies here too -
+    see module docstring - this doesn't get around that, it's just a
+    more actionable read of the same restricted evaluation pool.
     """
     evaluated = (df["rule_evaluated"] == True).to_numpy()  # noqa: E712
     flagged = (df["rule_flagged"] == True).to_numpy() & evaluated
     y_true = flagged[evaluated].astype(int)
     score = anomaly_score[evaluated]
-    return evaluate_overall_and_per_source(df[evaluated], "source", y_true, score)
+    result = evaluate_overall_and_per_source(df[evaluated], "source", y_true, score)
+    result.update(evaluate_precision_at_k(df[evaluated], "source", y_true, score))
+    return result
 
 
 def run(

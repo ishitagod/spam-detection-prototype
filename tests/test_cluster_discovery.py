@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.anomaly.cluster_discovery import (
     run_dbscan,
     select_anomalous_subset,
+    select_clustering_features,
     suggest_eps,
     summarize_clusters,
 )
@@ -103,6 +104,27 @@ def test_select_anomalous_subset_x_rows_stay_aligned_with_df_rows():
     # X row travelled with the correct df row through the filter, not
     # just that the counts happen to match.
     assert np.array_equal(X_subset.flatten(), subset["record_id"].astype(float).to_numpy())
+
+
+def test_select_clustering_features_keeps_only_embedding_pca_and_near_dup_cols():
+    """Real, measured failure this guards against (see module docstring):
+    clustering on the FULL joint feature space let sender-behavioral
+    differences fragment a single confirmed spam template across 13
+    different clusters. Only emb_pca_*/NEAR_DUP_COLS should survive -
+    behavioral/age-bucket/diversity/velocity/source columns must not."""
+    feature_names = [
+        "sender_msgs_last_5min", "sender_age_days",
+        "sender_age_bucket_lt_1hr", "sender_recipient_diversity_ratio_5min",
+        "near_dup_match_count_1hr", "near_dup_max_similarity_24hr",
+        "emb_pca_0", "emb_pca_1", "emb_pca_2",
+        "source_SMPP",
+    ]
+    X = np.arange(2 * len(feature_names)).reshape(2, len(feature_names)).astype(float)
+    kept = select_clustering_features(X, feature_names)
+    assert kept.shape == (2, 5)  # 2 near_dup cols + 3 emb_pca cols
+    # Values, not just shape - confirms the RIGHT columns survived, in order.
+    expected_cols = [4, 5, 6, 7, 8]  # indices of near_dup_*/emb_pca_* above
+    assert np.array_equal(kept, X[:, expected_cols])
 
 
 def _summary_df_and_labels():

@@ -18,14 +18,35 @@ its effort characterizing normal messages, which isn't this script's
 job; the whole point is characterizing what the anomaly layer already
 flagged as worth a second look.
 
-SAME VECTOR SPACE AS ISOLATION FOREST, ON PURPOSE: the feature matrix is
-built via models.anomaly.data.build_feature_matrix() over the FULL
-candidate pool first (same PCA/scaling fit Isolation Forest itself
-trained on), and only THEN sliced down to the anomalous subset's rows -
-not re-fit on the subset alone. Refitting PCA on just the anomalous rows
-would silently change the basis DBSCAN clusters in, making "the same
-messages, described two different ways" instead of one consistent space
-both techniques share.
+SAME PCA FIT AS ISOLATION FOREST, BUT NOT THE SAME CLUSTERING SPACE: the
+feature matrix is built via models.anomaly.data.build_feature_matrix()
+over the FULL candidate pool first (same PCA/scaling fit Isolation
+Forest itself trained on), and only THEN sliced down to the anomalous
+subset's rows - not re-fit on the subset alone. Refitting PCA on just
+the anomalous rows would silently change the basis, making "the same
+messages, described two different ways" instead of one consistent basis
+both techniques share. That basis-consistency argument does NOT mean
+DBSCAN should cluster on every column of it, though - see
+select_clustering_features() below for why the actual clustering
+distance metric is restricted to a CONTENT-similarity subset (embedding
+PCA + near-dup columns), not the full joint feature space
+(behavioral/age/diversity/velocity included) Isolation Forest scores on.
+Isolation Forest genuinely needs both content and behavior - "how
+anomalous is this row overall" is a real multi-factor question.
+Clustering here answers a different question - "which messages are the
+same campaign/template" - a content question, where sender-behavioral
+differences are a property OF instances within a campaign, not a
+legitimate boundary BETWEEN campaigns. Real, measured failure this
+guards against: clustering on the full joint space split one confirmed
+109-message spam template ("Let's chat on WhatsApp!...") across 13
+different DBSCAN clusters, because its instances came from senders with
+different message counts/ages/near-dup windows even though the TEXT was
+identical every time - the standard industry pattern for spam/phishing-
+campaign clustering (and this project's own FAISS near-dup search,
+features/faiss_index.py) is to cluster on content similarity alone and
+treat behavioral/sender features as a separate enrichment/filter layer,
+never blended into the same distance metric that defines cluster
+membership.
 
 NOT A DEPLOYABLE MODEL: scikit-learn's DBSCAN has no .predict() for
 genuinely new data at all - unlike IsolationForest/LightGBM, nothing
@@ -161,6 +182,33 @@ def load_features_and_scores(sources: list[str], data_dir: Path) -> tuple[pd.Dat
     return combined, X, feature_names
 
 
+def select_clustering_features(X: np.ndarray, feature_names: list[str]) -> np.ndarray:
+    """
+    Restricts DBSCAN's actual clustering input to CONTENT-similarity
+    columns only - embedding PCA components (`emb_pca_*`) plus
+    NEAR_DUP_COLS (themselves derived from the same MiniLM embeddings via
+    FAISS similarity search) - not the full joint feature space
+    build_feature_matrix() built for Isolation Forest. See module
+    docstring's "SAME PCA FIT... BUT NOT THE SAME CLUSTERING SPACE"
+    section for the real, measured failure this fixes and why this is
+    standard practice for campaign/template clustering specifically, not
+    a general "behavioral features are bad" claim.
+
+    Does NOT change the PCA fit itself - `X`/`feature_names` are still
+    build_feature_matrix()'s full-candidate-pool-fit output; this only
+    slices which of its columns the clustering DISTANCE METRIC sees.
+    Behavioral columns remain fully available in `df_subset` for
+    summarize_clusters()'s human-readable per-cluster reporting - this
+    changes cluster MEMBERSHIP, not what gets reported once clusters
+    exist.
+    """
+    keep = [
+        i for i, name in enumerate(feature_names)
+        if name.startswith("emb_pca_") or name in NEAR_DUP_COLS
+    ]
+    return X[:, keep]
+
+
 def select_anomalous_subset(
     df: pd.DataFrame, X: np.ndarray, percentile: float,
 ) -> tuple[pd.DataFrame, np.ndarray]:
@@ -232,10 +280,13 @@ def run(
     force: bool = False,
 ) -> None:
     print(f"Loading features + anomaly scores for sources: {sources} ...")
-    df, X, _ = load_features_and_scores(sources, data_dir)
+    df, X, feature_names = load_features_and_scores(sources, data_dir)
 
     print(f"Selecting top {100 - anomaly_percentile:.0f}% by anomaly_score ...")
     df_subset, X_subset = select_anomalous_subset(df, X, anomaly_percentile)
+    X_subset = select_clustering_features(X_subset, feature_names)
+    print(f"  clustering on {X_subset.shape[1]} content-similarity column(s) "
+          f"(embedding PCA + near-dup) - see select_clustering_features()")
     if len(df_subset) < min_samples:
         raise ValueError(
             f"Only {len(df_subset)} row(s) selected, fewer than --min_samples "

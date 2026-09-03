@@ -87,6 +87,16 @@ from models.anomaly.data import (
     BEHAVIORAL_COLS,
     COUNT_COLS,
     NEAR_DUP_COLS,
+    SENDER_AGE_BUCKET_EDGES_DAYS,
+    SENDER_AGE_BUCKET_LABELS,
+    SENDER_AGE_DAYS_COL,
+    SENDER_DIVERSITY_LONG_COL,
+    SENDER_DIVERSITY_LONG_KNOWN_COL,
+    SENDER_DIVERSITY_LONG_MSGS_COL,
+    SENDER_DIVERSITY_MIN_MSGS,
+    SENDER_DIVERSITY_SHORT_COL,
+    SENDER_DIVERSITY_SHORT_KNOWN_COL,
+    SENDER_DIVERSITY_SHORT_MSGS_COL,
     load_source_features,
 )
 from models.anomaly.train import MLFLOW_EXPERIMENT_NAME, MLFLOW_TRACKING_URI, score_anomalies
@@ -134,11 +144,57 @@ def build_interpretable_frame(df: pd.DataFrame) -> pd.DataFrame:
     - same "don't add a constant, information-free column" rule
     build_feature_matrix() itself now follows). Embedding columns are
     deliberately NOT included here - see module docstring.
+
+    SENDER_AGE_DAYS_COL: bucketed via the SAME pd.cut()/get_dummies()
+    build_combined_frame() itself uses, NOT passed raw - a real fitted
+    pipeline now expects sender_age_bucket_* columns, not the raw day
+    count (see models/anomaly/data.py's SENDER_AGE_BUCKET_EDGES_DAYS
+    comment for why). Getting this wrong here is not cosmetic: main()'s
+    reindex-to-expected_cols step would silently zero-fill every
+    sender_age_bucket_* column for every row (a state no real row can
+    actually be in - exactly one bucket is always 1) rather than error,
+    silently corrupting X_transformed for BOTH SHAP and LIME, not just
+    whatever this function happened to get wrong about age specifically.
+
+    SENDER_DIVERSITY_SHORT_COL/LONG_COL: same reasoning, gated via the
+    SAME message-count threshold build_combined_frame() uses (see
+    SENDER_DIVERSITY_MIN_MSGS's comment) rather than passed raw - a real
+    fitted pipeline expects the gated value plus a paired _known
+    indicator, not the raw (spuriously-extreme-on-tiny-samples) ratio.
     """
     transformed = df.copy()
     for col in COUNT_COLS:
         transformed[col] = np.log1p(transformed[col])
-    pieces = [transformed[BEHAVIORAL_COLS + NEAR_DUP_COLS]]
+
+    # Uses `df` (pre-log1p), not `transformed` - same reasoning as
+    # build_combined_frame()'s identical gate.
+    below_min_short = df[SENDER_DIVERSITY_SHORT_MSGS_COL] < SENDER_DIVERSITY_MIN_MSGS
+    transformed.loc[below_min_short, SENDER_DIVERSITY_SHORT_COL] = np.nan
+    transformed[SENDER_DIVERSITY_SHORT_KNOWN_COL] = transformed[SENDER_DIVERSITY_SHORT_COL].notna().astype(float)
+    transformed[SENDER_DIVERSITY_SHORT_COL] = transformed[SENDER_DIVERSITY_SHORT_COL].fillna(0.0)
+
+    below_min_long = df[SENDER_DIVERSITY_LONG_MSGS_COL] < SENDER_DIVERSITY_MIN_MSGS
+    transformed.loc[below_min_long, SENDER_DIVERSITY_LONG_COL] = np.nan
+    transformed[SENDER_DIVERSITY_LONG_KNOWN_COL] = transformed[SENDER_DIVERSITY_LONG_COL].notna().astype(float)
+    transformed[SENDER_DIVERSITY_LONG_COL] = transformed[SENDER_DIVERSITY_LONG_COL].fillna(0.0)
+
+    raw_passthrough_behavioral_cols = [
+        c for c in BEHAVIORAL_COLS
+        if c not in (SENDER_AGE_DAYS_COL, SENDER_DIVERSITY_SHORT_COL, SENDER_DIVERSITY_LONG_COL)
+    ]
+    diversity_cols = [
+        SENDER_DIVERSITY_SHORT_COL, SENDER_DIVERSITY_SHORT_KNOWN_COL,
+        SENDER_DIVERSITY_LONG_COL, SENDER_DIVERSITY_LONG_KNOWN_COL,
+    ]
+    age_bucket = pd.cut(
+        transformed[SENDER_AGE_DAYS_COL],
+        bins=SENDER_AGE_BUCKET_EDGES_DAYS, labels=SENDER_AGE_BUCKET_LABELS,
+    )
+    age_bucket_dummies = pd.get_dummies(age_bucket, prefix="sender_age_bucket")
+    pieces = [
+        transformed[raw_passthrough_behavioral_cols + NEAR_DUP_COLS + diversity_cols],
+        age_bucket_dummies,
+    ]
     if transformed["source"].nunique() > 1:
         pieces.append(pd.get_dummies(transformed["source"], prefix="source"))
     return pd.concat(pieces, axis=1)
