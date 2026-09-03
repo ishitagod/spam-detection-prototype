@@ -36,12 +36,23 @@ specifically on fraud_type=="spam" (labels/rule_labels.py), there is no
 SMISHING-specific score in this build. A request that asks only for
 SMISHING gets back an empty fraud_results array, not a fabricated number.
 
-risk_score/confidence/reason_codes below are explicit, DISCLOSED heuristics,
-not a calibrated business threshold or a real explainability pass - LIME/
-SHAP are CLAUDE.md's still-pending next steps (Current status: "Next: ...
-2. LIME integration 3. SHAP integration/evaluation"). Revisit
-_FRAUD_THRESHOLD/_confidence/_reason_codes once those land, rather than
-treating these numbers as final.
+risk_score/confidence below remain explicit, DISCLOSED heuristics, not a
+calibrated business threshold - _FRAUD_THRESHOLD=0.5 is still an
+unvalidated starting point.
+
+reason_codes/feature_contributions are now REAL: _reason_codes() derives
+its codes from serving.scoring.explain_rule_pattern()'s actual per-request
+shap.TreeExplainer contributions (CLAUDE.md's "Next: 1. Wire real
+SHAP/LIME output into /v1/score's reason_codes" - done for SHAP; LIME is
+deliberately NOT wired in here, see explain_rule_pattern()'s docstring for
+why it isn't safe to run inline). The reason-code STRINGS are still our
+own placeholder vocabulary (external spec's Table 8-4 enum unknown as of
+writing) - only which codes fire is now evidence-based, not the strings
+themselves. Explanation is only computed for a FRAUD prediction (cost-
+control: TreeExplainer is cheap but still real work, no reason to pay it
+for every NOT_FRAUD request) and is treated as best-effort, same as
+anomaly_score below - a failure here degrades reason_codes/
+feature_contributions, it never turns a successful score into FAILURE.
 """
 import time
 
@@ -53,6 +64,7 @@ from serving.anomaly_scoring import CorpusUnavailableError
 from serving.canonical import CanonicalRow, map_smpp_transaction, map_ss7_transaction
 from serving.feature_lookup import get_imsi_features, get_sender_features
 from serving.schemas import (
+    FeatureContribution,
     FraudPredictionResult,
     ScoreResponse,
     SMPPScoreRequest,
@@ -62,6 +74,7 @@ from serving.scoring import (
     BEHAVIORAL_COLS,
     ChampionUnavailableError,
     ChampionUnsupportedError,
+    explain_rule_pattern,
     score_rule_pattern,
 )
 
@@ -78,6 +91,12 @@ _SUPPORTED_FRAUD_TYPES = ("SPAM_SMS",)
 # `contamination="auto"`: the real precision/recall-calibrated cutoff is
 # a later, business-driven decision, not baked in here.
 _FRAUD_THRESHOLD = 0.5
+
+# How many top-|contribution| features feed feature_contributions and
+# get checked for reason-code membership below - not a tuned value, just
+# small enough to stay a "top reasons" list rather than dumping every
+# feature the model used.
+_TOP_K_CONTRIBUTIONS = 5
 
 
 def _confidence(cold_start: bool, text_decode_failed: bool) -> int:
@@ -97,25 +116,33 @@ def _confidence(cold_start: bool, text_decode_failed: bool) -> int:
     return max(confidence, 10)
 
 
-def _reason_codes(row: dict, cold_start: bool) -> list[str]:
-    """Cheap, rule-based stand-ins for real feature-contribution reason
-    codes (architecture plan Section 7: "native feature importance /
-    cheap contribution scores... fast enough for the inline path") -
-    thresholds below are illustrative, not fit to data. Only populated
-    for a FRAUD prediction, matching the response contract's own example
-    (NOT_FRAUD -> reason_codes: []).
+def _reason_codes(
+    row: dict, cold_start: bool, contributions: list[tuple[str, float, float]],
+) -> list[str]:
+    """Reason codes for a FRAUD prediction, membership now driven by REAL
+    per-request SHAP contributions (serving.scoring.explain_rule_pattern),
+    not fixed value thresholds like before: a feature only earns its code
+    if it's among the top _TOP_K_CONTRIBUTIONS by |contribution| AND its
+    contribution is positive (pushed THIS row toward FRAUD, not just
+    present). `contributions` is `[]` whenever explanation failed/was
+    unavailable (see score()'s try/except) - degrades to the
+    cold_start/text_decode_failed codes plus the base code, same as
+    before explainability existed.
 
-    TODO: these 5 codes are OUR OWN placeholder set, not validated against
-    the external spec's Table 8-4 enum (unknown as of writing - the one
-    example response seen so far used "PROMOTIONAL_CONTENT", which isn't
-    in this list). Revisit once Table 8-4 is available: align these
-    strings to the real enum values and consider a typed Enum here /
-    on ScoreResponse.FraudPredictionResult.reason_codes instead of
-    list[str], so an out-of-spec code can't silently go out."""
+    TODO: these 5 codes are still OUR OWN placeholder set, not validated
+    against the external spec's Table 8-4 enum (unknown as of writing -
+    the one example response seen so far used "PROMOTIONAL_CONTENT",
+    which isn't in this list). Revisit once Table 8-4 is available: align
+    these strings to the real enum values and consider a typed Enum here
+    instead of list[str], so an out-of-spec code can't silently go out."""
+    positive_top = {
+        feature for feature, _value, shap_value in contributions[:_TOP_K_CONTRIBUTIONS]
+        if shap_value > 0
+    }
     codes = ["KNOWN_SPAM_PATTERN"]
-    if row.get("sender_repeat_content_ratio_1hr", 0) >= 0.5:
+    if "sender_repeat_content_ratio_1hr" in positive_top:
         codes.append("REPEATED_CONTENT")
-    if row.get("sender_msgs_last_1hr", 0) >= 50:
+    if {"sender_msgs_last_1hr", "sender_msgs_last_5min"} & positive_top:
         codes.append("HIGH_SENDER_VELOCITY")
     if cold_start:
         codes.append("NEW_SENDER_LOW_HISTORY")
@@ -185,13 +212,33 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
     for fraud_type in to_evaluate:
         if fraud_type == "SPAM_SMS":
             prediction = "FRAUD" if probability >= _FRAUD_THRESHOLD else "NOT_FRAUD"
+
+            reason_codes: list[str] = []
+            feature_contributions: list[FeatureContribution] = []
+            if prediction == "FRAUD":
+                # Best-effort, same convention as anomaly_score below: a
+                # missing champion/explainer degrades explainability, it
+                # never turns a successful rule_pattern_score into
+                # FAILURE. Only paid for on FRAUD - see module docstring.
+                try:
+                    contributions = explain_rule_pattern(canonical, row)
+                except Exception as e:
+                    print(f"reason-code explanation unavailable for {reference!r}: {e}")
+                    contributions = []
+                reason_codes = _reason_codes(row, cold_start, contributions)
+                feature_contributions = [
+                    FeatureContribution(feature=f, value=v, contribution=c)
+                    for f, v, c in contributions[:_TOP_K_CONTRIBUTIONS]
+                ]
+
             fraud_results.append(
                 FraudPredictionResult(
                     fraud_type="SPAM_SMS",
                     prediction=prediction,
                     risk_score=round(probability * 100),
                     confidence=_confidence(cold_start, canonical.text_decode_failed),
-                    reason_codes=_reason_codes(row, cold_start) if prediction == "FRAUD" else [],
+                    reason_codes=reason_codes,
+                    feature_contributions=feature_contributions,
                 )
             )
         if not request.deep_scan and fraud_results and fraud_results[-1].prediction == "FRAUD":

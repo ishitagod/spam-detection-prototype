@@ -119,6 +119,19 @@ ScoreRequest = Annotated[
 ]
 
 
+class FeatureContribution(BaseModel):
+    """One feature's real per-request SHAP contribution to
+    rule_pattern_score (serving/scoring.py::explain_rule_pattern) -
+    `value` is the feature's own value for this request, `contribution`
+    is its signed SHAP value (positive = pushed this prediction toward
+    FRAUD). Not part of the external response contract - see
+    FraudPredictionResult.feature_contributions' docstring."""
+
+    feature: str
+    value: float
+    contribution: float
+
+
 class FraudPredictionResult(BaseModel):
     """One evaluated fraud_type's result. ONLY fraud_types this build
     actually models are ever included in ScoreResponse.fraud_results - see
@@ -132,7 +145,19 @@ class FraudPredictionResult(BaseModel):
     prediction: Literal["FRAUD", "NOT_FRAUD"]
     risk_score: int = Field(ge=0, le=100)
     confidence: int = Field(ge=0, le=100)
+    # reason_codes are now derived from REAL per-request SHAP contributions
+    # (serving/app.py::_reason_codes), not the old fixed-threshold
+    # heuristic - the code STRINGS themselves are still our own
+    # placeholder vocabulary, not the external spec's Table 8-4 enum
+    # (still unknown as of writing) - see serving/app.py's module
+    # docstring.
     reason_codes: list[str] = Field(default_factory=list)
+    # ADDITIVE field, not part of the external response contract - same
+    # status as ScoreResponse.anomaly_score. Only populated for a FRAUD
+    # prediction (empty for NOT_FRAUD, matching reason_codes), and only
+    # the top-K by |contribution| (serving/app.py's _TOP_K), not every
+    # feature the model used.
+    feature_contributions: list[FeatureContribution] = Field(default_factory=list)
 
 
 class ScoreResponse(BaseModel):

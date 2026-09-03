@@ -106,11 +106,38 @@ anomaly_score is surfaced on the response for visibility only; it does
 NOT gate the FRAUD/NOT_FRAUD decision yet (see "Two separate scores, not
 one blended score" above).
 
+SHAP explainability is built for both models (`models/rule_pattern/
+explain.py`, `models/anomaly/explain.py`) - offline scripts run against an
+already-trained MLflow run_id (default: latest), not something
+`serving/app.py` calls per request. Both rebuild the exact data that run
+trained/evaluated on from its own logged params, then run
+`shap.TreeExplainer` (exact for tree ensembles) to get per-row local
+contributions and dataset-wide global importance. The anomaly model also
+gets LIME, on a small deliberately-chosen set of instances (top-anomaly +
+random) - complementary to SHAP, not redundant: the 384-dim embedding is
+PCA'd to ~30 anonymous components before the model sees it, so SHAP can
+only report one aggregate "content_embedding" bucket, not
+interpretable per-dimension attributions; LIME's local surrogate explains
+the structured (behavioral/near-dup) features in their original units for
+those chosen rows instead. See each script's module docstring for the
+full reasoning.
+
+Real-time SHAP is now wired into `serving/app.py`'s `/v1/score`
+(`serving/scoring.py::explain_rule_pattern`): a `shap.TreeExplainer`
+cached once per champion load, run inline per request - safe to do
+inline only because TreeExplainer is exact/polynomial-time with no
+background dataset needed, unlike LIME (which stays offline-only, see
+`models/anomaly/explain.py`'s per-instance cost). `_reason_codes()`
+derives its codes from these real contributions instead of the old fixed
+thresholds, computed only for a FRAUD prediction (cost control); the raw
+top-K contributions are also surfaced on `FraudPredictionResult.
+feature_contributions`, an additive field alongside `anomaly_score`. A
+failure to explain degrades reason_codes/feature_contributions, it never
+turns a successful rule_pattern_score into a FAILURE response (same
+best-effort convention as anomaly_score).
+
 Not yet built:
-1. LIME wiring for both model types.
-2. SHAP wiring/evaluation - added alongside LIME, not yet decided which
-   is primary vs. supplementary.
-3. A full (non-sampled) `text_embeddings.py` run - both FAISS and
+1. A full (non-sampled) `text_embeddings.py` run - both FAISS and
    Isolation Forest currently train on the sampled subset
    (`--sample_n`); see `docs/architecture.md`'s "Known blockers" section
    for the real cost (~21hr full run) driving that choice.

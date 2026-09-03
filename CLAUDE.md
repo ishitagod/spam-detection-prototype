@@ -123,11 +123,21 @@ Completed:
 - FAISS features
 - Isolation Forest training
 - LightGBM training
+- FastAPI service combining both scores (`serving/app.py`)
+- SHAP explainability for both models, LIME for the anomaly model
+  (`models/rule_pattern/explain.py`, `models/anomaly/explain.py`) - offline,
+  run-id-driven scripts against an already-trained MLflow run
+- Real-time SHAP wired into `/v1/score` (`serving/scoring.py::
+  explain_rule_pattern`, a cached `shap.TreeExplainer` run inline per
+  request) - `_reason_codes()` now derives its codes from real per-request
+  contributions instead of fixed thresholds, and `FraudPredictionResult.
+  feature_contributions` surfaces the raw top-K SHAP values. FRAUD
+  predictions only (cost control); LIME is deliberately NOT wired in here
+  (too expensive per-request, stays offline-only - see
+  `explain_rule_pattern()`'s docstring)
 
 Next:
-1. FastAPI service combining both scores
-2. LIME integration
-3. SHAP integration/evaluation
+1. Full (non-sampled) `text_embeddings.py` run
 
 ## Documentation
 

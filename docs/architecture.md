@@ -77,9 +77,28 @@ Goal: production-grade working demo first, then iterate.
 - LightGBM (supervised classifier) - see `docs/experiments/rule_pattern.md`
 - MLflow (experiment tracking + model registry, SQLite backend:
   `sqlite:///mlflow.db`)
-- LIME (explainability, both model types) - not yet wired
-- SHAP (explainability, added alongside LIME - not yet decided which is
-  primary vs. supplementary; revisit once both are wired in)
+- SHAP (explainability, both model types) - `models/rule_pattern/explain.py`
+  (TreeExplainer over LightGBM), `models/anomaly/explain.py` (TreeExplainer
+  over the fitted IsolationForest, embedding PCA components collapsed into
+  one content bucket)
+- LIME (anomaly model only, alongside SHAP) - `models/anomaly/explain.py`;
+  explains a small deliberately-chosen set of instances (top-anomaly +
+  random) in original feature units, complementing SHAP's embedding bucket.
+  Not used for the rule_pattern model - TreeExplainer alone is exact there.
+  Both `explain.py` scripts are offline, run-id-driven against an
+  already-trained MLflow run - real-time explainability at `/v1/score` is
+  a separate, inline SHAP path (see below), not these scripts.
+- Real-time SHAP (`serving/scoring.py::explain_rule_pattern`) - the ONLY
+  explainer safe to run inline per request: a `shap.TreeExplainer` cached
+  once per champion load (same cache-once convention as the model itself),
+  exact/polynomial-time, no background dataset needed. LIME is deliberately
+  NOT wired into `/v1/score` - it perturbs and re-scores an instance
+  ~500x per call (see `models/anomaly/explain.py`'s config), fine offline
+  on a handful of chosen rows, not on the request path. `serving/app.py`'s
+  `_reason_codes()` derives its codes from these real contributions
+  (FRAUD predictions only, cost control); the raw top-K contributions are
+  also surfaced on `FraudPredictionResult.feature_contributions`, an
+  additive field not part of the external response contract.
 - FastAPI (inference service) - `serving/app.py`, one `POST /v1/score`
   endpoint. rule_pattern_score (`serving/scoring.py`) drives the
   FRAUD/NOT_FRAUD decision per the external response contract;
@@ -139,11 +158,11 @@ spam-detection-prototype/
 │   ├── anomaly/
 │   │   ├── data.py               # feature join (embeddings+behavioral+near-dup) + preprocessing pipeline
 │   │   ├── train.py              # Isolation Forest training - see docs/experiments/anomaly.md
-│   │   ├── cluster_discovery.py  # DBSCAN on top-anomaly rows -> candidate fraud-type clusters - see docs/experiments/anomaly_clustering.md
-│   │   └── inspect_clusters.py   # hand-labeling helper: prints/exports cluster samples for naming - see docs/experiments/anomaly_clustering.md
+│   │   └── explain.py            # SHAP (TreeExplainer) + LIME, offline, against an already-trained run
 │   └── rule_pattern/
 │       ├── data.py               # rule_evaluated==True feature/label prep
-│       └── train.py              # LightGBM training - see docs/experiments/rule_pattern.md
+│       ├── train.py              # LightGBM training - see docs/experiments/rule_pattern.md
+│       └── explain.py            # SHAP (TreeExplainer), offline, against an already-trained run
 ├── serving/
 │   ├── feature_lookup.py       # get_sender_features()/get_imsi_features() - Feast online-lookup helpers
 │   ├── canonical.py            # live SMPP/SS7 request -> CanonicalRow (single-message canonical mapping)
