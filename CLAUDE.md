@@ -135,9 +135,33 @@ Completed:
   predictions only (cost control); LIME is deliberately NOT wired in here
   (too expensive per-request, stays offline-only - see
   `explain_rule_pattern()`'s docstring)
+- Full (non-sampled) `text_embeddings.py` run - DONE. Both FAISS and
+  Isolation Forest now train on the full corpus (SMPP 5.5M / SS7 2.7M
+  rows), not the old `--sample_n` subset - see
+  `docs/experiments/anomaly.md`'s "Current scale". `--sample_n` still
+  exists as an opt-in flag for fast local iteration, it's just no longer
+  the default path any model trains on.
+- DBSCAN cluster-discovery workflow (`models/anomaly/cluster_discovery.py`
+  -> `inspect_clusters.py` -> `ingest_cluster_labels.py`) - turns
+  top-anomaly `anomaly_score` output into hand-labelable fraud-type
+  clusters. See `docs/experiments/anomaly_clustering.md` for the full
+  step-by-step.
 
 Next:
-1. Full (non-sampled) `text_embeddings.py` run
+1. Hand-confirm DBSCAN clusters (`docs/experiments/anomaly_clustering.md`
+   step 4: `models/anomaly/inspect_clusters.py` +
+   `models/anomaly/suggest_cluster_labels.py`, then
+   `models/anomaly/ingest_cluster_labels.py`), then train
+   `models/fraud_type_classifier/train.py --label_source confirmed` - the
+   real multiclass fraud-type candidate. `--label_source suggested`
+   (unconfirmed heuristic guesses) already runs today but logs to a
+   separate `_suggested_labels` MLflow experiment and must never be
+   promoted.
+2. `models/rule_pattern/train.py --with_embeddings` - now unblocked by
+   the full embeddings run above (100% `rule_evaluated` coverage both
+   sources), not yet run. Baseline LightGBM's own SHAP importances show
+   `text_length` as its top feature, suggesting real content embeddings
+   would help - see `docs/experiments/rule_pattern.md`.
 
 ## Documentation
 

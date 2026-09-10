@@ -136,8 +136,10 @@ failure to explain degrades reason_codes/feature_contributions, it never
 turns a successful rule_pattern_score into a FAILURE response (same
 best-effort convention as anomaly_score).
 
-Not yet built:
-1. A full (non-sampled) `text_embeddings.py` run - both FAISS and
-   Isolation Forest currently train on the sampled subset
-   (`--sample_n`); see `docs/architecture.md`'s "Known blockers" section
-   for the real cost (~21hr full run) driving that choice.
+Done since the above was written: the full (non-sampled)
+`text_embeddings.py` run - both FAISS and Isolation Forest now train on
+the full corpus, not the `--sample_n` subset. See
+`docs/experiments/anomaly.md`'s "Current scale" for confirmation, and
+`docs/experiments/rule_pattern.md`'s "`--with_embeddings`: built, not yet
+useful" section for what this unblocks next (the `rule_pattern_score`
+embeddings comparison).

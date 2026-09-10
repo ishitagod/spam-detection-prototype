@@ -385,18 +385,19 @@ see below for why the full dataset isn't embedded outright. The earlier
 applies as of 2026-08-24 — verified live, weights download and encode
 correctly in this environment now.
 
-**A real cost, not a theoretical one:** encoding is a transformer forward
-pass per distinct text (~14ms/text on this CPU for the original
-English-only model, measured), not the microseconds-per-row cost of
-every earlier pipeline stage. At the real dedup ratio (74.2% of SMPP's
-5.5M rows and 51.3% of SS7's 2.7M rows are actually distinct — spam
-templates vary by embedded OTP/amount/reference-number even when
-otherwise identical, so exact-match dedup alone doesn't collapse the
-corpus much), a full-dataset run is a ~21hr job. Current default is a
-random sample (`--sample_n`, seeded for reproducibility) sized for fast
-iteration while validating the FAISS/Isolation Forest steps — the full
-run stays available as a deliberate later step once the approach is
-validated, not abandoned.
+**A real cost, not a theoretical one — paid off, not just theorized:**
+encoding is a transformer forward pass per distinct text (~14ms/text on
+this CPU for the original English-only model, measured), not the
+microseconds-per-row cost of every earlier pipeline stage. At the real
+dedup ratio (74.2% of SMPP's 5.5M rows and 51.3% of SS7's 2.7M rows are
+actually distinct — spam templates vary by embedded OTP/amount/
+reference-number even when otherwise identical, so exact-match dedup
+alone doesn't collapse the corpus much), a full-dataset run was estimated
+at ~21hr. That run has since completed — both FAISS and Isolation Forest
+now train on the full corpus, not a sample (see
+`docs/experiments/anomaly.md`'s "Current scale"). `--sample_n` (seeded
+for reproducibility) remains available for fast local iteration, but is
+opt-in now, not the default path.
 
 ### Supervised — `rule_pattern_score`
 | Model | Role |

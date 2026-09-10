@@ -22,11 +22,12 @@ Usage:
 --skip_embeddings: for exactly one real recurring need - regenerating
 messages_with_behavioral.csv after a labels/rule_labels.py or
 features/behavioral.py change, WITHOUT re-doing stages 4-5. Embeddings
-(~21hr full run, see docs/architecture.md) and FAISS near-dup search are
-completely independent of the label/behavioral logic - re-running them for
-a labeling fix wastes hours redoing unrelated, unchanged work, and would
-collide with an embeddings run already in progress. Stage 5 is skipped
-whenever stage 4 is, since it consumes stage 4's output directly.
+(a full-corpus encode - hours-scale, see docs/experiments/anomaly.md's
+"Current scale") and FAISS near-dup search are completely independent of
+the label/behavioral logic - re-running them for a labeling fix wastes
+hours redoing unrelated, unchanged work, and would collide with an
+embeddings run already in progress. Stage 5 is skipped whenever stage 4
+is, since it consumes stage 4's output directly.
 """
 import argparse
 from pathlib import Path

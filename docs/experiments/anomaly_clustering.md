@@ -119,32 +119,53 @@ Cluster IDs are per-run, not stable across reruns (see the caveat below)
 — always inspect the `fraud_type_clusters.parquet` from the SAME
 `cluster_discovery.py` run you're currently labeling.
 
-**5. Feed confirmed labels forward — this is the part not yet built.**
-There is currently no ingestion path from a hand-confirmed cluster label
-back into training data (no `labels/cluster_labels.py` counterpart to
-`labels/rule_labels.py` yet). When you build it:
-- Store it as its own label source, **never merged into `rule_flagged`**
-  — a cluster-derived label and a rule-engine label have different
-  confidence/provenance and must stay traceable to which one they came
-  from (mirrors this project's existing discipline: `rule_flagged` is
-  never conflated with `SW_*` bypasses either — see
+**5. Feed confirmed labels forward.** `labels/cluster_labels.py`
+(mirroring `labels/rule_labels.py`'s "derive labels from an external
+verdict" shape) + `models/anomaly/ingest_cluster_labels.py` (the CLI/
+file-I/O shell around it, same division as `inspect_clusters.py`) close
+this loop:
+```
+python -m models.anomaly.ingest_cluster_labels --source SS7
+python -m models.anomaly.ingest_cluster_labels --source SMPP
+```
+Run this after hand-filling a `cluster_labels_template.csv` (step 4). It
+joins `fraud_type_clusters.parquet`'s per-message `cluster_label` to the
+template's confirmed (non-blank `fraud_type_label`) rows only, and
+accumulates the result into `data/processed/<source>/cluster_labels.parquet`
+(`message_key`, `cluster_label`, `cluster_fraud_type_label`) —
+de-duplicated on `message_key`, keep-newest, so repeated labeling
+sessions over time (each against a freshly, differently-numbered
+clustered batch — cluster IDs are per-run, not stable) accumulate into
+one growing, current view instead of overwriting each other or
+colliding. `build_cluster_labels()` also refuses to silently join a
+template against the wrong run: if a confirmed `cluster_label` doesn't
+exist in the `fraud_type_clusters.parquet` it's paired with, it raises
+rather than dropping those rows quietly.
+
+The design constraints that shaped it, still true and worth restating:
+- `cluster_fraud_type_label` is its own column, **never merged into
+  `rule_flagged`** — a cluster-derived label and a rule-engine label
+  have different confidence/provenance and must stay traceable to which
+  one they came from (mirrors this project's existing discipline:
+  `rule_flagged` is never conflated with `SW_*` bypasses either — see
   `labels/rule_labels.py`).
-- Only promote a cluster's rows to training labels once a human has
-  actually confirmed the cluster's identity (step 4) — never auto-label
-  from `cluster_label` alone. DBSCAN's job was grouping, not deciding
-  ground truth.
-- Log any classifier trained on these labels to its **own** MLflow
-  experiment (e.g. `fraud_type_classifier`, or
+- Only a hand-confirmed cluster (step 4) ever produces a label — never
+  auto-labeled from `cluster_label` alone. DBSCAN's job was grouping,
+  not deciding ground truth.
+- Log any classifier trained on `cluster_labels.parquet` to its **own**
+  MLflow experiment (e.g. `fraud_type_classifier`, or
   `rule_pattern_score_with_cluster_labels` if extending the existing
   LightGBM model) — same "never mistaken for the existing baseline"
   convention as `anomaly_score_diagnostics` and
-  `rule_pattern_score_experimental`. Do not silently fold these rows into
-  `rule_pattern_score`'s existing training pool.
+  `rule_pattern_score_experimental`. Do not silently fold these rows
+  into `rule_pattern_score`'s existing training pool.
 - Once confirmed labels exist across multiple fraud types (not just
-  binary spam/not-spam), this becomes the seed for a genuine multiclass
-  classifier — the production-scale design's Stage C
+  binary spam/not-spam), `cluster_labels.parquet` becomes the seed for a
+  genuine multiclass classifier — the production-scale design's Stage C
   (`docs/sms_spam_technical_architecture_plan.md`), gated on label
-  *volume*, not a calendar date.
+  *volume*, not a calendar date. That classifier itself is still not
+  built — this step only gets the labels into a durable, accumulated
+  file; training against them is a separate, later action.
 
 ## Caveats to keep in view
 

@@ -68,9 +68,11 @@ Goal: production-grade working demo first, then iterate.
   refresh_feast.py` - wired in for the sender-behavioral features (see
   above); requires `dill==0.4.1` pinned in requirements.txt (see "Known
   blockers" below), not Feast's own `dill~=0.3.0`
-- sentence-transformers, model = `all-MiniLM-L6-v2` (prototype choice -
-  smallest footprint of the candidates; Distil-mBERT/XLM-R are production
-  options, not used here)
+- sentence-transformers, model = `paraphrase-multilingual-MiniLM-L12-v2`
+  (prototype choice - switched from the smaller-footprint `all-MiniLM-L6-v2`
+  once real data showed ~10-11% genuine Malay/mixed content an
+  English-only model would embed poorly; see README.md's "Modeling plan").
+  Distil-mBERT/XLM-R are production options, not used here.
 - FAISS (near-duplicate detection) - see `docs/experiments/faiss.md`
 - scikit-learn Isolation Forest (unsupervised anomaly scoring) - see
   `docs/experiments/anomaly.md`
@@ -183,6 +185,7 @@ spam-detection-prototype/
 │   │   ├── anomaly_clustering.md          # DBSCAN clustering workflow: anomaly_score -> hand-labelable fraud-type clusters
 │   │   └── rule_pattern.md                # LightGBM design + tuning evidence
 │   ├── feature_catalog.md                 # what's servable from Feast - name/type/meaning per feature
+│   ├── feature_reference.md               # FULL feature inventory, SS7 vs SMPP - canonical, source-specific, behavioral, embeddings, FAISS, labels, per-model feature sets
 │   ├── prototype_plan.md
 │   └── sms_spam_technical_architecture_plan.md
 └── data/                        # gitignored - raw/ and processed/ real CDR data, feast_sources/ snapshot parquet

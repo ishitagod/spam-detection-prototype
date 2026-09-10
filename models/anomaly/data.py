@@ -5,12 +5,12 @@ matrix for Isolation Forest, by message_key:
   - embeddings.npy + embeddings_id_map.parquet (MiniLM embeddings)
   - faiss_output.parquet          (near-dup features, both windows)
 
-INNER join, not left: embeddings/faiss currently only cover the sampled
-subset built by features/text_embeddings.py's --sample_n (see that
-module's docstring for why - the full 8.2M-row encode is a ~21hr job).
-Training data is therefore restricted to that same sample, consistently
-- not a new limitation introduced here, just carried through explicitly
-rather than silently.
+INNER join, not left: embeddings/faiss now cover the FULL corpus (the
+former --sample_n-only restriction is gone - features/text_embeddings.py's
+full 8.2M-row encode, previously a ~21hr job, has since completed; see
+docs/experiments/anomaly.md's "Current scale"). INNER (not LEFT) is kept
+regardless, on principle - a row missing embeddings/faiss output should
+drop out explicitly, not silently train on a partially-NaN feature row.
 
 `source` IS included as a feature (one-hot), not used to route to
 separate models - per CLAUDE.md's "one model to start, not two"

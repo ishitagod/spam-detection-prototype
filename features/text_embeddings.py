@@ -6,9 +6,13 @@ re-encoding text independently - one model, one pass, two downstream
 readers. This is exactly why it's its own step rather than being folded
 into either consumer (see CLAUDE.md's roadmap note).
 
-MODEL: `all-MiniLM-L6-v2` via sentence-transformers. Embeddings are L2-normalized at encode time, so
-cosine similarity downstream reduces to a plain dot product - what
-FAISS's inner-product index types expect.
+MODEL: `paraphrase-multilingual-MiniLM-L12-v2` (config.settings.
+TEXT_EMBEDDING_MODEL) via sentence-transformers - switched from the
+original `all-MiniLM-L6-v2` pick once real data showed ~10-11% genuine
+Malay/mixed content an English-only model would embed poorly (see
+README.md's "Modeling plan" section for the measurement). Embeddings are
+L2-normalized at encode time, so cosine similarity downstream reduces to
+a plain dot product - what FAISS's inner-product index types expect.
 
 DEDUPLICATION: real spam is repetitive by construction - one busy SMPP
 sender's own last-hour text-frequency snapshot (docs/feature_catalog.md)

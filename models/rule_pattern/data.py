@@ -50,12 +50,15 @@ rule_evaluated pool, split by UNIQUE TEXT (no template leaking across
 train/test), scored PR-AUC 0.934 vs a 0.669 naive baseline - real
 generalizing signal, not just template memorization.
 
-use_embeddings is NOT yet useful as the main training path: the MiniLM
-embedding sample only overlaps ~1% of the rule_evaluated pool (under 1%
-for both sources as of writing - see load_labelled_messages_with_embeddings()),
-because features/text_embeddings.py's full-dataset run (~21hr CPU job) is
-still sample-scale. This flag exists so the comparison is one command
-away once that full run lands.
+use_embeddings is NOW actually usable, not yet tried: features/
+text_embeddings.py's full-dataset run (previously a ~21hr blocker) has
+completed - embeddings now cover 100% of both sources' rule_evaluated
+pool (139,546/139,546 SMPP, 2,654,369/2,654,369 SS7 - verified against
+embeddings_id_map.parquet), not the ~1% sample-era overlap this docstring
+used to describe. The `--with_embeddings` comparison in
+models/rule_pattern/train.py is a real, runnable experiment now - see
+docs/experiments/rule_pattern.md for the case for running it (baseline
+`text_length` feature importance) and its result once run.
 
 Embeddings and TF-IDF are deliberately independent flags, not one combined
 "with_content" toggle: they catch different things in real spam here - TF-IDF
