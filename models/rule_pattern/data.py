@@ -19,6 +19,11 @@ FEATURES, deliberately narrower than Isolation Forest's:
     from there rather than duplicated
   - canonical: dcs, text_decode_failed, plus text_length (a cheap
     derived signal, zero extra cost to add)
+  - content-rule flags (features/content_flags.py, CONTENT_FLAG_COLS):
+    base features here too, same as Isolation Forest - see that module's
+    CONTENT_FLAG_COLS comment and the architecture plan's Section 3 for
+    why these aren't gated behind use_embeddings/use_tfidf the way
+    corpus-fit TF-IDF/embeddings are
   - source (one-hot)
 EXCLUDED ON PURPOSE for this first build: originator/destination - too
 high-cardinality to one-hot without real overfitting risk on a pool
@@ -83,6 +88,7 @@ full df before train.py's split - harmless in practice for PCA, but worth
 closing now that TF-IDF's vocabulary fit makes the same mistake far more
 consequential.)
 """
+
 from pathlib import Path
 
 import numpy as np
@@ -90,14 +96,21 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from models.anomaly.data import (
-    BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, N_EMBEDDING_COMPONENTS, SENDER_VELOCITY_ZSCORE_COL,
+    BEHAVIORAL_COLS,
+    CONTENT_FLAG_COLS,
+    IMSI_DISTINCT_ORIG_COL,
+    N_EMBEDDING_COMPONENTS,
+    SENDER_VELOCITY_ZSCORE_COL,
     embedding_pca_pipeline,
 )
 
 CANONICAL_COLS = ["dcs", "text_decode_failed"]
 REQUIRED_COLS = (
     ["source", "record_id", "rule_evaluated", "rule_flagged", "text"]
-    + CANONICAL_COLS + BEHAVIORAL_COLS + [IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL]
+    + CANONICAL_COLS
+    + BEHAVIORAL_COLS
+    + [IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL]
+    + CONTENT_FLAG_COLS
 )
 
 # Validated empirically (see module docstring) on the full real SS7 corpus,
@@ -127,12 +140,18 @@ def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
     """
     messages_path = Path(messages_path)
     dtypes = {
-        "source": str, "record_id": str, "rule_evaluated": bool,
-        "dcs": "float64", "text_decode_failed": bool,
-        "sender_msgs_last_5min": "int64", "sender_msgs_last_1hr": "int64",
-        "sender_unique_destinations_1hr": "int64", "sender_repeat_content_ratio_1hr": "float64",
+        "source": str,
+        "record_id": str,
+        "rule_evaluated": bool,
+        "dcs": "float64",
+        "text_decode_failed": bool,
+        "sender_msgs_last_5min": "int64",
+        "sender_msgs_last_1hr": "int64",
+        "sender_unique_destinations_1hr": "int64",
+        "sender_repeat_content_ratio_1hr": "float64",
         "sender_age_days": "float64",
-        "sender_recipient_diversity_ratio_5min": "float64", "sender_recipient_diversity_ratio_1hr": "float64",
+        "sender_recipient_diversity_ratio_5min": "float64",
+        "sender_recipient_diversity_ratio_1hr": "float64",
         "sender_velocity_zscore_5min": "float64",  # can be NaN - a plain
         # float64 column already handles that fine, unlike rule_flagged's
         # nullable "boolean" below (True/False/NA trichotomy needs the
@@ -146,7 +165,8 @@ def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
         "rule_flagged": "boolean",
     }
     df = pd.read_csv(
-        messages_path, usecols=lambda c: c in set(REQUIRED_COLS),
+        messages_path,
+        usecols=lambda c: c in set(REQUIRED_COLS),
         dtype=dtypes,  # `text` deliberately left out - free text doesn't fit a fixed dtype
     )
     # No dtype entry above for IMSI_DISTINCT_ORIG_COL on purpose - it's
@@ -158,6 +178,12 @@ def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
     # handling as `dcs` above).
     if IMSI_DISTINCT_ORIG_COL not in df.columns:
         df[IMSI_DISTINCT_ORIG_COL] = np.nan
+    # Same "absent -> default, not a required column" treatment as IMSI
+    # above, but 0 (no flags known) rather than NaN - see
+    # models/anomaly/data.py::load_source_features()'s matching comment.
+    for col in CONTENT_FLAG_COLS:
+        if col not in df.columns:
+            df[col] = 0
     # source/record_id already forced to str via the dtype= dict above -
     # same convention as every other module in this codebase (a real bug
     # hit before: pandas can infer one source file's record_id/
@@ -174,7 +200,9 @@ def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     has native missing-value handling built in, no imputation needed.
     """
     text_length = df["text"].fillna("").str.len().rename("text_length")
-    text_decode_failed = df["text_decode_failed"].astype(int).rename("text_decode_failed")
+    text_decode_failed = (
+        df["text_decode_failed"].astype(int).rename("text_decode_failed")
+    )
     # Absent entirely for a caller that didn't run it through
     # load_labelled_messages() (e.g. a test fixture) - same "NaN means
     # unknown, not missing" treatment as `dcs`, not a required column.
@@ -192,8 +220,18 @@ def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     if SENDER_VELOCITY_ZSCORE_COL in df.columns:
         velocity_col = df[[SENDER_VELOCITY_ZSCORE_COL]]
     else:
-        velocity_col = pd.DataFrame({SENDER_VELOCITY_ZSCORE_COL: np.nan}, index=df.index)
-    pieces = [df[BEHAVIORAL_COLS], imsi_col, velocity_col, df[["dcs"]], text_decode_failed, text_length]
+        velocity_col = pd.DataFrame(
+            {SENDER_VELOCITY_ZSCORE_COL: np.nan}, index=df.index
+        )
+    pieces = [
+        df[BEHAVIORAL_COLS],
+        imsi_col,
+        velocity_col,
+        df[["dcs"]],
+        text_decode_failed,
+        text_length,
+        df[CONTENT_FLAG_COLS],
+    ]
     # Same reasoning as models/anomaly/data.py's build_feature_matrix():
     # `source` is dead weight (a constant column) once a run is restricted
     # to one source (--sources SMPP/SS7 for a split model) - only add it
@@ -244,15 +282,21 @@ def build_feature_matrix(
         embedding_cols = [c for c in df.columns if c.startswith("emb_")]
         pca_pipeline = embedding_pca_pipeline(n_embedding_components)
         pca_pipeline.fit(df.loc[train_mask, embedding_cols].to_numpy(dtype=np.float64))
-        embeddings_reduced = pca_pipeline.transform(df[embedding_cols].to_numpy(dtype=np.float64))
+        embeddings_reduced = pca_pipeline.transform(
+            df[embedding_cols].to_numpy(dtype=np.float64)
+        )
         embedding_names = [f"emb_pca_{i}" for i in range(n_embedding_components)]
-        pieces.append(pd.DataFrame(embeddings_reduced, columns=embedding_names, index=df.index))
+        pieces.append(
+            pd.DataFrame(embeddings_reduced, columns=embedding_names, index=df.index)
+        )
         fitted["embedding_pca_pipeline"] = pca_pipeline
 
     if use_tfidf:
         text = df["text"].fillna("")
         vectorizer = TfidfVectorizer(
-            ngram_range=tfidf_ngram_range, max_features=tfidf_max_features, min_df=tfidf_min_df,
+            ngram_range=tfidf_ngram_range,
+            max_features=tfidf_max_features,
+            min_df=tfidf_min_df,
         )
         vectorizer.fit(text[train_mask])
         tfidf_matrix = vectorizer.transform(text).toarray()
@@ -265,14 +309,17 @@ def build_feature_matrix(
     return matrix.to_numpy(dtype=np.float64), y, matrix.columns.tolist(), fitted
 
 
-def load_labelled_messages_with_embeddings(source_dir: Path, messages_path: Path) -> pd.DataFrame:
+def load_labelled_messages_with_embeddings(
+    source_dir: Path, messages_path: Path
+) -> pd.DataFrame:
     """
     Same rule_evaluated==True filter as load_labelled_messages(), INNER
     JOINED with features/text_embeddings.py's output (emb_0..emb_{d-1}).
-    See module docstring - this is restricted to whatever the embedding
-    sample currently covers, which as of writing is under 1% of either
-    source's rule_evaluated pool. Ready for the full run, not useful as
-    the main training path today.
+    See module docstring - coverage depends on `source_dir`'s own
+    embeddings.npy: full-dataset for SS7 as of writing, still
+    sample-scale (or absent) for SMPP. The inner join silently restricts
+    to whatever's actually present - pass a single source_dir/messages_path
+    pair per source rather than assuming combined coverage.
     """
     source_dir = Path(source_dir)
     df = load_labelled_messages(messages_path)
@@ -281,7 +328,9 @@ def load_labelled_messages_with_embeddings(source_dir: Path, messages_path: Path
 
     embeddings = np.load(source_dir / "embeddings.npy")
     id_map = pd.read_parquet(source_dir / "embeddings_id_map.parquet")
-    emb_df = pd.DataFrame(embeddings, columns=[f"emb_{i}" for i in range(embeddings.shape[1])])
+    emb_df = pd.DataFrame(
+        embeddings, columns=[f"emb_{i}" for i in range(embeddings.shape[1])]
+    )
     emb_df["message_key"] = id_map["message_key"].to_numpy()
 
     return df.merge(emb_df, on="message_key", how="inner").reset_index(drop=True)

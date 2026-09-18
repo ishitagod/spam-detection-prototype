@@ -1,0 +1,205 @@
+"""Protocol-aware SMS decoding shared by training and live inference."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+GSM = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\x1bÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
+EXT = {
+    0x14: "^",
+    0x28: "{",
+    0x29: "}",
+    0x2F: "\\",
+    0x3C: "[",
+    0x3D: "~",
+    0x3E: "]",
+    0x40: "|",
+    0x65: "€",
+}
+
+
+@dataclass(frozen=True)
+class DecodeResult:
+    text: str | None
+    status: str
+    codec: str
+    had_udh: bool = False
+    multipart_reference: int | None = None
+    part_number: int | None = None
+    total_parts: int | None = None
+    replacement_count: int = 0
+
+
+def _udh(data: bytes) -> tuple[bytes, dict[str, int]]:
+    if not data or data[0] + 1 > len(data):
+        return data, {}
+    end, pos, info = data[0] + 1, 1, {}
+    while pos + 2 <= end:
+        kind, size = data[pos], data[pos + 1]
+        value = data[pos + 2 : pos + 2 + size]
+        if len(value) != size:
+            return data, {}
+        if kind == 0 and size == 3:
+            info = {"ref": value[0], "total": value[1], "part": value[2]}
+        elif kind == 8 and size == 4:
+            info = {
+                "ref": int.from_bytes(value[:2], "big"),
+                "total": value[2],
+                "part": value[3],
+            }
+        pos += size + 2
+    return (data[end:], info) if info else (data, {})
+
+
+def _gsm_octets(data: bytes) -> tuple[str, int]:
+    out, bad, escaped = [], 0, False
+    for value in data:
+        if escaped:
+            char = EXT.get(value)
+            out.append(char or "?")
+            bad += char is None
+            escaped = False
+        elif value == 0x1B:
+            escaped = True
+        elif value < len(GSM):
+            out.append(GSM[value])
+        else:
+            out.append("?")
+            bad += 1
+    if escaped:
+        out.append("?")
+        bad += 1
+    return "".join(out), bad
+
+
+def _gsm_packed(data: bytes, fill_bits: int = 0) -> tuple[str, int]:
+    bits = int.from_bytes(data, "little") >> fill_bits
+    count = max(0, (len(data) * 8 - fill_bits) // 7)
+    return _gsm_octets(bytes((bits >> (7 * i)) & 0x7F for i in range(count)))
+
+
+def _utf16(data: bytes) -> tuple[str, int]:
+    while data.endswith(b"\x00\x00"):
+        data = data[:-2]
+    if len(data) % 2:
+        return "?", 1
+    if data.startswith(b"\xff\xfe"):
+        data, encoding = data[2:], "utf-16-le"
+    elif data.startswith(b"\xfe\xff"):
+        data, encoding = data[2:], "utf-16-be"
+    else:
+        encoding = "utf-16-be"
+    text = data.decode(encoding, errors="replace")
+    return text, text.count("�")
+
+
+def decode_sms(
+    protocol: str, content: str | None, dcs: int | str | None
+) -> DecodeResult:
+    if not content:
+        return DecodeResult(None, "EMPTY", "NONE")
+    try:
+        data = bytes.fromhex(content)
+        dcs_number = int(dcs)
+    except (ValueError, TypeError):
+        return DecodeResult(None, "INVALID_INPUT", "NONE")
+    body, info = _udh(data)
+    had_udh = bool(info)
+    if (
+        protocol.lower() == "ss7"
+        and int(dcs) == 4
+        and b"application/vnd.wap." in data.lower()
+    ):
+        return DecodeResult(
+            None,
+            "BINARY_CONTENT",
+            "WAP_MMS",
+            had_udh,
+            info.get("ref"),
+            info.get("part"),
+            info.get("total"),
+        )
+    try:
+        if protocol.lower() == "smpp":
+            if dcs_number in {0, -11, 4, -15}:
+                text, bad, codec = *_gsm_octets(body), "GSM0338"
+            elif dcs_number == 1:
+                text, codec = (
+                    body.decode("ascii", "replace").replace("\x00", ""),
+                    "ASCII",
+                )
+                bad = text.count("�")
+            elif dcs_number in {8, 24, 25}:
+                text, bad, codec = *_utf16(body), "UTF16"
+            elif dcs_number == 3:
+                text, bad, codec = (
+                    body.decode("latin-1").replace("\x00", ""),
+                    0,
+                    "LATIN1",
+                )
+            else:
+                return DecodeResult(
+                    None,
+                    "UNSUPPORTED_DCS",
+                    "BINARY",
+                    had_udh,
+                    info.get("ref"),
+                    info.get("part"),
+                    info.get("total"),
+                )
+        elif protocol.lower() == "ss7":
+            if dcs_number == 246:
+                return DecodeResult(
+                    None,
+                    "BINARY_CONTENT",
+                    "BINARY",
+                    had_udh,
+                    info.get("ref"),
+                    info.get("part"),
+                    info.get("total"),
+                )
+            if dcs_number in {0, 1, 3, 12, 16, 17, 18, 192, 241, 242, 245}:
+                fill = (7 - (((data[0] + 1) * 8) % 7)) % 7 if had_udh else 0
+                text, bad, codec = *_gsm_packed(body, fill), "GSM7_PACKED"
+            elif dcs_number in {4, 26, 244}:
+                text, codec = (
+                    body.decode("ascii", "replace").replace("\x00", ""),
+                    "ASCII",
+                )
+                bad = text.count("�")
+            elif dcs_number in {8, 25}:
+                text, bad, codec = *_utf16(body), "UTF16"
+            else:
+                return DecodeResult(
+                    None,
+                    "UNSUPPORTED_DCS",
+                    "BINARY",
+                    had_udh,
+                    info.get("ref"),
+                    info.get("part"),
+                    info.get("total"),
+                )
+        else:
+            return DecodeResult(None, "UNSUPPORTED_PROTOCOL", "NONE")
+    except (UnicodeError, ValueError):
+        return DecodeResult(
+            None,
+            "DECODE_ERROR",
+            "NONE",
+            had_udh,
+            info.get("ref"),
+            info.get("part"),
+            info.get("total"),
+        )
+    # PostgreSQL text and downstream NLP cannot accept embedded NUL controls.
+    text = text.replace("\x00", "")
+    return DecodeResult(
+        text,
+        "SUCCESS",
+        codec,
+        had_udh,
+        info.get("ref"),
+        info.get("part"),
+        info.get("total"),
+        bad,
+    )

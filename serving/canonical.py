@@ -64,10 +64,12 @@ def _hex_to_bytes(content: str) -> str:
 
 def map_ss7_transaction(txn: SS7Transaction) -> CanonicalRow:
     """SS7 stores `dcs` unsigned already (no sign-correction needed,
-    unlike SMPP - see ingestion/dcs_codecs.py's module docstring) and
-    applies no UDH-stripping (SS7 signals concatenation via
-    sarref/msg_part/msg_parts instead - see ingestion/ss7.py's module
-    docstring), both handled by reusing ss7._decode_row unchanged."""
+    unlike SMPP - see ingestion/dcs_codecs.py's module docstring). SS7
+    signals MULTIPART concatenation via sarref/msg_part/msg_parts, not UDH
+    - but content bytes can still carry a UDH for other reasons (e.g.
+    Application Port Addressing on binary-data-class DCS values - see
+    ingestion/ss7.py's module docstring), so ss7._decode_row still detects
+    and strips a UDH when present, same as SMPP."""
     dcs = int(txn.dcs) if txn.dcs not in (None, "") else None
     decoded = _ss7_decode_row(_hex_to_bytes(txn.content), dcs)
     text = decoded["text"] or ""

@@ -4,6 +4,7 @@ Top-level orchestrator, chaining every stage that actually exists today:
     ingestion.run_ingest.run_ingestion()          raw CDRs -> canonical features + labels
     features.message_reassembly.run_reassembly()  per-part rows -> one row per logical message
     features.behavioral.run_behavioral()          reassembled messages -> + sender-behavioral columns
+    features.content_flags.run_content_flags()    + text-only content-rule flag columns
     features.text_embeddings.run_text_embeddings()  reassembled messages -> MiniLM embeddings + id map
     features.faiss_index.run_faiss_near_dup()      embeddings -> near-dup match features (1hr/24hr)
 
@@ -17,11 +18,12 @@ shape wrong.
 Usage:
     python pipeline.py
     python pipeline.py --raw_dir data/raw --out_dir data/processed
-    python pipeline.py --skip_embeddings   # stages 1-3 only, both sources, one command
+    python pipeline.py --skip_embeddings   # stages 1-3b only, both sources, one command
 
 --skip_embeddings: for exactly one real recurring need - regenerating
-messages_with_behavioral.csv after a labels/rule_labels.py or
-features/behavioral.py change, WITHOUT re-doing stages 4-5. Embeddings
+messages_with_behavioral.csv after a labels/rule_labels.py, features/
+behavioral.py, or features/content_flags.py change, WITHOUT re-doing
+stages 4-5. Embeddings
 (a full-corpus encode - hours-scale, see docs/experiments/anomaly.md's
 "Current scale") and FAISS near-dup search are completely independent of
 the label/behavioral logic - re-running them for a labeling fix wastes
@@ -33,6 +35,7 @@ import argparse
 from pathlib import Path
 
 from features.behavioral import run_behavioral
+from features.content_flags import run_content_flags
 from features.faiss_index import run_faiss_near_dup
 from features.message_reassembly import run_reassembly
 from features.text_embeddings import run_text_embeddings
@@ -67,8 +70,20 @@ def run(raw_dir: Path, out_dir: Path, skip_embeddings: bool = False) -> None:
             out_path=out_dir / source / "messages_with_behavioral.csv",
         )
 
+    print("\n=== Stage 3b: content-rule flags ===")
+    # Text-only (no behavioral/history dependency) - sequenced after Stage 3
+    # purely so every downstream stage reads one file, same discipline as
+    # Stage 5's dependency note below. In-place enrichment of the same
+    # messages_with_behavioral.csv Stage 3 just wrote.
+    for source in sorted(manifest["source"].unique()):
+        print(f"\n-- {source} --")
+        run_content_flags(
+            messages_path=out_dir / source / "messages_with_behavioral.csv",
+            out_path=out_dir / source / "messages_with_behavioral.csv",
+        )
+
     if skip_embeddings:
-        print("\n--skip_embeddings set: stopping after Stage 3 (stages 4-5 skipped).")
+        print("\n--skip_embeddings set: stopping after Stage 3b (stages 4-5 skipped).")
         return
 
     print("\n=== Stage 4: text embeddings ===")

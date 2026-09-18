@@ -48,7 +48,7 @@ import mlflow
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
+from config.settings import MLFLOW_TRACKING_URI
 
 # (combined_experiment_name, metric_prefix, label) - metric_prefix
 # matches what each train.py actually passes to

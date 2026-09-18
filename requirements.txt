@@ -17,6 +17,8 @@ httpx  # serving/app.py test client (fastapi.testclient)
 fastapi==0.141.1  # serving/app.py
 uvicorn==0.52.4    # serving/app.py - run with `uvicorn serving.app:app`
 feast==0.66.0
+redis==5.2.1       # feature_repo/feature_store.yaml online_store: redis (docker-compose.yml)
+psycopg2-binary==2.9.10  # Postgres driver - Feast's sql registry + MLflow's Postgres tracking store
 # dill version pin is required, not cosmetic: feast declares dill~=0.3.0
 # and pip will warn about this pin conflicting with that, but the
 # installed 0.3.9 cannot serialize the on-demand feature view UDF in

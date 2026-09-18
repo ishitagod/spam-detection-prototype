@@ -6,6 +6,21 @@ ingestion/smpp.py) - those are spec, not config, and externalizing them
 would just add indirection around a value that will never change.
 """
 
+import os
+
+# --- MLflow tracking store -----------------------------------------------
+# Single source of truth - every train.py/registry/serving module that
+# calls mlflow.set_tracking_uri() imports this instead of hardcoding
+# "sqlite:///mlflow.db" separately (that was duplicated across ~8 files).
+# Points at docker-compose.yml's postgres service by default (the "mlflow"
+# database created by scripts/postgres_init/01_create_mlflow_db.sql,
+# alongside Feast's own feast_registry database in the same instance) -
+# override via env var for a non-docker-compose Postgres or CI.
+MLFLOW_TRACKING_URI = os.environ.get(
+    "MLFLOW_TRACKING_URI",
+    "postgresql+psycopg2://spam_detection:spam_detection@localhost:5432/mlflow",
+)
+
 # --- SMPP ingestion (ingestion/smpp.py) ---------------------------------
 SMPP_SUBMIT_SM_OPERATION = 4  # keep only op-4 (submit_sm) rows - see
 # ingestion/smpp.py clean_smpp_raw()
@@ -27,6 +42,35 @@ BEHAVIORAL_SHORT_WINDOW = (
 # sender_recipient_diversity_ratio_5min, sender_velocity_zscore_5min
 BEHAVIORAL_LONG_WINDOW = "1h"  # sender_msgs_last_1hr, sender_unique_destinations_1hr,
 # sender_repeat_content_ratio_1hr, sender_recipient_diversity_ratio_1hr
+
+# --- Content-rule flags (features/content_flags.py) ---------------------
+# Named regex registry - one binary column per entry, computed from `text`
+# alone (no behavioral/history dependency, unlike features/behavioral.py).
+# These are ML FEATURES, not Rule Engine gates - the upstream telecom Rule
+# Engine (labels/rule_labels.py's SW_/SR_ prefixes) has zero content/regex
+# matching of its own, confirmed against real data this session; these
+# flags are this codebase's own, independent, second signal source, fed to
+# BOTH LightGBM and Isolation Forest as base features (see the architecture
+# plan's Section 1 - cheap, deterministic, always-available, same category
+# as behavioral/near-dup, not corpus-fit like TF-IDF/embeddings).
+#
+# English-language keyword lists are a starting point, not a calibrated or
+# complete set - this system scores multilingual text (paraphrase-
+# multilingual-MiniLM-L12-v2 is the embedding model precisely because
+# content isn't all English) - real per-language corpus mining is future
+# work, flagged here rather than silently assumed complete.
+CONTENT_FLAG_PATTERNS = {
+    "has_url": r"https?://|www\.",
+    "has_shortlink": r"\b(?:bit\.ly|tinyurl\.com|t\.co|goo\.gl|is\.gd|ow\.ly)\b",
+    "has_phone_number": r"\b(?:\+?\d[\d\-\s]{8,}\d)\b",
+    "has_currency_symbol": r"[$€£₹]|\b(?:usd|inr|eur|gbp)\b",
+    "has_urgency_keyword": r"\b(?:urgent|immediately|act now|expires?|last chance|final notice|limited time)\b",
+    "has_prize_keyword": r"\b(?:won|winner|prize|reward|claim now|congratulations|selected)\b",
+    "has_gambling_keyword": r"\b(?:casino|betting|lottery|jackpot|bet now|poker)\b",
+    "has_loan_keyword": r"\b(?:loan|credit approved|pre-?approved|cash advance|instant loan)\b",
+    "has_otp_keyword": r"\b(?:otp|one[- ]time password|verification code|security code)\b",
+    "has_excessive_punctuation": r"[!?]{2,}",
+}
 
 # --- Text embeddings (features/text_embeddings.py) -----------------------
 # paraphrase-multilingual-MiniLM-L12-v2 was picked
@@ -67,6 +111,71 @@ FAISS_CHUNK_SIZE = 500_000
 # per call.
 FAISS_QUERY_BATCH_SIZE = 10_000
 
+# --- Serving-time FAISS index (serving/anomaly_scoring.py) --------------
+# The batch/training path above (compute_near_dup_features_chunked) stays
+# exact IndexFlatIP - each chunk is already bounded to FAISS_CHUNK_SIZE +
+# a window buffer, so brute-force is fine there (see
+# features/faiss_index.py::build_index()'s docstring). Serving is
+# different: it holds the ENTIRE per-source historical corpus in ONE
+# index, queried once per live request - SS7's full corpus is now
+# 2,742,301 vectors, a real memory constraint on the serving host that
+# ruled out both exact IndexFlatIP (raw 384*4=1536 bytes/vector) and
+# HNSW (~1.5-2x that for graph overhead). IVF-PQ trades some recall for
+# real compression (m bytes/vector) - accepted specifically because the
+# constraint here is memory, not primarily latency or accuracy, but the
+# params below are chosen to keep latency and recall reasonable too, not
+# to chase maximum compression alone.
+FAISS_SERVING_INDEX_TYPE = "ivfpq"  # vs "flat" (exact, batch/training default)
+
+# nlist: number of k-means coarse-quantizer cells. Sized off FAISS's own
+# published guidance (roughly 4*sqrt(N) to 16*sqrt(N) for N in the low
+# millions) - sqrt(2,742,301) =~ 1655, so 4096 sits inside that range,
+# toward the lower end (favors faster/cheaper training and search over
+# maximum partition granularity). NOT tuned/validated against this
+# corpus's real recall yet - a starting point, same spirit as
+# FAISS_NEAR_DUP_THRESHOLD's own "not calibrated" starting-point comment.
+FAISS_IVFPQ_NLIST = 4096
+
+# nprobe: how many of those nlist cells get searched per query - the real
+# latency/recall dial (higher = slower + closer to exact, lower = faster
+# + more approximate). 32 of 4096 cells (~0.8%) is a deliberately
+# middle-of-the-road starting point, not tuned - raise this first (before
+# touching nlist/m/nbits) if a real recall measurement comes back too low,
+# since it's the cheapest lever to turn without rebuilding the index.
+FAISS_IVFPQ_NPROBE = 32
+
+# m: number of sub-vector splits for product quantization - must evenly
+# divide the embedding dimension (384). CHECKED empirically (synthetic
+# near-dup benchmark: clustered vectors calibrated to this project's own
+# real "near-dup" similarity range, ~0.88-0.95 within-cluster - see the
+# session that added this comment for the exact test), not just a rule-
+# of-thumb guess: m=48 (8 dims/sub-vector) LOST a true near-dup match
+# exact IndexFlatIP search found (quantized self-similarity dropped to
+# 0.915, below FAISS_NEAR_DUP_THRESHOLD=0.92 - a real recall regression,
+# not a rounding artifact). m=64 (6 dims/sub-vector) recovered EXACT
+# recall parity with flat search in that same test, at 64 bytes/vector
+# vs 384*4=1536 bytes raw = 24x compression (vs m=48's 32x) - a small
+# compression cost for closing a real accuracy gap. Still only a
+# synthetic-benchmark validation, not measured against this project's
+# actual corpus - re-verify against real embeddings once that's
+# practical, don't assume this transfers unchanged.
+FAISS_IVFPQ_M = 64
+
+# nbits: bits per sub-quantizer codebook - 8 is FAISS's standard default
+# (256 centroids/sub-vector); needs roughly >= 256 real training points
+# per nlist cell to fit well, comfortably true at this corpus size.
+FAISS_IVFPQ_NBITS = 8
+
+# Coarse-quantizer + PQ codebook training is a one-time cost per process
+# (the index is built once and cached - see
+# serving/anomaly_scoring.py::_load_corpus()), but training on the FULL
+# 2.74M-vector corpus is unnecessary - FAISS's own guidance is that
+# ~30-256x nlist training points is enough to shape cell/codebook
+# boundaries well. Capped here to bound index-build time; add() still
+# indexes every real vector regardless of how many were used to train,
+# so this does NOT reduce how much of the corpus is actually searchable.
+FAISS_IVFPQ_TRAIN_SAMPLE_SIZE = 500_000
+
 # Hard cap on near-dup candidates returned PER QUERY MESSAGE -
 # compute_near_dup_features() uses a fixed-K faiss.Index.search() (top-K
 # by similarity), then threshold-filters the K results, instead of
@@ -91,3 +200,19 @@ FAISS_QUERY_BATCH_SIZE = 10_000
 # still bounding compute/memory to a small, fixed fraction of what a
 # true unbounded blowup could reach.
 FAISS_MAX_MATCHES_PER_QUERY = 100_000
+
+# --- Retraining automation (scripts/check_retrain_trigger.py) -----------
+# Not tuned against a real target - starting points, same "documented, not
+# proven" status as FAISS_NEAR_DUP_THRESHOLD/N_EMBEDDING_COMPONENTS above.
+#
+# RETRAIN_MIN_NEW_ROWS: enough new rule_evaluated volume since the last
+# full LightGBM/Isolation Forest retrain (compare_versions.py's promotion
+# gate) to be worth the cost of a full pipeline run + retrain + promotion
+# check - deliberately large, this is the expensive trigger.
+RETRAIN_MIN_NEW_ROWS = 50_000
+
+# DBSCAN_MIN_NEW_ANOMALY_ROWS: DBSCAN re-runs are cheap and decoupled from
+# model retraining (clusters on frozen pretrained MiniLM embeddings, needs
+# only a re-run, not a retrain) - can fire far more often than
+# RETRAIN_MIN_NEW_ROWS, so this threshold is much smaller.
+DBSCAN_MIN_NEW_ANOMALY_ROWS = 5_000

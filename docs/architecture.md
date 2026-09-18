@@ -108,6 +108,16 @@ Goal: production-grade working demo first, then iterate.
   and surfaced on the response for visibility only - see
   `docs/ml/modeling.md`'s two-score section for why neither is averaged
   into the other.
+- Stage-level logging (`serving/app.py`, `serving/scoring.py`,
+  `serving/anomaly_scoring.py`) - standard `logging` module, one
+  `logging.basicConfig` in `serving/app.py` (the process entrypoint).
+  Every `/v1/score` request logs each stage as it runs (Feast lookup,
+  rule_pattern_score/LightGBM, explain_rule_pattern/SHAP TreeExplainer,
+  anomaly_score/IsolationForest+FAISS) with per-stage timing and the
+  algorithm's output, plus a cold-cache line the first time a champion
+  model or FAISS corpus index is loaded into the process. Replaces the
+  old print()-only failure-path logging - failures now log at
+  WARNING/ERROR through the same logger instead.
 
 ## Known blockers / environment notes
 

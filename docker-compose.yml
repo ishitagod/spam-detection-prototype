@@ -1,0 +1,38 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--save", "60", "1"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Single Postgres instance, two logical databases (feast_registry created
+  # by POSTGRES_DB below, mlflow created by scripts/postgres_init/'s init
+  # script) - Feast's registry and MLflow's tracking store are unrelated
+  # schemas, no reason to run two separate Postgres containers for them.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: spam_detection
+      POSTGRES_PASSWORD: spam_detection
+      POSTGRES_DB: feast_registry
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres_init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spam_detection"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redis_data:
+  postgres_data:

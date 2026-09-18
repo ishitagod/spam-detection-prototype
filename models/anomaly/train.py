@@ -71,10 +71,10 @@ from mlflow.models import infer_signature
 from sklearn.ensemble import IsolationForest
 from sklearn.pipeline import Pipeline
 
+from config.settings import MLFLOW_TRACKING_URI
 from models.anomaly.data import build_combined_frame, build_feature_matrix, load_source_features
 from models.metrics import evaluate_overall_and_per_source, evaluate_precision_at_k
 
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
 MLFLOW_EXPERIMENT_NAME = "isolation_forest"
 
 

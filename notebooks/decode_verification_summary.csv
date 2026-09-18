@@ -1,0 +1,11 @@
+source,dcs,codec_used,n_rows,mean_printable_score,example_text
+SMPP,-15,gsm7,2754,0.9991323952134327,RM0 Setel. DO NOT SHARE THIS OTP. Your OTP is 480790. Valid for 5 mins. Contact Customer Service immediately if you didn't send a request.
+SMPP,0,gsm7,143,0.9975122491583761,lick the link in the message.
+SMPP,25,utf16,34,0.9976931949250288,"RM0 Ryt Bank: 检测到新设备绑定。从 1 Aug 2026, 11:59 PM (GMT+8) 起已启动 12 小时冷静期。"
+SMPP,8,utf16,53,0.9874213836477987,楤㨰ㄴ㔹㠴ㄲ㈠獵戺〰〠摬癲携〰〠獵扭楴⁤慴攺㈶〸〱〰〰⁤潮攠摡瑥㨲㘰㠰㈰〰〠獴慴㩅塐䥒䕄⁥牲㨰〸⁔數琺
+SS7,0,gsm7,914,0.9999442350204915,Security system to remind you: Time:2026/08/02 00:02:22 DevName:SEN303-SBNLIGHT S303S33-SBNLIGHTDOOR-Zone Bypass 
+SS7,241,gsm7,3,1.0,Alarm @ RPKB JLN SG BESI 01:00:02 02-08-2026 PUMP 02 START 
+SS7,3,gsm7(auto),1,1.0,?n001801025A05156F2000000000150000000194928100000000000015082005062600000000000000000000000000000000000000000000000000000000000000000000000802261202000000* 
+SS7,4,,236,0.0,
+SS7,4,ascii(auto),128,1.0,(T2ZKaMjKhf4w)
+SS7,8,utf16,66,1.0,"n kita, dpt jumpa.kita akn abik apa brg yg ada Dr ag.ag dealead smu"

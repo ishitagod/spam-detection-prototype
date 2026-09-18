@@ -64,9 +64,9 @@ from mlflow.models import infer_signature
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.model_selection import train_test_split
 
+from config.settings import MLFLOW_TRACKING_URI
 from models.fraud_type_classifier.data import build_feature_matrix, load_cluster_labeled_messages
 
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
 MLFLOW_EXPERIMENT_BASE_NAME = "fraud_type_classifier"
 MIN_CLASS_COUNT = 10  # starting point, not tuned - same "documented, not
 # proven" status as this project's other threshold constants

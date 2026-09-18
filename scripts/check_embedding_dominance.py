@@ -38,11 +38,11 @@ from sklearn.preprocessing import StandardScaler
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from config.settings import MLFLOW_TRACKING_URI
 from models.anomaly.data import BEHAVIORAL_COLS, COUNT_COLS, NEAR_DUP_COLS, build_feature_matrix, load_source_features
 
 DATA_DIR = REPO_ROOT / "data" / "processed"
 SOURCES = ["SMPP", "SS7"]
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
 MLFLOW_EXPERIMENT_NAME = "anomaly_score_diagnostics"
 
 

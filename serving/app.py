@@ -54,6 +54,7 @@ for every NOT_FRAUD request) and is treated as best-effort, same as
 anomaly_score below - a failure here degrades reason_codes/
 feature_contributions, it never turns a successful score into FAILURE.
 """
+import logging
 import time
 
 from fastapi import FastAPI
@@ -77,6 +78,16 @@ from serving.scoring import (
     explain_rule_pattern,
     score_rule_pattern,
 )
+
+# One basicConfig call, here rather than per-module - this is the process
+# entrypoint (uvicorn imports this module once). Stage-by-stage logs below
+# exist so a running server's terminal shows which algorithm/stage is
+# executing per request, not just print()-only failure paths (the prior
+# convention). Level is INFO by default - override via
+# `logging.getLogger("serving").setLevel(...)` or the LOG_LEVEL env var if
+# ever wired through config/settings.py.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Spam Detection Scoring API")
 
@@ -169,7 +180,9 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
     hit."""
     start = time.perf_counter()
     reference = request.transaction.reference
+    logger.info("[%s] score request received (source=%s)", reference, canonical.source)
 
+    stage_start = time.perf_counter()
     try:
         behavioral = get_sender_features(canonical.sender_id, canonical.text)
         # SS7-only, keyed on imsi not sender_id (serving/feature_lookup.py's
@@ -181,18 +194,30 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
         behavioral = {**behavioral, **get_imsi_features(canonical.imsi)}
     except Exception as e:  # Feast store missing/unreachable, etc. - a
         # real operational failure, not a modeling one.
+        logger.error("[%s] Feast behavioral lookup failed: %s", reference, e)
         return ScoreResponse(
             reference=reference, status="FAILURE",
             error_message=f"behavioral feature lookup failed: {e}",
         )
     cold_start = all(behavioral.get(c) is None for c in BEHAVIORAL_COLS)
+    logger.info(
+        "[%s] Feast lookup done in %dms (cold_start=%s)",
+        reference, int((time.perf_counter() - stage_start) * 1000), cold_start,
+    )
 
+    stage_start = time.perf_counter()
     try:
         probability, model_version, row = score_rule_pattern(canonical, behavioral)
     except (ChampionUnavailableError, ChampionUnsupportedError) as e:
+        logger.error("[%s] rule_pattern_score (LightGBM) unavailable: %s", reference, e)
         return ScoreResponse(reference=reference, status="FAILURE", error_message=str(e))
     except Exception as e:
+        logger.error("[%s] rule_pattern_score (LightGBM) failed: %s", reference, e)
         return ScoreResponse(reference=reference, status="FAILURE", error_message=f"scoring failed: {e}")
+    logger.info(
+        "[%s] rule_pattern_score (LightGBM v%s) = %.4f in %dms",
+        reference, model_version, probability, int((time.perf_counter() - stage_start) * 1000),
+    )
 
     # Empty/omitted fraud_types means "evaluate every supported type", per
     # the API spec - NOT "evaluate nothing" (see SS7ScoreRequest's
@@ -220,10 +245,16 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
                 # missing champion/explainer degrades explainability, it
                 # never turns a successful rule_pattern_score into
                 # FAILURE. Only paid for on FRAUD - see module docstring.
+                explain_start = time.perf_counter()
                 try:
                     contributions = explain_rule_pattern(canonical, row)
+                    logger.info(
+                        "[%s] explain_rule_pattern (shap.TreeExplainer) done in %dms, top feature=%s",
+                        reference, int((time.perf_counter() - explain_start) * 1000),
+                        contributions[0][0] if contributions else None,
+                    )
                 except Exception as e:
-                    print(f"reason-code explanation unavailable for {reference!r}: {e}")
+                    logger.warning("[%s] reason-code explanation unavailable: %s", reference, e)
                     contributions = []
                 reason_codes = _reason_codes(row, cold_start, contributions)
                 feature_contributions = [
@@ -252,16 +283,26 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
     # status=FAILURE; anomaly_score is surfaced for visibility, not a
     # required part of this response (see schemas.ScoreResponse's
     # anomaly_score docstring).
+    stage_start = time.perf_counter()
     try:
         anomaly_score, _, _ = score_anomaly(canonical, behavioral)
+        logger.info(
+            "[%s] anomaly_score (IsolationForest + FAISS near-dup) = %.4f in %dms",
+            reference, anomaly_score, int((time.perf_counter() - stage_start) * 1000),
+        )
     except (AnomalyChampionUnavailableError, CorpusUnavailableError) as e:
-        print(f"anomaly_score unavailable for {reference!r}: {e}")
+        logger.warning("[%s] anomaly_score unavailable: %s", reference, e)
         anomaly_score = None
     except Exception as e:
-        print(f"anomaly_score failed for {reference!r}: {e}")
+        logger.warning("[%s] anomaly_score failed: %s", reference, e)
         anomaly_score = None
 
     processing_time_ms = int((time.perf_counter() - start) * 1000)
+    logger.info(
+        "[%s] scored in %dms -> prediction=%s recommended_action=%s",
+        reference, processing_time_ms,
+        fraud_results[0].prediction if fraud_results else None, recommended_action,
+    )
 
     return ScoreResponse(
         reference=reference,

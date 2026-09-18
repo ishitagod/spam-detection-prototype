@@ -136,6 +136,15 @@ failure to explain degrades reason_codes/feature_contributions, it never
 turns a successful rule_pattern_score into a FAILURE response (same
 best-effort convention as anomaly_score).
 
+Not yet built:
+1. A full (non-sampled) `text_embeddings.py` run for **SMPP** - SS7's is
+   done (GPU, full `(2,742,301, 384)` corpus, confirmed against
+   `data/processed/SS7/embeddings.npy`'s shape); SMPP still trains
+   FAISS/Isolation Forest on the sampled subset (`--sample_n`); see
+   `docs/architecture.md`'s "Known blockers" section for the real cost
+   (~21hr full run) driving that choice. The SS7-side full corpus also
+   unblocks `models/rule_pattern/train.py --with_embeddings --sources SS7`
+   (see `docs/experiments/rule_pattern.md`) - not yet retrained against it.
 Done since the above was written: the full (non-sampled)
 `text_embeddings.py` run - both FAISS and Isolation Forest now train on
 the full corpus, not the `--sample_n` subset. See

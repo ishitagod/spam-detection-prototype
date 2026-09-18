@@ -37,6 +37,22 @@ refreshed corpus (see scripts/refresh_feast.py for the equivalent
 staleness caveat already accepted for behavioral features); revisit the
 refresh cadence, not this module, if that becomes the bottleneck.
 
+INDEX TYPE - APPROXIMATE (IVF-PQ), NOT EXACT: _load_corpus() builds its
+FAISS index via features/faiss_index.py::build_index(index_type=
+FAISS_SERVING_INDEX_TYPE), which defaults to "ivfpq", NOT the exact
+IndexFlatIP the batch/training path (features/faiss_index.py) still uses.
+Deliberate, not an oversight: this index holds a source's ENTIRE
+historical corpus (SS7: full 2,742,301 vectors) in one process-lifetime
+object, queried once per live request - a genuinely different scale/
+latency profile than the batch path's bounded per-chunk indices. IVF-PQ
+was chosen specifically for MEMORY (m bytes/vector instead of raw
+dim*4), accepting some recall loss as the tradeoff - see
+config/settings.py's FAISS_IVFPQ_* comments for the full reasoning and
+current (unbenchmarked) parameter choices. This means live near_dup_*
+features are approximate, on top of the staleness caveat above - two
+independent, disclosed sources of drift from the batch path's exact
+values, not one.
+
 FEATURE PARITY WITH TRAINING: models/anomaly/data.py's build_combined_frame()
 is reused directly (unlike serving/scoring.py's rule-pattern path, which
 reimplements its own base-frame construction because that helper is
@@ -48,6 +64,8 @@ would otherwise silently drop whichever source_* dummy column the
 already-fitted preprocessor still expects (see that parameter's
 docstring).
 """
+import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,12 +74,23 @@ import mlflow.sklearn
 import numpy as np
 import pandas as pd
 
+from config.settings import (
+    FAISS_IVFPQ_M,
+    FAISS_IVFPQ_NBITS,
+    FAISS_IVFPQ_NLIST,
+    FAISS_IVFPQ_NPROBE,
+    FAISS_IVFPQ_TRAIN_SAMPLE_SIZE,
+    FAISS_SERVING_INDEX_TYPE,
+)
+from features.content_flags import compute_content_flags
 from features.faiss_index import build_index, compute_near_dup_features_for_live_query
 from models.anomaly.data import (
     BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL, build_combined_frame,
 )
 from models.registry import MLFLOW_TRACKING_URI
 from serving.canonical import CanonicalRow
+
+logger = logging.getLogger(__name__)
 
 ANOMALY_MODEL_NAME = "anomaly"  # base name - actual registered model is
 # source-suffixed (anomaly_SMPP / anomaly_SS7), see module docstring
@@ -125,8 +154,13 @@ def _load_champion(source: str) -> _LoadedAnomalyModel:
             f"--registered_name {registered_name} --metric_key overall_pr_auc` to promote one."
         ) from e
 
+    load_start = time.perf_counter()
     pipeline = mlflow.sklearn.load_model(f"models:/{registered_name}@{CHAMPION_ALIAS}")
     _cached_model[source] = _LoadedAnomalyModel(pipeline=pipeline, version=str(version.version))
+    logger.info(
+        "loaded anomaly_score champion v%s (IsolationForest) for source=%s in %dms",
+        version.version, source, int((time.perf_counter() - load_start) * 1000),
+    )
     return _cached_model[source]
 
 
@@ -144,6 +178,8 @@ def _load_corpus(source: str, data_dir: Path) -> _LoadedCorpus:
             "run features/text_embeddings.py for it first."
         )
 
+    load_start = time.perf_counter()
+    logger.info("loading corpus + building FAISS %s index for source=%s (cold cache)", FAISS_SERVING_INDEX_TYPE, source)
     embeddings = np.load(emb_path)
     id_map = pd.read_parquet(id_map_path)
 
@@ -158,12 +194,31 @@ def _load_corpus(source: str, data_dir: Path) -> _LoadedCorpus:
     messages["message_key"] = messages["source"] + "|" + messages["record_id"]
     id_map = id_map.merge(messages[["message_key", "originator"]], on="message_key", how="left")
 
-    index = build_index(embeddings)
+    # index_type=FAISS_SERVING_INDEX_TYPE ("ivfpq" by default) - a
+    # real per-source corpus here can be millions of vectors (SS7: full
+    # 2,742,301), held once per process and queried per live request, a
+    # genuinely different scale/latency profile than the batch/training
+    # path's bounded chunks (see build_index()'s docstring and
+    # config/settings.py's FAISS_IVFPQ_* comments for the memory/latency/
+    # accuracy tradeoff this accepts).
+    index = build_index(
+        embeddings,
+        index_type=FAISS_SERVING_INDEX_TYPE,
+        nlist=FAISS_IVFPQ_NLIST,
+        nprobe=FAISS_IVFPQ_NPROBE,
+        m=FAISS_IVFPQ_M,
+        nbits=FAISS_IVFPQ_NBITS,
+        train_sample_size=FAISS_IVFPQ_TRAIN_SAMPLE_SIZE,
+    )
     timestamps = pd.to_datetime(id_map["timestamp"]).to_numpy()
     originators = id_map["originator"].astype(str).to_numpy()
 
     loaded = _LoadedCorpus(index=index, timestamps=timestamps, originators=originators)
     _cached_corpus[source] = loaded
+    logger.info(
+        "built FAISS %s index for source=%s over %d vectors in %dms",
+        FAISS_SERVING_INDEX_TYPE, source, len(embeddings), int((time.perf_counter() - load_start) * 1000),
+    )
     return loaded
 
 
@@ -209,6 +264,14 @@ def build_anomaly_row(
     row[SENDER_VELOCITY_ZSCORE_COL] = velocity_value if velocity_value is not None else np.nan
     row.update(near_dup_features)
     row["source"] = canonical.source
+    # Content-rule flags (features/content_flags.py): required by
+    # build_combined_frame() below (CONTENT_FLAG_COLS is part of its
+    # other_cols) - computed inline here, same registry
+    # (config.settings.CONTENT_FLAG_PATTERNS) training used, same as
+    # serving/scoring.py's identical inline computation.
+    flags = compute_content_flags(pd.Series([canonical.text or ""])).iloc[0]
+    for name, value in flags.items():
+        row[name] = int(value)
     for i, value in enumerate(embedding.reshape(-1)):
         row[f"emb_{i}"] = float(value)
     return row

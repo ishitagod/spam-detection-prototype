@@ -11,6 +11,18 @@ three distinct "rule" things in this codebase - don't conflate them:
   2. this module (label derivation from #1's output)
   3. models/rule_pattern/ (the LightGBM model trained to approximate #1)
 
+A FOURTH, genuinely independent label source lives at the bottom of this
+module (content_flagged()/is_content_evaluated()): the upstream telecom
+rule engine (#1 above) has ZERO content/regex matching of its own
+(confirmed against real op-4 data) - features/content_flags.py's static
+regex flags are this codebase's OWN label source, not a restatement of #1.
+Kept in its own label_source ("content_static_rules") and NEVER silently
+merged with rule_flagged ("telecom_rule_engine") - see those functions'
+docstrings for why, and the architecture plan's Section 6 for the
+tautology-ablation this separation unblocks (training with content flags
+as BOTH feature and label source would just reconstruct the labeling
+formula if the two were conflated).
+
 Rows where decision/rule/fraud_type are NULL/empty = the rule engine did
 NOT flag them. This is exactly the pool the unsupervised layer
 (Isolation Forest + FAISS near-duplicate) needs to work on - it's the only
@@ -20,6 +32,13 @@ the rules already caught is, by definition, a KNOWN pattern.
 import pandas as pd
 
 from config.settings import WHITELIST_RULE_PREFIX
+from models.anomaly.data import CONTENT_FLAG_COLS
+
+# label_source column values - see content_flagged()/is_content_evaluated()
+# below for why these are never silently merged into rule_flagged/
+# is_rule_evaluated()'s telecom-derived labels.
+LABEL_SOURCE_TELECOM_RULE_ENGINE = "telecom_rule_engine"
+LABEL_SOURCE_CONTENT_STATIC_RULES = "content_static_rules"
 
 
 def build_rule_labels(label_source_df: pd.DataFrame, fraud_type_col="fraud_type") -> pd.Series:
@@ -109,3 +128,78 @@ def is_rule_evaluated(label_source_df: pd.DataFrame) -> pd.Series:
         )
         evaluated &= ~whitelist_only
     return evaluated
+
+
+# --- content-static-rules label source (see module docstring's "FOURTH
+# rule thing" note) -------------------------------------------------------
+#
+# DIFFERENT INPUT SHAPE from build_rule_labels()/is_rule_evaluated() above:
+# those operate on label_source_df, the raw per-source ingestion frame
+# (decision/rule/fraud_type - present at ingestion time, before
+# reassembly). The functions below operate on messages_with_behavioral.csv
+# AFTER features/content_flags.py's Stage 3b has run (CONTENT_FLAG_COLS +
+# text_decode_failed present) - a genuinely later pipeline stage, since
+# content flags need reassembled `text`, which doesn't exist yet at
+# ingestion time. Callers must pass the right frame to the right function.
+
+# High-confidence flag COMBINATIONS that count as "content-rule flagged" -
+# a single common flag alone (e.g. has_url) is too weak/noisy on its own
+# (real messages link things routinely); these combinations were picked as
+# a stronger signal, same "starting point, not calibrated" status as
+# config/settings.py's CONTENT_FLAG_PATTERNS regex list itself - revisit
+# once real precision/recall against confirmed spam is measured.
+CONTENT_FLAG_HIGH_CONFIDENCE_COMBINATIONS = [
+    ["has_gambling_keyword"],
+    ["has_otp_keyword", "has_urgency_keyword"],
+    ["has_url", "has_urgency_keyword"],
+    ["has_url", "has_prize_keyword"],
+    ["has_loan_keyword", "has_urgency_keyword"],
+]
+
+
+def is_content_evaluated(messages_df: pd.DataFrame) -> pd.Series:
+    """
+    True wherever features/content_flags.py's compute_content_flags()
+    actually ran on real, decodable text - always True in practice except
+    text_decode_failed rows (undecodable text still gets flag columns, all
+    0, via compute_content_flags()'s NaN-safe fillna("") - but "no flags
+    fired because there was no real content to check" is not the same
+    claim as "checked and found nothing", the same is_rule_evaluated()
+    vs rule_flagged distinction this module already draws for the telecom
+    label source above.
+    """
+    missing = [c for c in CONTENT_FLAG_COLS if c not in messages_df.columns]
+    if missing:
+        raise ValueError(
+            f"messages_df is missing content-flag column(s): {missing} - "
+            "run features/content_flags.py (pipeline.py Stage 3b) first"
+        )
+    if "text_decode_failed" in messages_df.columns:
+        return ~messages_df["text_decode_failed"].astype(bool)
+    return pd.Series(True, index=messages_df.index)
+
+
+def content_flagged(messages_df: pd.DataFrame) -> pd.Series:
+    """
+    True where CONTENT_FLAG_HIGH_CONFIDENCE_COMBINATIONS' set of flag
+    combinations fires (any one combination, ALL of its flags true) - a
+    SECOND, INDEPENDENT label source from rule_flagged (see module
+    docstring). Never merged with rule_flagged into one column - a
+    training pool that wants to combine them must pass an explicit
+    `label_sources` list (see architecture plan Section 6) so it's always
+    clear which rows came from which source, and combined use stays
+    opt-in rather than the default.
+    """
+    missing = [c for c in CONTENT_FLAG_COLS if c not in messages_df.columns]
+    if missing:
+        raise ValueError(
+            f"messages_df is missing content-flag column(s): {missing} - "
+            "run features/content_flags.py (pipeline.py Stage 3b) first"
+        )
+    flagged = pd.Series(False, index=messages_df.index)
+    for combination in CONTENT_FLAG_HIGH_CONFIDENCE_COMBINATIONS:
+        combo_hit = pd.Series(True, index=messages_df.index)
+        for col in combination:
+            combo_hit &= messages_df[col].astype(bool)
+        flagged |= combo_hit
+    return flagged

@@ -8,14 +8,16 @@
 
 ## Project
 
-Prototype SMS fraud detector using real SMPP and SS7 CDRs.
+Production SMS fraud detection system using real SMPP and SS7 CDRs.
 
 Pipeline:
 
-SMPP/SS7 → ingestion → canonical schema → reassembly → behavioral features
+SMPP/SS7 → Kafka ingestion → canonical schema → reassembly → behavioral features
 → text embeddings → FAISS near-dup → ML models → FastAPI
 
-Goal: production-grade working demo first, then iterate.
+Goal: production-grade real-time fraud detection — streaming ingestion,
+low-latency feature serving, and continuous (not scheduled-batch) campaign
+discovery, hardened incrementally from the current working baseline.
 
 ## Architecture rules
 
@@ -32,6 +34,12 @@ Goal: production-grade working demo first, then iterate.
   `scripts/check_source_split_justified.py` reports both the shared model's per-source PR-AUC gap
   and, once split runs exist, whether each source-specific model actually beats the shared model's
   slice of it.
+- Real-time campaign discovery is a production target, not yet complete: DBSCAN clustering
+  (`models/anomaly/cluster_discovery.py`) currently runs as a scheduled batch job. Production
+  iteration moves discovery onto the Kafka-fed stream (see Feature store) so new campaign shapes
+  surface continuously instead of on a fixed cadence. Matching a message against an
+  *already-fingerprinted* campaign is already real-time per message today — don't conflate that
+  with brand-new-campaign discovery, which is the piece still migrating off batch.
 - Features must be point-in-time valid.
 - Rule-resolved traffic (`rule_evaluated == True`) is not scored at real-time inference.
 - Anomaly detection still trains on the full traffic stream.
@@ -71,10 +79,17 @@ Goal: production-grade working demo first, then iterate.
 
 ## Feature store
 
-- Feast with local SQLite registry/online store.
-- Behavioral sender features are batch-refreshed.
-- No Kafka or Redis for this prototype.
-- Online freshness depends on refresh cadence.
+- Feast with a **Postgres** SQL registry and a **Redis** online store
+  (`feature_repo/feature_store.yaml`, `docker-compose.yml`) — local SQLite
+  registry/online store is retired, not the current setup.
+- Behavioral sender features are batch-refreshed today. Production target:
+  Kafka-fed streaming refresh, so volumetric/social-graph features and
+  campaign discovery (see Architecture rules) move off a fixed cadence —
+  not yet wired in.
+- Online freshness depends on refresh cadence until streaming lands.
+- MLflow's tracking store also runs on the same Postgres instance
+  (separate `mlflow` database, see `config/settings.py::
+  MLFLOW_TRACKING_URI`, `scripts/postgres_init/`) — not SQLite.
 - See `feature_repo/` and `features/behavioral_snapshot.py`.
 
 ## Stack
@@ -82,10 +97,16 @@ Goal: production-grade working demo first, then iterate.
 - Python
 - FastAPI
 - Feast
+- Postgres (Feast registry + MLflow tracking store)
+- Redis (Feast online store)
+- Kafka — production target for streaming ingestion and real-time
+  campaign discovery, not yet integrated
 - LightGBM
 - scikit-learn
 - sentence-transformers / MiniLM
-- FAISS
+- FAISS (exact `IndexFlatIP` for batch/training; IVF-PQ for serving-time
+  memory efficiency at multi-million-vector scale — see
+  `config/settings.py::FAISS_SERVING_INDEX_TYPE`)
 - MLflow
 - LIME + SHAP
 - pandas / numpy
@@ -146,8 +167,28 @@ Completed:
   top-anomaly `anomaly_score` output into hand-labelable fraud-type
   clusters. See `docs/experiments/anomaly_clustering.md` for the full
   step-by-step.
+- Production infra migration off local SQLite: Feast registry moved to
+  **Postgres**, Feast online store moved to **Redis**, MLflow tracking
+  store moved onto the same Postgres instance (`docker-compose.yml`,
+  `feature_repo/feature_store.yaml`, `config/settings.py::
+  MLFLOW_TRACKING_URI`) - DONE, uncommitted.
+- Serving-time FAISS index switched from exact `IndexFlatIP` to IVF-PQ
+  (`config/settings.py::FAISS_SERVING_INDEX_TYPE` and the
+  `FAISS_IVFPQ_*` params) to bound memory at the full-corpus scale
+  (SS7: 2.74M vectors) - DONE, uncommitted; `m=64` empirically validated
+  against a synthetic near-dup benchmark, not yet re-verified against
+  the real corpus.
 
 Next:
+0. Kafka-fed streaming ingestion, replacing scheduled-batch behavioral
+   feature refresh and DBSCAN cluster discovery with continuous,
+   real-time paths (see Architecture rules and Feature store) - the
+   last piece of the production infra migration, not started.
+1. Full (non-sampled) `text_embeddings.py` run for SMPP - SS7's is done
+   (GPU, full corpus, `data/processed/SS7/embeddings.npy`). SS7's full
+   embeddings also unblock retraining `rule_pattern_score --with_embeddings
+   --sources SS7` (corpus ready, retrain not yet run/logged) - see
+   `docs/experiments/rule_pattern.md`.
 1. Hand-confirm DBSCAN clusters (`docs/experiments/anomaly_clustering.md`
    step 4: `models/anomaly/inspect_clusters.py` +
    `models/anomaly/suggest_cluster_labels.py`, then

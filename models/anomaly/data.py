@@ -55,6 +55,15 @@ from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from config.settings import CONTENT_FLAG_PATTERNS
+
+# features/content_flags.py's output columns - already binary 0/1 (int8),
+# passed through unchanged into `other_cols` below, same treatment as
+# NEAR_DUP_COLS's similarity scores (already ~0-1, no log1p/bucketing
+# needed) - see the architecture plan's Section 3 for why these are base
+# features here too, not gated like embeddings/TF-IDF.
+CONTENT_FLAG_COLS = list(CONTENT_FLAG_PATTERNS.keys())
+
 BEHAVIORAL_COLS = [
     "sender_msgs_last_5min", "sender_msgs_last_1hr",
     "sender_unique_destinations_1hr", "sender_repeat_content_ratio_1hr",
@@ -180,6 +189,7 @@ def load_source_features(source_dir: Path, messages_path: Path) -> pd.DataFrame:
     wanted_cols = (
         ["source", "record_id"] + BEHAVIORAL_COLS
         + [IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL]
+        + CONTENT_FLAG_COLS
         + ["rule_evaluated", "rule_flagged"]
     )
     messages = pd.read_csv(
@@ -187,6 +197,16 @@ def load_source_features(source_dir: Path, messages_path: Path) -> pd.DataFrame:
     )
     if IMSI_DISTINCT_ORIG_COL not in messages.columns:
         messages[IMSI_DISTINCT_ORIG_COL] = np.nan
+    # Absent entirely for a messages_with_behavioral.csv produced before
+    # features/content_flags.py existed - default to 0 (no flags known),
+    # not NaN, since sklearn's Pipeline can't take NaN and "unknown" isn't
+    # a meaningful state for a deterministic regex feature the way it is
+    # for IMSI/velocity (those measure something that may genuinely be
+    # unobserved; a missing content-flag column just means this run
+    # predates the feature).
+    for col in CONTENT_FLAG_COLS:
+        if col not in messages.columns:
+            messages[col] = 0
     messages["source"] = messages["source"].astype(str)
     messages["record_id"] = messages["record_id"].astype(str)
     messages["message_key"] = messages["source"] + "|" + messages["record_id"]
@@ -348,11 +368,12 @@ def build_combined_frame(
     embedding_cols = [c for c in transformed.columns if c.startswith("emb_")]
     other_cols = (
         raw_passthrough_behavioral_cols + list(NEAR_DUP_COLS) + imsi_cols + velocity_cols
-        + diversity_cols + SENDER_AGE_BUCKET_COLS
+        + diversity_cols + SENDER_AGE_BUCKET_COLS + CONTENT_FLAG_COLS
     )
     pieces = [
         transformed[raw_passthrough_behavioral_cols + NEAR_DUP_COLS + imsi_cols + velocity_cols + diversity_cols],
         age_bucket_dummies,
+        transformed[CONTENT_FLAG_COLS],
     ]
     if known_sources is not None:
         source_dummies = pd.get_dummies(

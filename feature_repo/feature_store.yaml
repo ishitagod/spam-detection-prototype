@@ -1,8 +1,10 @@
 project: spam_detection
-registry: data/feast_registry.db
+registry:
+  registry_type: sql
+  path: postgresql+psycopg2://spam_detection:spam_detection@localhost:5432/feast_registry
 provider: local
 online_store:
-  type: sqlite
-  path: data/online_store.db
+  type: redis
+  connection_string: "localhost:6379"
 offline_store:
   type: file

@@ -17,7 +17,8 @@ FEATURE PARITY WITH TRAINING: whatever models/rule_pattern/train.py
 actually trained the champion with - the base feature frame
 (models/rule_pattern/data.py's _base_feature_frame(): BEHAVIORAL_COLS,
 imsi_distinct_originators_1hr, `dcs`, `text_decode_failed`, `text_length`,
-one-hot `source`), and
+CONTENT_FLAG_COLS (features/content_flags.py, computed inline here via
+compute_content_flags()), one-hot `source`), and
 OPTIONALLY TF-IDF (`tfidf_*`) and/or PCA-reduced MiniLM embeddings
 (`emb_pca_*`) if the champion was trained with --with_tfidf/
 --with_embeddings. This module rebuilds the base frame rather than
@@ -50,6 +51,8 @@ explainer is built once per champion load (_load_champion(), same
 cache-once convention as the model itself) so scoring N requests never
 rebuilds it N times.
 """
+import logging
+import time
 from dataclasses import dataclass
 
 import mlflow
@@ -57,11 +60,15 @@ import mlflow.artifacts
 import mlflow.lightgbm
 import mlflow.sklearn
 import numpy as np
+import pandas as pd
 import shap
 
+from features.content_flags import compute_content_flags
 from models.anomaly.data import BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL
 from models.registry import MLFLOW_TRACKING_URI
 from serving.canonical import CanonicalRow
+
+logger = logging.getLogger(__name__)
 
 RULE_PATTERN_MODEL_NAME = "rule_pattern_score_model"  # base name - the
 # actual registered model is always source-suffixed, see module docstring
@@ -110,6 +117,8 @@ def _load_champion(source: str) -> _LoadedRulePatternModel:
     if source in _cached:
         return _cached[source]
 
+    load_start = time.perf_counter()
+    logger.info("loading rule_pattern_score champion for source=%s (cold cache)", source)
     registered_name = f"{RULE_PATTERN_MODEL_NAME}_{source}"
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     client = mlflow.MlflowClient()
@@ -150,6 +159,12 @@ def _load_champion(source: str) -> _LoadedRulePatternModel:
         model=model, feature_names=feature_names, version=str(version.version),
         tfidf_vectorizer=tfidf_vectorizer, embedding_pca_pipeline=embedding_pca_pipeline,
         explainer=explainer,
+    )
+    logger.info(
+        "loaded rule_pattern_score champion v%s for source=%s in %dms "
+        "(tfidf=%s, embeddings=%s)",
+        version.version, source, int((time.perf_counter() - load_start) * 1000),
+        needs_tfidf, needs_embeddings,
     )
     return _cached[source]
 
@@ -209,6 +224,15 @@ def build_rule_pattern_row(
     row["source_SS7"] = int(canonical.source == "SS7")
 
     text = canonical.text or ""
+    # Content-rule flags (features/content_flags.py): sub-millisecond
+    # regex, computed inline same as text_length above - no model/index
+    # load, same registry (config.settings.CONTENT_FLAG_PATTERNS) training
+    # used. Base features - always computed, same as the columns above,
+    # not gated behind tfidf_vectorizer/embedding_pca_pipeline like
+    # tfidf_*/emb_pca_* below.
+    flags = compute_content_flags(pd.Series([text])).iloc[0]
+    for name, value in flags.items():
+        row[name] = int(value)
     if tfidf_vectorizer is not None:
         tfidf_vector = tfidf_vectorizer.transform([text]).toarray()[0]
         for name, value in zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vector):

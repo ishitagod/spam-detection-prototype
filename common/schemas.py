@@ -26,8 +26,8 @@ CANONICAL_FEATURE_SCHEMA: dict[str, str] = {
     # parsed to datetime downstream in
     # features/behavioral.py, not here
     "dcs": "float64",
-    "text_decode_failed": "bool",  # SMPP-only today - real feature per
-    # ingestion/smpp.py, not bookkeeping
+    "text_decode_failed": "bool",  # both sources set this (ingestion/smpp.py
+    # and ingestion/ss7.py) - a real feature, not bookkeeping
     "esm_class": "float64",  # SMPP-only (ESME class, an SMPP PDU field -
     # no SS7 equivalent) - raw batch column is `esme_class`
     # (ingestion/smpp.py's FEATURE_MAP), live wire payload field is

@@ -25,7 +25,7 @@ import argparse
 
 import mlflow
 
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
+from config.settings import MLFLOW_TRACKING_URI
 
 
 def get_latest_run(experiment_name: str) -> mlflow.entities.Run:

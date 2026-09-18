@@ -118,7 +118,7 @@ actual re-run of `models.rule_pattern.train --sources SMPP`, not a
 fabricated figure here. Flagging the stale "SMPP skipped" claim rather
 than leaving it standing as if still accurate.
 
-## `--with_embeddings`: built, not yet useful
+## `--with_embeddings`: SS7 corpus is now full-scale, retrain not yet run
 
 Uses `models/rule_pattern/data.py`'s embeddings-aware loader/feature
 builder instead of the default ones, reusing
@@ -129,6 +129,22 @@ still swamp this model's other ~10 features. Logged to a SEPARATE MLflow
 experiment (`rule_pattern_score_with_embeddings`) so an early, tiny-sample
 run never gets mistaken for a real baseline candidate.
 
+**Status as of writing (source-dependent, no longer uniformly ~1%)**:
+- **SS7**: `data/processed/SS7/embeddings.npy` is now a full-dataset GPU
+  run - shape `(2,742,301, 384)`, matching SS7's full row count exactly
+  (not a sample). `load_labelled_messages_with_embeddings()`'s inner join
+  picks this up automatically, so `--with_embeddings --sources SS7` now
+  trains against the full SS7 `rule_evaluated` pool (349,962 rows). **Not
+  yet retrained/logged**, though - the only `rule_pattern_score_with_embeddings`
+  run in MLflow (`070dd5f791c648f3b0d986f38ff6373c`) still shows
+  `n_rows=2653`, from the old sample-era corpus. The corpus is ready; the
+  actual retrain + comparison against `light_gbm_SS7`'s no-embeddings
+  baseline (test PR-AUC 0.866, `d8752b4d8d364a6fad4aadf18e187c6f`) hasn't
+  been run yet.
+- **SMPP**: no `embeddings.npy` yet - still blocked on its own
+  full-dataset `text_embeddings.py` run. Passing `--sources SMPP SS7`
+  together today would silently restrict the inner join to SS7-only rows
+  - run `--sources SS7` explicitly until SMPP's embeddings land.
 **Now actually usable, not yet tried**: `features/text_embeddings.py`'s
 full-dataset (non-sampled) run is done (see `docs/experiments/anomaly.md`'s
 "Current scale") - the ~1% overlap problem this section used to describe
@@ -141,10 +157,11 @@ is genuinely runnable with a meaningful result now, not just "one command
 away" - it hasn't actually been run/evaluated yet as of this doc edit, so
 no result is claimed here.
 
-**Why it's worth doing eventually, not just a nice-to-have**: the
+**Why it's worth doing, not just a nice-to-have**: the
 baseline (no-embeddings) model's own feature importances show
 `text_length` (the only content-adjacent signal it has) as the single
 most important feature by a wide margin - meaning even a crude proxy for
 content carries real separating power, so genuine content (real
 embeddings, not just character count) would plausibly help more, not be
-redundant.
+redundant. Worth running `python -m models.rule_pattern.train --with_embeddings --sources SS7`
+now that the full corpus exists, rather than waiting on SMPP too.

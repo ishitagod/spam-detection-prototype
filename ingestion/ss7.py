@@ -46,6 +46,7 @@ from common.schemas import (
     validate_labels,
 )
 from ingestion.dcs_codecs import decode_by_dcs
+from ingestion.udh import parse_udh, strip_udh
 from labels.rule_labels import build_rule_labels, is_rule_evaluated
 
 # message_type meanings (given directly, not yet independently verified
@@ -72,6 +73,23 @@ _MO = 3
 # ---------------------------------------------------------------------------
 
 
+# GSM 03.38 "8-bit data" alphabet class DCS value(s), verified against real
+# SS7 samples (notebooks/decode_verification.ipynb): NOT a text alphabet at
+# all - decode_by_dcs's auto-detect would otherwise confidently return
+# gibberish for these (GSM-7's table maps every byte to SOME printable
+# glyph, so printable-ratio scoring can't tell binary-misdecoded-as-text
+# apart from real text - see _printable_score's caveat in dcs_codecs.py's
+# module docstring). 236/364 real dcs=4 rows checked carry no recoverable
+# structure at all; 128/364 carry a genuine UDH Application Port Addressing
+# IE (dest_port=1234 observed) whose STRIPPED remainder decodes as real
+# legible ASCII - so this class is only "unrecoverable" absent a UDH, not
+# unconditionally. NOTE: SMPP's dcs=4 means something different (real GSM-7
+# text there, separately verified - see ingestion/dcs_codecs.py's module
+# docstring on "same DCS byte does NOT imply the same convention across
+# sources") - this set is SS7-only.
+SS7_BINARY_DATA_CLASS_DCS = {4}
+
+
 def _decode_row(content_hex, dcs) -> dict:
     """
     Decodes SS7 `content` directly via dcs_codecs.decode_by_dcs(source=
@@ -84,22 +102,46 @@ def _decode_row(content_hex, dcs) -> dict:
     codec path (decode_by_dcs's returned codec name), not about fixing a
     known bug the way SMPP's rewrite was.
 
-    NOTE: unlike SMPP, no UDH-stripping is applied - checked a real
-    multipart SS7 row byte-for-byte and `content` has no embedded header/
-    framing prefix. SS7 signals concatenation via its own sarref/msg_part/
-    msg_parts columns instead (see clean()'s concat_ref/concat_total_parts/
-    concat_part_num and the module docstring's MULTIPART note), not via
-    UDH-in-content the way SMPP does.
+    UDH handling (added after the note below was found to be incomplete):
+    a real multipart SS7 sample byte-for-byte has no UDH prefix - SS7
+    signals concatenation via its own sarref/msg_part/msg_parts columns
+    instead (see clean()'s concat_ref/concat_total_parts/concat_part_num
+    and the module docstring's MULTIPART note), not via UDH-in-content the
+    way SMPP does. BUT `notebooks/decode_verification.ipynb` found a
+    separate real case where SS7 content DOES carry a UDH: dcs=4
+    ("8-bit data" class, not text) rows port-addressed to an application via
+    an Application Port Addressing IE. So UDH detection now always runs
+    (it's structural/self-validating - ingestion/udh.py's parse_udh has a
+    measured ~0.03% false-positive rate on real text, see its docstring) and
+    is stripped before decoding when present, same as SMPP.
+
+    Binary-data-class DCS values (SS7_BINARY_DATA_CLASS_DCS) with NO UDH
+    found are not passed to decode_by_dcs at all - there is nothing there to
+    guess a text codec against, and letting auto-detect try anyway is
+    exactly the bug this fixes (verified: it silently returns high-
+    printable-score, non-English gibberish for these). `text=None` +
+    `content_is_binary=True` instead - clean() forces text_clean="" /
+    text_decode_failed=True for these rather than falling back to
+    `decoded_content` (equally unreliable garbage for the same rows,
+    verified in the same notebook).
     """
+    empty = {"text": None, "content_is_binary": False, "udh_dest_port": None}
     if not isinstance(content_hex, str) or not content_hex:
-        return {"text": None}
+        return empty
     try:
-        payload = bytes.fromhex(content_hex)
+        raw_bytes = bytes.fromhex(content_hex)
     except ValueError:
-        return {"text": None}
+        return empty
+
+    udh = parse_udh(raw_bytes)
+    payload = strip_udh(raw_bytes, udh)
     dcs_int = int(dcs) if pd.notna(dcs) else None
+
+    if dcs_int in SS7_BINARY_DATA_CLASS_DCS and not udh.present:
+        return {"text": None, "content_is_binary": True, "udh_dest_port": udh.dest_port}
+
     text, _codec_used = decode_by_dcs(payload, dcs_int, source="SS7")
-    return {"text": text}
+    return {"text": text, "content_is_binary": False, "udh_dest_port": udh.dest_port}
 
 
 def clean(df: pd.DataFrame) -> pd.DataFrame:
@@ -169,7 +211,13 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     decoded = kept.apply(
         lambda r: _decode_row(r.get("content"), r.get("dcs")), axis=1, result_type="expand"
     )
-    kept["text_clean"] = decoded["text"].fillna(kept.get("decoded_content"))
+    content_is_binary = decoded["content_is_binary"].fillna(False).astype(bool)
+    # Binary-data-class rows with no recoverable UDH never fall back to
+    # decoded_content - that upstream column was verified (same notebook) to
+    # be equally unreliable gibberish for these specific rows, not a
+    # trustworthy fallback the way it is for a genuine text-decode miss.
+    text_clean = decoded["text"].fillna(kept.get("decoded_content"))
+    kept["text_clean"] = text_clean.where(~content_is_binary, None)
     text_missing = kept["text_clean"].isna() | (
         kept["text_clean"].fillna("").str.strip() == ""
     )
@@ -177,6 +225,8 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
         print(
             f"  clean (SS7): {text_missing.sum()} MO/MT_request row(s) have no "
             "decodable text - kept (not dropped), flagged via text_decode_failed"
+            f" ({content_is_binary.sum()} of those are binary-data-class DCS"
+            " with no recoverable UDH, not a decode failure per se)"
         )
     kept["text_decode_failed"] = text_missing
     kept["text_clean"] = kept["text_clean"].where(~text_missing, "")
@@ -208,11 +258,15 @@ FEATURE_MAP = {
                                          # still exist as raw columns, unused
                                          # here now.
     "text": "text_clean",               # reconstructed in clean() above
-    "timestamp": "time_stamp",
-    "create_date": "create_date",       # kept as its OWN feature, distinct
-                                         # from timestamp/time_stamp - exact
-                                         # semantic difference between the
-                                         # two not yet confirmed.
+    "timestamp": "time_stamp",          # full date+time on both sources
+                                         # (raw `time_stamp` is ISO
+                                         # date+time, not date-only) - the
+                                         # one shared timestamp column.
+                                         # `create_date` dropped as a
+                                         # separate feature: redundant with
+                                         # this, no confirmed distinct
+                                         # semantic, and SMPP has no
+                                         # equivalent raw field anyway.
     "message_id": "reference",
     "smsc": "smsc",
     "imsi": "imsi",

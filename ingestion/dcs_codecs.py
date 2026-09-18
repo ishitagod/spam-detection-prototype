@@ -42,6 +42,7 @@ here. This module has no opinion on that, it's a source-specific quirk.
    raw newline in the first place - sidesteps the whole bug class.
 """
 import re
+import unicodedata
 
 # ---------------------------------------------------------------------------
 # GSM 03.38 default alphabet + septet unpacking
@@ -170,13 +171,34 @@ def _sanitize_for_storage(text: str | None) -> str | None:
     return re.sub(r"\r\n|\r|\n", " ", text)
 
 
+# Unicode general categories treated as "good" alongside str.isprintable()
+# even though isprintable() itself says no - both are legitimate in real
+# UTF-16 SMS content, not decode noise: Cf (format - zero-width joiner,
+# left/right-to-left marks; real emoji ZWJ sequences and bidi-marked text
+# use these) and Zs (space separator - real messages have been seen using
+# non-ASCII spacing, e.g. U+2000 EN QUAD, between words). Found via
+# notebooks/decode_verification.ipynb's full-SS7-corpus run: without this,
+# _printable_score flagged multiple CORRECTLY decoded UTF-16 messages
+# (an emoji ZWJ sequence; a "Maybank Alert..." message using EN QUAD
+# spacing) as low-scoring/suspicious, even though nothing about the decode
+# was wrong - only Cf/Zs specifically; other isprintable()=False categories
+# (Cc control, Cs surrogate, Co private-use, Cn unassigned, Zl/Zp line/
+# paragraph separators) are NOT added here - those really do only show up
+# from wrong-codec noise, not real message content.
+_ALSO_GOOD_CATEGORIES = {"Cf", "Zs"}
+
+
 def _printable_score(text: str | None) -> float:
-    """Fraction of characters that are printable, excluding the unmapped-
-    code placeholder so a bad GSM-7 decode full of undefined codes can't
-    score well just because U+FFFD is technically a printable character."""
+    """Fraction of characters that are printable (or one of
+    _ALSO_GOOD_CATEGORIES - see its comment), excluding the unmapped-code
+    placeholder so a bad GSM-7 decode full of undefined codes can't score
+    well just because U+FFFD is technically a printable character."""
     if not text:
         return 0.0
-    good = sum(1 for ch in text if ch.isprintable() and ch != _UNMAPPED)
+    good = sum(
+        1 for ch in text
+        if ch != _UNMAPPED and (ch.isprintable() or unicodedata.category(ch) in _ALSO_GOOD_CATEGORIES)
+    )
     return good / len(text)
 
 
@@ -228,6 +250,25 @@ _AMBIGUOUS = {"SMPP": {}, "SS7": SS7_AMBIGUOUS_DCS}
 _FUNCS = {"SMPP": SMPP_CODEC_FUNCS, "SS7": SS7_CODEC_FUNCS}
 
 
+# Try-order for the "unmapped DCS" fallback in decode_by_dcs (NOT used for
+# SS7_AMBIGUOUS_DCS, which already deliberately puts "gsm7" first for its
+# two genuinely-ambiguous values). Found via a real tie: a UDH-stripped
+# remainder that's clean 7-bit ASCII can ALSO score a perfect 1.0 under
+# _printable_score when (mis)interpreted as packed GSM-7 septets - GSM-7's
+# table maps most byte values to some printable glyph, so septet-repacked
+# ASCII bytes can coincidentally decode to an all-printable (if nonsensical)
+# string. _best_of keeps the FIRST codec on a tie, so if gsm7 is tried
+# before ascii, correct ASCII text loses to gsm7 nonsense purely by
+# iteration order, not merit. Byte-preserving decodes (ascii/latin1/utf16)
+# go first because succeeding outright on them is a much stronger structural
+# signal than gsm7's bit-reinterpretation happening to also land on
+# printable codepoints - verified via notebooks/decode_verification.ipynb
+# (SS7 dcs=4, UDH-recovered remainder "(T2ZKaMjKhf4w)": ascii and gsm7 both
+# scored 1.0, gsm7 won purely because SS7_CODEC_FUNCS/SMPP_CODEC_FUNCS
+# happen to list "gsm7" first).
+_UNMAPPED_DCS_TRY_ORDER = ("ascii", "latin1", "utf16", "gsm7")
+
+
 def _best_of(payload: bytes, codec_names, funcs: dict) -> tuple[str | None, str | None]:
     best_text, best_codec, best_score = None, None, -1.0
     for name in codec_names:
@@ -265,8 +306,10 @@ def decode_by_dcs(payload: bytes, dcs: int | None, *, source: str) -> tuple[str 
         text, codec_used = funcs[codec](payload), codec
     else:
         # Unmapped DCS - don't guess a single default, score every codec
-        # this source supports and keep the most legible result.
-        text, codec = _best_of(payload, funcs.keys(), funcs)
+        # this source supports and keep the most legible result. Order
+        # matters on a tie - see _UNMAPPED_DCS_TRY_ORDER.
+        candidates = [name for name in _UNMAPPED_DCS_TRY_ORDER if name in funcs]
+        text, codec = _best_of(payload, candidates, funcs)
         codec_used = f"{codec}(auto)" if codec else None
 
     # Scoring above (_best_of/_printable_score) runs on the RAW decoded

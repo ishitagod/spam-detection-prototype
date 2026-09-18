@@ -88,9 +88,9 @@ import pandas as pd
 from sklearn.cluster import DBSCAN
 from sklearn.neighbors import NearestNeighbors
 
+from config.settings import MLFLOW_TRACKING_URI
 from models.anomaly.data import BEHAVIORAL_COLS, NEAR_DUP_COLS, build_feature_matrix, load_source_features
 
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
 # Own experiment name, separate from "anomaly_score" - see docs/ml/
 # modeling.md's MLflow conventions: a variant that isn't a real
 # promotable candidate (which this structurally can't be - see module

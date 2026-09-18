@@ -37,10 +37,13 @@ given this pool's small-for-SMPP / imbalanced-for-SS7 shape.
 
 --with_embeddings / --with_tfidf: independently toggleable, see
 models/rule_pattern/data.py's module docstring for why they're separate
-flags rather than one combined switch. --with_embeddings is NOT useful
-today - the MiniLM sample only overlaps ~1% of the rule_evaluated pool -
-this flag exists so the comparison is one command away once
-features/text_embeddings.py's full-dataset run lands. --with_tfidf IS
+flags rather than one combined switch. --with_embeddings coverage is now
+source-dependent: SS7's embeddings.npy is a full-dataset GPU run (all
+2,742,301 rows), so `--with_embeddings --sources SS7` trains on the full
+SS7 rule_evaluated pool - ready to run, just not yet re-trained/logged to
+MLflow as of writing (the one logged rule_pattern_score_with_embeddings
+run still reflects the old ~1%-sample era). SMPP has no embeddings.npy
+yet - still blocked on its own full-dataset run. --with_tfidf IS
 useful today - real standalone signal already measured (PR-AUC 0.934 on
 a text-grouped split, see data.py docstring), no sample-coverage blocker.
 
@@ -75,6 +78,7 @@ import pandas as pd
 from mlflow.models import infer_signature
 from sklearn.model_selection import train_test_split
 
+from config.settings import MLFLOW_TRACKING_URI
 from models.anomaly.data import N_EMBEDDING_COMPONENTS
 from models.metrics import evaluate_overall_and_per_source
 from models.rule_pattern.data import (
@@ -86,7 +90,6 @@ from models.rule_pattern.data import (
     load_labelled_messages_with_embeddings,
 )
 
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
 MLFLOW_EXPERIMENT_NAME = "light_gbm"
 MLFLOW_EXPERIMENTAL_EXPERIMENT_NAME = "rule_pattern_score_experimental"
 

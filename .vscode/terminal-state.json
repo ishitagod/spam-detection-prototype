@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "savedAt": "2026-09-10T08:42:49.414Z",
+  "workspace": "c:\\Users\\IshitaGodani\\Documents\\projects\\spam-detection-prototype",
+  "settings": {
+    "skipPermissions": true
+  },
+  "terminals": [
+    {
+      "name": "✳ Claude Code",
+      "type": "claude",
+      "sessionId": "d8dbf095-2734-4bc9-b7f6-6fdd8d909b93",
+      "modelShort": null,
+      "modelFull": null,
+      "cwd": "C:\\Users\\IshitaGodani\\Documents\\projects\\spam-detection-prototype",
+      "icon": null,
+      "color": null,
+      "shellPath": null,
+      "isWsl": false,
+      "distro": null,
+      "sessionSource": "session-file"
+    }
+  ]
+}

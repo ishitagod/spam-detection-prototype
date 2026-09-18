@@ -73,6 +73,11 @@ import pandas as pd
 
 from config.settings import (
     FAISS_CHUNK_SIZE,
+    FAISS_IVFPQ_M,
+    FAISS_IVFPQ_NBITS,
+    FAISS_IVFPQ_NLIST,
+    FAISS_IVFPQ_NPROBE,
+    FAISS_IVFPQ_TRAIN_SAMPLE_SIZE,
     FAISS_MAX_MATCHES_PER_QUERY,
     FAISS_NEAR_DUP_THRESHOLD,
     FAISS_NEAR_DUP_WINDOW_LONG,
@@ -129,18 +134,87 @@ def _to_gpu(index: "faiss.Index") -> "faiss.Index":
         return index
 
 
-def build_index(embeddings: np.ndarray, use_gpu: bool = False) -> "faiss.Index":
-    """Flat inner-product index - exact search, no approximation. Fine at
-    the scale compute_near_dup_features_chunked() bounds each call to
-    (chunk_size + buffer, not the full corpus); revisit (e.g. IVF) only
-    if benchmarking at that bounded scale shows it's actually needed -
-    IVF's benefit shrinks once chunking already keeps N small.
-    `use_gpu`: see _to_gpu() - falls back to CPU cleanly if unavailable."""
-    index = faiss.IndexFlatIP(embeddings.shape[1])
-    if use_gpu:
-        index = _to_gpu(index)
-    index.add(embeddings)
-    return index
+def build_index(
+    embeddings: np.ndarray,
+    use_gpu: bool = False,
+    index_type: str = "flat",
+    nlist: int = FAISS_IVFPQ_NLIST,
+    nprobe: int = FAISS_IVFPQ_NPROBE,
+    m: int = FAISS_IVFPQ_M,
+    nbits: int = FAISS_IVFPQ_NBITS,
+    train_sample_size: int = FAISS_IVFPQ_TRAIN_SAMPLE_SIZE,
+    random_state: int = 42,
+) -> "faiss.Index":
+    """
+    `index_type="flat"` (default): exact IndexFlatIP, unchanged behavior -
+    used by compute_near_dup_features_chunked() (the batch/training path),
+    which already bounds N per call to chunk_size + a window buffer, not
+    the full corpus. Brute-force is fine at that bounded scale; revisit
+    only if benchmarking there specifically shows it's needed - this
+    docstring used to say the same about the whole module before serving
+    grew its own much-larger, unbounded corpus (see below).
+
+    `index_type="ivfpq"`: approximate IndexIVFPQ (product-quantized,
+    inverted-file index) - used by serving/anomaly_scoring.py's
+    _load_corpus() over each source's FULL historical corpus (millions of
+    vectors, built once per process and queried per live request, unlike
+    the batch path's bounded chunks). Chosen over IndexFlatIP/HNSW
+    specifically for MEMORY: raw IndexFlatIP needs dim*4 bytes/vector,
+    HNSW roughly 1.5-2x that for its graph, IVF-PQ needs `m` bytes/vector
+    (see config/settings.py's FAISS_IVFPQ_* comments for how nlist/
+    nprobe/m/nbits were sized, and why they're a genuine 3-way latency/
+    memory/accuracy tradeoff, not free). NOT tuned/validated against this
+    corpus's real recall yet - config defaults are FAISS's own published
+    starting-point guidance, same "disclosed, not fabricated" convention
+    as FAISS_NEAR_DUP_THRESHOLD.
+
+    `dim` must be evenly divisible by `m` for IVF-PQ (raises ValueError
+    otherwise, rather than letting FAISS fail with a less legible error).
+    Training (index.train()) runs on a bounded random sample
+    (train_sample_size), not the full corpus - shapes the coarse-
+    quantizer/codebook boundaries; index.add() below still indexes every
+    real vector regardless of the training sample size, so this does NOT
+    shrink what's actually searchable.
+
+    `use_gpu`: see _to_gpu() - falls back to CPU cleanly if unavailable.
+    For IVF-PQ, training always happens on CPU first (a one-time,
+    non-latency-critical cost), then the trained index is optionally
+    moved to GPU before add() - mirrors the flat path's own
+    build-then-optionally-move-to-GPU order.
+    """
+    dim = embeddings.shape[1]
+
+    if index_type == "flat":
+        index = faiss.IndexFlatIP(dim)
+        if use_gpu:
+            index = _to_gpu(index)
+        index.add(embeddings)
+        return index
+
+    if index_type == "ivfpq":
+        if dim % m != 0:
+            raise ValueError(
+                f"FAISS_IVFPQ_M={m} must evenly divide the embedding "
+                f"dimension ({dim}); {dim}/{m} = {dim / m}"
+            )
+        quantizer = faiss.IndexFlatIP(dim)
+        index = faiss.IndexIVFPQ(quantizer, dim, nlist, m, nbits, faiss.METRIC_INNER_PRODUCT)
+
+        rng = np.random.default_rng(random_state)
+        if len(embeddings) > train_sample_size:
+            sample_idx = rng.choice(len(embeddings), size=train_sample_size, replace=False)
+            train_vectors = embeddings[sample_idx]
+        else:
+            train_vectors = embeddings
+        index.train(train_vectors)
+
+        if use_gpu:
+            index = _to_gpu(index)
+        index.add(embeddings)
+        index.nprobe = nprobe
+        return index
+
+    raise ValueError(f"Unknown index_type {index_type!r} - expected 'flat' or 'ivfpq'")
 
 
 def compute_near_dup_features(
@@ -326,9 +400,14 @@ def compute_near_dup_features_for_live_query(
 
     No query-batching or chunking here (unlike the batch path) - a single
     live request is one query, not millions of historical rows; the same
-    FAISS_MAX_MATCHES_PER_QUERY cap is reused as-is since a FlatIP index's
-    per-query search cost is dominated by corpus size (index.ntotal), not
-    by k - capping k tighter here wouldn't meaningfully help latency.
+    FAISS_MAX_MATCHES_PER_QUERY cap is reused as-is. Per-query search cost
+    is dominated by how much of the corpus actually gets scanned - the
+    whole thing (index.ntotal) for an exact IndexFlatIP, or only the
+    nprobe nearest cells' worth for the IVF-PQ index build_index() now
+    builds by default here (see config/settings.py's FAISS_IVFPQ_* and
+    build_index()'s docstring for why serving uses IVF-PQ specifically) -
+    either way, capping k tighter wouldn't meaningfully help latency,
+    since k only bounds the RESULT size, not how much gets searched.
 
     `index`: pre-built over the historical corpus's embeddings (see
     build_index()) - NOT rebuilt here; caller (serving/anomaly_scoring.py)

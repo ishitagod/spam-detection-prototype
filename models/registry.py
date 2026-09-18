@@ -8,7 +8,7 @@ serving code change.
 """
 import mlflow
 
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
+from config.settings import MLFLOW_TRACKING_URI
 
 
 def load_champion(registered_name: str, alias: str = "champion"):

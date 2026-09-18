@@ -1,12 +1,16 @@
 import ast
+import sys
 import numpy as np
 import pandas as pd
 import mlflow
 from pathlib import Path
 from sklearn.model_selection import train_test_split
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config.settings import MLFLOW_TRACKING_URI
 from models.rule_pattern.data import build_feature_matrix, load_labelled_messages, load_labelled_messages_with_embeddings
 
-mlflow.set_tracking_uri("sqlite:///mlflow.db")
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 run_id = "f7da9adb39e249c580cb4c7408741319"
 run = mlflow.get_run(run_id)
 params = run.data.params
