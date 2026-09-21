@@ -12,10 +12,11 @@ docstring and the discussion this was built from. Run this by hand:
     python -m models.anomaly.train
     python -m models.anomaly.train --n_estimators 200 --contamination 0.02
 
-CURRENT SCALE: trains on whatever features/text_embeddings.py's
---sample_n sample covers (40k SMPP / 20k SS7 as of writing) - see
-models/anomaly/data.py's module docstring for why the join is
-necessarily restricted to that sample right now.
+CURRENT SCALE: trains on the full corpus per source (SMPP 5.5M / SS7
+2.74M rows), not a --sample_n subset - see models/anomaly/data.py's
+ChunkedEmbeddingReducer for how the embedding preprocessing stays
+memory-bounded at that scale (plain StandardScaler.fit() upcasts
+float32 input to float64 internally and OOMs on the full SS7 corpus).
 
 OUTPUT SCORE: `-model.decision_function(X)`, not `.predict()`'s binary
 label. sklearn's decision_function is HIGHER for normal points, LOWER

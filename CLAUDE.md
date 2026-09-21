@@ -197,13 +197,29 @@ Completed:
   against a synthetic near-dup benchmark, not yet re-verified against
   the real corpus.
 - Decision fusion (`models/decision_fusion/`, `serving/fusion_scoring.py`) -
-  DONE for the mechanism (training, serving wiring, graceful fallback), but
-  no champion promoted yet for either source. SMPP's fusion training pool
-  is real (139,546 rows, both classes, 100% anomaly_score coverage); SS7's
-  is small (~19k/2.65M rows) until Isolation Forest is retrained on SS7's
-  full corpus - re-run `models.anomaly.train --sources SS7` first, then
-  `models.decision_fusion.train --source SS7`, then promote both via
-  `models.compare_versions`.
+  DONE, champions promoted for BOTH sources (`decision_fusion_model_SMPP`/
+  `_SS7`, alias `champion`). SMPP: 139,546-row pool, test PR-AUC 0.9954.
+  SS7: full 2,654,369-row pool (100% anomaly_score coverage, up from an
+  earlier ~19k/2.65M partial sample), test PR-AUC 0.9735.
+- Postgres/Redis infra (`docker-compose.yml`) - running locally via Docker
+  Desktop, host Postgres port remapped to 5433 (5432 was already taken by
+  a native Postgres install on this machine - see `config/settings.py`/
+  `feature_repo/feature_store.yaml`). `psycopg2-binary` bumped to 2.9.13
+  in requirements.txt (2.9.10 has no Python 3.14 wheel).
+- SS7's Isolation Forest retrained on its FULL 2,742,301-row corpus (was
+  a 20k-row sample) - champion promoted as `anomaly_SS7`. Needed a real
+  fix, not just more RAM: `models/anomaly/data.py`'s `build_preprocessor()`
+  now uses a new `ChunkedEmbeddingReducer` (StandardScaler + IncrementalPCA
+  via `partial_fit`, batched) for the embedding branch specifically, since
+  sklearn's plain `StandardScaler.fit()` upcasts float32 input to float64
+  internally (`X - mean`, a numpy promotion rule) - unavoidable ~2x memory
+  spike that OOM's a 16GB machine on a (2.74M, 384) array otherwise.
+  `embedding_pca_pipeline()` itself is UNCHANGED (still a plain
+  `Pipeline(StandardScaler, PCA)`) - rule_pattern's embeddings path and
+  live single-row serving don't operate at this scale and don't need
+  chunking. Also fixed a wasteful `df.copy()` in `build_combined_frame()`
+  that was duplicating the entire (2.74M, 384) embedding block for no
+  reason (nothing in that function mutates embeddings).
 
 Next:
 0. Kafka-fed streaming ingestion, replacing scheduled-batch behavioral
