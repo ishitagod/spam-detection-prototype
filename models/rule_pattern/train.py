@@ -64,6 +64,23 @@ scripts/check_embedding_dominance.py's separate diagnostics experiment.
 with_embeddings/with_tfidf are logged as params on every run, so runs
 are filterable/comparable within that one experiment rather than
 scattered across per-combination experiment names.
+
+--include_content_labels: expands the training pool with confident
+positives mined from rows the telecom rule engine never evaluated
+(rule_evaluated==False), scored by a LogisticRegression fit on the REAL
+rule_flagged labels (labels/rule_labels.py::fit_content_flag_weights() /
+content_flagged_by_weight()) rather than an unweighted flag count or a
+hand-picked combination - each content flag's weight is its OWN measured
+coefficient toward rule_flagged, printed at run start. Must be fit on a
+pool with both classes present, so this is fit on the combined SMPP+SS7
+labelled pool (SMPP alone has zero confirmed-clean rule_evaluated rows -
+CLAUDE.md). See models/rule_pattern/data.py::label_content_flagged_positives()
+for why these are POSITIVE-only additions, never labelled-clean rows.
+Adds a test-set breakdown BY label_source (telecom_rule_engine vs
+content_static_rules) alongside the existing per-source breakdown, since
+the content_static_rules slice's label is still derived from
+CONTENT_FLAG_COLS, which are also features here - a good score on just
+that slice is expected, not evidence of real generalization on its own.
 """
 
 import argparse
@@ -79,6 +96,7 @@ from mlflow.models import infer_signature
 from sklearn.model_selection import train_test_split
 
 from config.settings import MLFLOW_TRACKING_URI
+from labels.rule_labels import content_flag_weights, fit_content_flag_weights
 from models.anomaly.data import N_EMBEDDING_COMPONENTS
 from models.metrics import evaluate_overall_and_per_source
 from models.rule_pattern.data import (
@@ -86,8 +104,10 @@ from models.rule_pattern.data import (
     TFIDF_MIN_DF,
     TFIDF_NGRAM_RANGE,
     build_feature_matrix,
+    label_content_flagged_positives,
     load_labelled_messages,
     load_labelled_messages_with_embeddings,
+    load_unevaluated_messages,
 )
 
 MLFLOW_EXPERIMENT_NAME = "light_gbm"
@@ -165,10 +185,24 @@ def run(
     tfidf_max_features: int = TFIDF_MAX_FEATURES,
     tfidf_ngram_range: tuple[int, int] = TFIDF_NGRAM_RANGE,
     tfidf_min_df: int = TFIDF_MIN_DF,
+    include_content_labels: bool = False,
+    content_flag_weight_threshold: float = 0.5,
 ) -> None:
+    if include_content_labels and with_embeddings:
+        # content-labelled rows (models/rule_pattern/data.py::
+        # label_content_flagged_positives) never carry emb_* columns,
+        # since they come from the rule_evaluated==False pool, not the
+        # embeddings-joined one - unsupported combination, fail loudly
+        # rather than silently building a feature matrix some rows can't
+        # actually populate.
+        raise ValueError(
+            "--include_content_labels is not supported together with --with_embeddings"
+        )
+
     print(
         f"Loading rule_evaluated rows for sources: {sources} "
-        f"(with_embeddings={with_embeddings}, with_tfidf={with_tfidf}) ..."
+        f"(with_embeddings={with_embeddings}, with_tfidf={with_tfidf}, "
+        f"include_content_labels={include_content_labels}) ..."
     )
     frames = []
     for source in sources:
@@ -181,6 +215,34 @@ def run(
         print(f"  {source}: {len(df)} row(s)")
         frames.append(df)
     df = pd.concat(frames, ignore_index=True)
+
+    if include_content_labels:
+        # Fit on the REAL labelled pool built above (both sources combined
+        # if requested - fit_content_flag_weights() itself refuses a
+        # single-class pool, which a SMPP-only `sources` would be, see
+        # that function's docstring), THEN score each source's own
+        # rule_evaluated==False rows with the fitted weights.
+        weight_model = fit_content_flag_weights(df)
+        print("Content-flag weights (LogisticRegression fit on real rule_flagged labels):")
+        for name, weight in sorted(
+            content_flag_weights(weight_model).items(), key=lambda kv: -abs(kv[1])
+        ):
+            print(f"  {name}: {weight:+.3f}")
+
+        content_frames = []
+        for source in sources:
+            messages_path = data_dir / source / "messages_with_behavioral.csv"
+            unevaluated = load_unevaluated_messages(messages_path)
+            content_df = label_content_flagged_positives(
+                unevaluated, weight_model, threshold=content_flag_weight_threshold
+            )
+            print(
+                f"  {source}: +{len(content_df)} content-flagged row(s) "
+                f"(rule_evaluated==False, weight_threshold={content_flag_weight_threshold})"
+            )
+            content_frames.append(content_df)
+        df = pd.concat([df] + content_frames, ignore_index=True)
+
     y_full = (df["rule_flagged"] == True).astype(int).to_numpy()  # noqa: E712
 
     # Split BEFORE featurization, not after: with either flag on, TF-IDF
@@ -211,7 +273,9 @@ def run(
     print(
         f"Total: {len(df)} rows, {X.shape[1]} feature(s), {int(y.sum())} positive ({y.mean():.1%})"
     )
-    assert np.array_equal(y, y_full), "build_feature_matrix()'s y must match the pre-split labels"
+    assert np.array_equal(
+        y, y_full
+    ), "build_feature_matrix()'s y must match the pre-split labels"
 
     X_train, y_train, df_train = X[idx_train], y[idx_train], df.iloc[idx_train]
     X_test, y_test, df_test = X[idx_test], y[idx_test], df.iloc[idx_test]
@@ -250,14 +314,34 @@ def run(
     for k, v in test_metrics.items():
         print(f"  {k}: {v}")
 
+    if include_content_labels:
+        # Broken down by label_source too, on top of the per-source
+        # breakdown above - content_static_rules rows' label is partly
+        # reconstructible from CONTENT_FLAG_COLS, which are also features
+        # here (see load_content_labelled_messages()'s docstring), so a
+        # good score on JUST that slice is expected and not by itself
+        # evidence the model generalizes - disclosed explicitly rather
+        # than folded invisibly into one combined number.
+        print(
+            "Test set evaluation by label_source (content_static_rules rows are partly "
+            "self-referential - see load_content_labelled_messages()'s docstring):"
+        )
+        label_source_metrics = evaluate_overall_and_per_source(
+            df_test, "label_source", y_test, test_score, prefix="test_by_label_source_"
+        )
+        for k, v in label_source_metrics.items():
+            print(f"  {k}: {v}")
+        test_metrics.update(label_source_metrics)
+
     # Any experimental flag routes to a SEPARATE experiment - a plain run
-    # (neither flag set) stays the real baseline candidate in
-    # MLFLOW_EXPERIMENT_NAME; with_embeddings/with_tfidf are logged as
-    # params either way so runs stay filterable/comparable in one place
-    # rather than proliferating one experiment per combination.
+    # (no flags set) stays the real baseline candidate in
+    # MLFLOW_EXPERIMENT_NAME; with_embeddings/with_tfidf/
+    # include_content_labels are logged as params either way so runs stay
+    # filterable/comparable in one place rather than proliferating one
+    # experiment per combination.
     experiment_name = (
         MLFLOW_EXPERIMENTAL_EXPERIMENT_NAME
-        if (with_embeddings or with_tfidf)
+        if (with_embeddings or with_tfidf or include_content_labels)
         else MLFLOW_EXPERIMENT_NAME
     )
     # A source-restricted run (e.g. --sources SMPP alone) gets its own
@@ -286,6 +370,12 @@ def run(
                 "reg_lambda": reg_lambda,
                 "with_embeddings": with_embeddings,
                 "with_tfidf": with_tfidf,
+                "include_content_labels": include_content_labels,
+                **(
+                    {"content_flag_weight_threshold": content_flag_weight_threshold}
+                    if include_content_labels
+                    else {}
+                ),
                 **(
                     {"n_embedding_components": n_embedding_components}
                     if with_embeddings
@@ -322,13 +412,18 @@ def run(
         # already-combined final feature matrix.
         if "embedding_pca_pipeline" in fitted:
             embedding_cols = [c for c in df.columns if c.startswith("emb_")]
-            embedding_sample = df.loc[train_mask, embedding_cols].head(5).to_numpy(dtype=np.float64)
+            embedding_sample = (
+                df.loc[train_mask, embedding_cols].head(5).to_numpy(dtype=np.float64)
+            )
             embedding_signature = infer_signature(
-                embedding_sample, fitted["embedding_pca_pipeline"].transform(embedding_sample)
+                embedding_sample,
+                fitted["embedding_pca_pipeline"].transform(embedding_sample),
             )
             mlflow.sklearn.log_model(
-                fitted["embedding_pca_pipeline"], name="embedding_pca_pipeline",
-                signature=embedding_signature, input_example=embedding_sample,
+                fitted["embedding_pca_pipeline"],
+                name="embedding_pca_pipeline",
+                signature=embedding_signature,
+                input_example=embedding_sample,
             )
         if "tfidf_vectorizer" in fitted:
             text_sample = df.loc[train_mask, "text"].fillna("").head(5).to_numpy()
@@ -336,8 +431,10 @@ def run(
                 text_sample, fitted["tfidf_vectorizer"].transform(text_sample).toarray()
             )
             mlflow.sklearn.log_model(
-                fitted["tfidf_vectorizer"], name="tfidf_vectorizer",
-                signature=tfidf_signature, input_example=text_sample,
+                fitted["tfidf_vectorizer"],
+                name="tfidf_vectorizer",
+                signature=tfidf_signature,
+                input_example=text_sample,
             )
         print(
             f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={experiment_name})"
@@ -354,21 +451,31 @@ def main():
     parser.add_argument("--max_depth", type=int, default=-1)
     parser.add_argument("--random_state", type=int, default=42)
     parser.add_argument(
-        "--colsample_bytree", type=float, default=1.0,
+        "--colsample_bytree",
+        type=float,
+        default=1.0,
         help="Fraction of features randomly sampled per tree - lower (e.g. 0.7) so no "
         "single feature (e.g. a highly-discriminative tfidf_* token) can be the split "
         "at every tree's root. See train_lightgbm()'s docstring.",
     )
     parser.add_argument(
-        "--min_child_samples", type=int, default=20,
+        "--min_child_samples",
+        type=int,
+        default=20,
         help="Minimum rows per leaf - raise (e.g. 50) to require more support before a "
         "leaf specializes around one rare-but-strong token.",
     )
     parser.add_argument(
-        "--reg_alpha", type=float, default=0.0, help="L1 regularization on leaf weights.",
+        "--reg_alpha",
+        type=float,
+        default=0.0,
+        help="L1 regularization on leaf weights.",
     )
     parser.add_argument(
-        "--reg_lambda", type=float, default=0.0, help="L2 regularization on leaf weights.",
+        "--reg_lambda",
+        type=float,
+        default=0.0,
+        help="L2 regularization on leaf weights.",
     )
     parser.add_argument(
         "--with_embeddings",
@@ -389,10 +496,30 @@ def main():
     )
     parser.add_argument("--tfidf_max_features", type=int, default=TFIDF_MAX_FEATURES)
     parser.add_argument(
-        "--tfidf_ngram_range", type=int, nargs=2, default=list(TFIDF_NGRAM_RANGE),
+        "--tfidf_ngram_range",
+        type=int,
+        nargs=2,
+        default=list(TFIDF_NGRAM_RANGE),
         metavar=("MIN_N", "MAX_N"),
     )
     parser.add_argument("--tfidf_min_df", type=int, default=TFIDF_MIN_DF)
+    parser.add_argument(
+        "--include_content_labels",
+        action="store_true",
+        help="Expand the training pool with confident positives from rows the telecom "
+        "rule engine never evaluated (rule_evaluated==False), scored by a LogisticRegression "
+        "fit on the REAL rule_flagged labels (labels/rule_labels.py::fit_content_flag_weights) "
+        "instead of an unweighted flag count - see models/rule_pattern/data.py::"
+        "label_content_flagged_positives()'s docstring. Not supported together with "
+        "--with_embeddings (those rows have no emb_* columns).",
+    )
+    parser.add_argument(
+        "--content_flag_weight_threshold",
+        type=float,
+        default=0.5,
+        help="Minimum fitted-model P(rule_flagged) for a rule_evaluated==False row to count "
+        "as a confident content-flagged positive. Only used with --include_content_labels.",
+    )
     args = parser.parse_args()
     run(
         args.sources,
@@ -412,6 +539,8 @@ def main():
         tfidf_max_features=args.tfidf_max_features,
         tfidf_ngram_range=tuple(args.tfidf_ngram_range),
         tfidf_min_df=args.tfidf_min_df,
+        include_content_labels=args.include_content_labels,
+        content_flag_weight_threshold=args.content_flag_weight_threshold,
     )
 
 

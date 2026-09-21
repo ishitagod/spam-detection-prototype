@@ -14,7 +14,19 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from labels.rule_labels import build_rule_labels, is_rule_evaluated
+import numpy as np
+
+from labels.rule_labels import (
+    build_rule_labels,
+    content_flag_count,
+    content_flag_weighted_score,
+    content_flag_weights,
+    content_flagged_by_count,
+    content_flagged_by_weight,
+    fit_content_flag_weights,
+    is_rule_evaluated,
+)
+from models.anomaly.data import CONTENT_FLAG_COLS
 
 
 @pytest.fixture
@@ -104,6 +116,88 @@ def test_rule_flagged_is_na_when_never_evaluated(label_source):
 def test_raises_when_decision_column_missing():
     with pytest.raises(ValueError):
         is_rule_evaluated(pd.DataFrame({"rule": ["S_x", None]}))
+
+
+@pytest.fixture
+def content_flags_frame() -> pd.DataFrame:
+    """One row per flag count (0, 1, 2, all-10) - CONTENT_FLAG_COLS order
+    doesn't matter here, only how many are True."""
+    n = len(CONTENT_FLAG_COLS)
+    rows = [
+        dict.fromkeys(CONTENT_FLAG_COLS, 0),  # 0 flags
+        {**dict.fromkeys(CONTENT_FLAG_COLS, 0), CONTENT_FLAG_COLS[0]: 1},  # 1 flag
+        {**dict.fromkeys(CONTENT_FLAG_COLS, 0), CONTENT_FLAG_COLS[0]: 1, CONTENT_FLAG_COLS[1]: 1},  # 2 flags
+        dict.fromkeys(CONTENT_FLAG_COLS, 1),  # all n flags
+    ]
+    return pd.DataFrame(rows)
+
+
+def test_content_flag_count_sums_across_all_flags(content_flags_frame):
+    n = len(CONTENT_FLAG_COLS)
+    assert content_flag_count(content_flags_frame).tolist() == [0, 1, 2, n]
+
+
+def test_content_flagged_by_count_thresholds_on_aggregate_not_one_flag(content_flags_frame):
+    """min_flags=2: rows with 0 or 1 flag are NOT flagged even though each
+    individually fired at least one real pattern - this is the aggregate
+    signal, distinct from content_flagged()'s hand-picked combinations."""
+    flagged = content_flagged_by_count(content_flags_frame, min_flags=2)
+    assert flagged.tolist() == [False, False, True, True]
+
+
+def test_content_flag_count_raises_on_missing_columns():
+    with pytest.raises(ValueError):
+        content_flag_count(pd.DataFrame({"has_url": [1, 0]}))
+
+
+@pytest.fixture
+def weighted_labelled_frame() -> pd.DataFrame:
+    """Synthetic rule_evaluated==True pool, both classes present:
+    has_gambling_keyword is a near-perfect predictor of rule_flagged,
+    every other flag is pure noise (uncorrelated coin flips) - a fitted
+    LogisticRegression should assign has_gambling_keyword by far the
+    largest positive coefficient."""
+    rng = np.random.RandomState(0)
+    n = 200
+    gambling = rng.randint(0, 2, size=n)
+    rows = {col: rng.randint(0, 2, size=n) for col in CONTENT_FLAG_COLS}
+    rows["has_gambling_keyword"] = gambling
+    df = pd.DataFrame(rows)
+    df["rule_flagged"] = gambling.astype(bool)
+    return df
+
+
+def test_fit_content_flag_weights_gives_strongest_predictor_largest_weight(weighted_labelled_frame):
+    model = fit_content_flag_weights(weighted_labelled_frame)
+    weights = content_flag_weights(model)
+    strongest = max(weights, key=lambda k: abs(weights[k]))
+    assert strongest == "has_gambling_keyword"
+    assert weights["has_gambling_keyword"] > 0
+
+
+def test_content_flagged_by_weight_recovers_the_true_signal(weighted_labelled_frame):
+    model = fit_content_flag_weights(weighted_labelled_frame)
+    score = content_flag_weighted_score(weighted_labelled_frame, model)
+    flagged = content_flagged_by_weight(weighted_labelled_frame, model, threshold=0.5)
+    assert (score >= 0).all() and (score <= 1).all()
+    # Near-perfect separation on the fit data itself (in-sample) - real
+    # held-out generalization isn't what this unit test checks, only that
+    # scoring/thresholding wires together correctly.
+    assert (flagged == weighted_labelled_frame["rule_flagged"]).mean() > 0.9
+
+
+def test_fit_content_flag_weights_raises_on_single_class():
+    n = 20
+    df = pd.DataFrame({col: [0] * n for col in CONTENT_FLAG_COLS})
+    df["rule_flagged"] = True  # every row the same class
+    with pytest.raises(ValueError):
+        fit_content_flag_weights(df)
+
+
+def test_fit_content_flag_weights_raises_when_rule_flagged_missing():
+    df = pd.DataFrame({col: [0, 1] for col in CONTENT_FLAG_COLS})
+    with pytest.raises(ValueError):
+        fit_content_flag_weights(df)
 
 
 if __name__ == "__main__":

@@ -81,6 +81,27 @@ discovery, hardened incrementally from the current working baseline.
   has no content/regex matching of its own) - see `labels/rule_labels.py`'s
   `content_flagged`/`is_content_evaluated`, kept in a separate
   `label_source` from the telecom-derived `rule_flagged`, never merged.
+- `content_flagged_by_count()` (`labels/rule_labels.py`) is an aggregate
+  alternative to `content_flagged()`'s fixed combination list - "at least
+  N of the 10 flags fired" instead of one hand-picked combination. Kept as
+  a simple utility/reference point, but superseded for actual training use
+  by the weighted approach below (a plain count treats every flag as
+  equally strong evidence, which is just as arbitrary as a hand-picked
+  combination).
+- `fit_content_flag_weights()` / `content_flagged_by_weight()`
+  (`labels/rule_labels.py`) fit a `LogisticRegression(CONTENT_FLAG_COLS ->
+  rule_flagged)` on the REAL labelled pool (must have both classes - SMPP
+  alone has zero confirmed-clean `rule_evaluated` rows, so fit on the
+  combined SMPP+SS7 pool) - each flag's weight is its own measured
+  coefficient, not a guess. `models/rule_pattern/train.py
+  --include_content_labels` uses the fitted model to add confident
+  POSITIVES ONLY from `rule_evaluated == False` rows into
+  `rule_pattern_score`'s training pool, tagged `label_source ==
+  "content_static_rules"` and never merged into the telecom-derived rows -
+  evaluated as its own breakdown (`test_by_label_source_*` metrics)
+  because that slice's label is still derived from `CONTENT_FLAG_COLS`,
+  which are also features. Routes to the experimental MLflow experiment,
+  same as `--with_embeddings`/`--with_tfidf`.
 
 ### FAISS
 - Near-duplicate detection using 1h and 24h windows.

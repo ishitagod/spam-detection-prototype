@@ -30,6 +30,7 @@ place genuinely novel (rule-invisible) spam can be found, since anything
 the rules already caught is, by definition, a KNOWN pattern.
 """
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
 
 from config.settings import WHITELIST_RULE_PREFIX
 from models.anomaly.data import CONTENT_FLAG_COLS
@@ -203,3 +204,134 @@ def content_flagged(messages_df: pd.DataFrame) -> pd.Series:
             combo_hit &= messages_df[col].astype(bool)
         flagged |= combo_hit
     return flagged
+
+
+def content_flag_count(messages_df: pd.DataFrame) -> pd.Series:
+    """
+    Row-wise count of HOW MANY of CONTENT_FLAG_COLS fired - an aggregate
+    alternative to content_flagged()'s fixed combination list above:
+    instead of requiring one specific hand-picked combination, this counts
+    across every flag in config/settings.py::CONTENT_FLAG_PATTERNS, so a
+    caller can threshold on "at least N flags fired" instead
+    (content_flagged_by_count() below) without hand-enumerating which N.
+    Same input-shape contract as content_flagged() (messages_with_behavioral.csv
+    after Stage 3b, not the raw ingestion frame).
+    """
+    missing = [c for c in CONTENT_FLAG_COLS if c not in messages_df.columns]
+    if missing:
+        raise ValueError(
+            f"messages_df is missing content-flag column(s): {missing} - "
+            "run features/content_flags.py (pipeline.py Stage 3b) first"
+        )
+    return messages_df[CONTENT_FLAG_COLS].sum(axis=1)
+
+
+def content_flagged_by_count(messages_df: pd.DataFrame, min_flags: int = 3) -> pd.Series:
+    """
+    True where content_flag_count() >= min_flags - a broader, less
+    hand-picked "content-rule flagged" signal than content_flagged()'s
+    fixed combination list. Same label_source ("content_static_rules",
+    never silently merged with rule_flagged - see module docstring) and
+    the same "starting point, not calibrated" status as
+    CONTENT_FLAG_HIGH_CONFIDENCE_COMBINATIONS: out of 10 total flags
+    (config/settings.py::CONTENT_FLAG_PATTERNS), min_flags=3 co-occurring
+    signals was picked as a stronger bar than any single flag alone (real
+    messages routinely contain just a URL or just a currency symbol on
+    their own) - revisit once measured against confirmed spam.
+
+    SUPERSEDED for models/rule_pattern/train.py's actual training use by
+    fit_content_flag_weights()/content_flagged_by_weight() below - a plain
+    count treats every flag as equally strong evidence (has_gambling_keyword
+    alone is a rare, strong signal; has_url/has_currency_symbol are common
+    on legitimate messages too and correlate with each other), which is
+    just as arbitrary a starting point as the fixed-combination list this
+    function replaced. Kept here as a simpler, dependency-free utility/
+    reference point, not deleted.
+    """
+    return content_flag_count(messages_df) >= min_flags
+
+
+def fit_content_flag_weights(labelled_df: pd.DataFrame) -> LogisticRegression:
+    """
+    Fits LogisticRegression(CONTENT_FLAG_COLS -> rule_flagged) on rows with
+    REAL telecom rule-engine labels (rule_evaluated==True, non-null
+    rule_flagged) - the fitted coefficients become each flag's DATA-DRIVEN
+    weight (magnitude AND sign, not just presence/absence) instead of an
+    unweighted count (content_flagged_by_count()) or a hand-picked
+    combination (content_flagged()). Ground truth for the fit is
+    rule_flagged, NOT the content flags predicting each other - this is
+    fitting "how well does this SET of flags predict the REAL rule-engine
+    label", not reconstructing content_flagged()'s own formula.
+
+    MUST be fit on a pool with BOTH classes present - SMPP alone has ZERO
+    confirmed-clean rule_evaluated rows (CLAUDE.md), so a SMPP-only
+    `labelled_df` raises here rather than silently fitting a degenerate
+    single-class model. Fit on the combined SMPP+SS7 labelled pool (SS7
+    supplies the negatives) - content-flag regex patterns aren't
+    source-specific, so a combined fit is the right scope, same reasoning
+    as rule_pattern_score training on both sources by default.
+
+    The rows THIS model is later applied to (rule_evaluated==False, see
+    content_flagged_by_weight()) are a genuinely different, unlabelled
+    pool - fitting here on the real-labelled rows and predicting on the
+    unlabelled ones is standard supervised generalization, not the
+    tautology risk content_flagged()/content_flagged_by_count() carry
+    when their formula-based label is used on rows that also see the same
+    flags as model FEATURES for those same rows' OWN prediction target.
+    """
+    missing = [c for c in CONTENT_FLAG_COLS if c not in labelled_df.columns]
+    if missing:
+        raise ValueError(
+            f"labelled_df is missing content-flag column(s): {missing} - "
+            "run features/content_flags.py (pipeline.py Stage 3b) first"
+        )
+    if "rule_flagged" not in labelled_df.columns:
+        raise ValueError("labelled_df has no rule_flagged column - pass rule_evaluated==True rows")
+    X = labelled_df[CONTENT_FLAG_COLS].astype(float).to_numpy()
+    y = (labelled_df["rule_flagged"] == True).astype(int).to_numpy()  # noqa: E712
+    if len(set(y.tolist())) < 2:
+        raise ValueError(
+            "fit_content_flag_weights() needs both classes present in labelled_df - got only "
+            "one. SMPP alone has zero confirmed-clean rule_evaluated rows (see CLAUDE.md); "
+            "fit on the combined SMPP+SS7 labelled pool instead."
+        )
+    model = LogisticRegression(max_iter=1000)
+    model.fit(X, y)
+    return model
+
+
+def content_flag_weights(model: LogisticRegression) -> dict:
+    """Named {flag: coefficient} view of a model fit by
+    fit_content_flag_weights() - for printing/logging the measured
+    weights, not for scoring (see content_flag_weighted_score())."""
+    return dict(zip(CONTENT_FLAG_COLS, model.coef_[0].tolist()))
+
+
+def content_flag_weighted_score(messages_df: pd.DataFrame, model: LogisticRegression) -> pd.Series:
+    """
+    P(rule_flagged) per row from a model fit by fit_content_flag_weights(),
+    applied to ANY frame with CONTENT_FLAG_COLS present (typically the
+    rule_evaluated==False pool - see content_flagged_by_weight()).
+    """
+    missing = [c for c in CONTENT_FLAG_COLS if c not in messages_df.columns]
+    if missing:
+        raise ValueError(
+            f"messages_df is missing content-flag column(s): {missing} - "
+            "run features/content_flags.py (pipeline.py Stage 3b) first"
+        )
+    X = messages_df[CONTENT_FLAG_COLS].astype(float).to_numpy()
+    return pd.Series(model.predict_proba(X)[:, 1], index=messages_df.index)
+
+
+def content_flagged_by_weight(
+    messages_df: pd.DataFrame, model: LogisticRegression, threshold: float = 0.5,
+) -> pd.Series:
+    """
+    True where content_flag_weighted_score() >= threshold - the
+    data-driven counterpart to content_flagged_by_count()/content_flagged().
+    threshold=0.5 is the natural midpoint of a calibrated-by-construction
+    logistic regression probability, same "unvalidated starting point"
+    status as serving/app.py's _FRAUD_THRESHOLD - not tuned against a
+    target precision/recall yet.
+    """
+    return content_flag_weighted_score(messages_df, model) >= threshold

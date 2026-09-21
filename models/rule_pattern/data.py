@@ -41,6 +41,19 @@ decision==1 directly (labels/rule_labels.py found ~7.5% of SS7's
 decision==1 rows are non-spam fraud types; rule_flagged already encodes
 fraud_type=="spam" specifically, decision alone doesn't).
 
+OPT-IN SECOND LABEL POOL: load_unevaluated_messages() +
+label_content_flagged_positives() below add confident POSITIVES (never
+negatives) from rule_evaluated==False rows, scored by a LogisticRegression
+fit on the REAL rule_flagged labels (labels/rule_labels.py::
+fit_content_flag_weights()/content_flagged_by_weight()) instead of an
+unweighted flag count - gated behind models/rule_pattern/train.py's
+--include_content_labels, never in the default load_labelled_messages()
+path. Kept in its own label_source column, same "never silently merge
+label sources" rule as labels/rule_labels.py's content_flagged() -
+CONTENT_FLAG_COLS are also features here, so this pool's label is still
+derived from them; see label_content_flagged_positives()'s docstring for
+the full reasoning.
+
 EMBEDDINGS/TF-IDF, both OPTIONAL and INDEPENDENTLY toggleable
 (use_embeddings=, use_tfidf= on build_feature_matrix() below): "not
 embeddings" in the module summary above is a scoping decision for the
@@ -95,6 +108,11 @@ import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+from labels.rule_labels import (
+    LABEL_SOURCE_CONTENT_STATIC_RULES,
+    LABEL_SOURCE_TELECOM_RULE_ENGINE,
+    content_flagged_by_weight,
+)
 from models.anomaly.data import (
     BEHAVIORAL_COLS,
     CONTENT_FLAG_COLS,
@@ -121,10 +139,12 @@ TFIDF_NGRAM_RANGE = (1, 3)
 TFIDF_MIN_DF = 5
 
 
-def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
+def _load_messages_csv(messages_path: Path) -> pd.DataFrame:
     """
-    Rows with rule_evaluated==True only, from ONE source's full
-    messages_with_behavioral.csv. Caller concatenates across sources.
+    Shared dtype-explicit CSV read behind load_labelled_messages() and
+    load_content_labelled_messages() below - every row of ONE source's
+    full messages_with_behavioral.csv, unfiltered (callers pick their own
+    rule_evaluated slice).
 
     NO low_memory=False here, unlike most other CSV reads in this
     codebase (features/behavioral.py, features/text_embeddings.py,
@@ -189,7 +209,73 @@ def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
     # hit before: pandas can infer one source file's record_id/
     # originator as int64 and another's as str, which silently breaks
     # downstream joins/dtype consistency once concatenated).
-    return df[df["rule_evaluated"] == True].copy()  # noqa: E712
+    return df
+
+
+def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
+    """
+    Rows with rule_evaluated==True only, from ONE source's full
+    messages_with_behavioral.csv - the real, telecom-rule-engine-derived
+    label pool. Caller concatenates across sources. label_source is always
+    tagged LABEL_SOURCE_TELECOM_RULE_ENGINE (labels/rule_labels.py) so a
+    caller that also mixes in load_content_labelled_messages() below can
+    tell the two pools apart in evaluation, never by silently assuming
+    "everything in df is telecom-labelled".
+    """
+    df = _load_messages_csv(messages_path)
+    df = df[df["rule_evaluated"] == True].copy()  # noqa: E712
+    df["label_source"] = LABEL_SOURCE_TELECOM_RULE_ENGINE
+    return df
+
+
+def load_unevaluated_messages(messages_path: Path) -> pd.DataFrame:
+    """
+    Rows with rule_evaluated==False only, from ONE source's full
+    messages_with_behavioral.csv - the pool label_content_flagged_positives()
+    below draws candidate positives from. Unlike load_labelled_messages(),
+    rule_flagged is NOT a usable label here (NA for every row in this
+    pool, by definition of rule_evaluated==False).
+    """
+    df = _load_messages_csv(messages_path)
+    return df[df["rule_evaluated"] == False].copy()  # noqa: E712
+
+
+def label_content_flagged_positives(
+    unevaluated_df: pd.DataFrame, weight_model, threshold: float = 0.5,
+) -> pd.DataFrame:
+    """
+    Confident POSITIVES only, from a rule_evaluated==False pool
+    (load_unevaluated_messages()) - expands the rule_pattern_score
+    training pool beyond the rule-evaluated pool using
+    labels/rule_labels.py::content_flagged_by_weight(): `weight_model` is
+    a LogisticRegression fit by fit_content_flag_weights() on the REAL
+    labelled pool (rule_evaluated==True, both sources - see that
+    function's docstring for why SMPP alone can't fit one), so each
+    content flag counts toward the label in proportion to how well it
+    ACTUALLY predicted rule_flagged, not an unweighted count or a
+    hand-picked combination.
+
+    NO negatives come from this pool: a row scoring below `threshold` is
+    not labelled clean here - a low content-flag score doesn't mean
+    "not spam" (it may be spam that doesn't use these literal patterns at
+    all, or ordinary untouched traffic) - only a confident positive hit is
+    a strong enough signal to use as a label at all.
+
+    label_source is tagged LABEL_SOURCE_CONTENT_STATIC_RULES - NEVER
+    silently blended with load_labelled_messages()'s telecom-derived rows;
+    a caller that combines both must keep this column so evaluation can be
+    broken down per label_source (see models/rule_pattern/train.py's
+    --include_content_labels), since these rows' rule_flagged label is
+    still derived from the same CONTENT_FLAG_COLS this model also uses as
+    features - real risk of an inflated-looking metric on this slice
+    specifically, disclosed rather than hidden inside one combined number.
+    """
+    positives = unevaluated_df[
+        content_flagged_by_weight(unevaluated_df, weight_model, threshold=threshold)
+    ].copy()
+    positives["rule_flagged"] = True
+    positives["label_source"] = LABEL_SOURCE_CONTENT_STATIC_RULES
+    return positives
 
 
 def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
