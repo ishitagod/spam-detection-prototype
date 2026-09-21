@@ -61,15 +61,55 @@ BEHAVIORAL_LONG_WINDOW = "1h"  # sender_msgs_last_1hr, sender_unique_destination
 # work, flagged here rather than silently assumed complete.
 CONTENT_FLAG_PATTERNS = {
     "has_url": r"https?://|www\.",
-    "has_shortlink": r"\b(?:bit\.ly|tinyurl\.com|t\.co|goo\.gl|is\.gd|ow\.ly)\b",
+    "has_shortlink": r"\b(?:bit\.ly|tinyurl\.com|t\.co|goo\.gl|is\.gd|ow\.ly|rebrand\.ly|cutt\.ly|tiny\.cc|shorturl\.at)\b",
     "has_phone_number": r"\b(?:\+?\d[\d\-\s]{8,}\d)\b",
-    "has_currency_symbol": r"[$€£₹]|\b(?:usd|inr|eur|gbp)\b",
-    "has_urgency_keyword": r"\b(?:urgent|immediately|act now|expires?|last chance|final notice|limited time)\b",
-    "has_prize_keyword": r"\b(?:won|winner|prize|reward|claim now|congratulations|selected)\b",
-    "has_gambling_keyword": r"\b(?:casino|betting|lottery|jackpot|bet now|poker)\b",
-    "has_loan_keyword": r"\b(?:loan|credit approved|pre-?approved|cash advance|instant loan)\b",
-    "has_otp_keyword": r"\b(?:otp|one[- ]time password|verification code|security code)\b",
+    "has_currency_symbol": r"[$€£₹¥₩₦]|\b(?:usd|inr|eur|gbp|jpy|krw|ngn)\b",
+    # English + Spanish/Portuguese/French/Hindi(Latin-script)/Indonesian
+    # urgency phrasing - same MiniLM multilingual corpus this project
+    # already embeds text with (paraphrase-multilingual-MiniLM-L12-v2), so
+    # these regex flags cover the same language mix rather than English-only.
+    "has_urgency_keyword": (
+        r"\b(?:urgent|immediately|act now|expires?|last chance|final notice|limited time"
+        r"|urgente|inmediatamente|ahora mismo|expira|ultima chance|urgent(?:e)?|immediatement"
+        r"|jaldi|abhi|turant|segera|sekarang)\b"
+    ),
+    "has_prize_keyword": (
+        r"\b(?:won|winner|prize|reward|claim now|congratulations|selected"
+        r"|ganador|premio|felicidades|reclamar ahora|ganhador|premio|parabens"
+        r"|felicitations|gagnant|inaam|jeeta|badhai ho|pemenang|hadiah|selamat)\b"
+    ),
+    "has_gambling_keyword": (
+        r"\b(?:casino|betting|lottery|jackpot|bet now|poker"
+        r"|loteria|apuesta|apostar ahora|loteria|aposta|sorteio"
+        r"|satta|matka|jua|judi|togel)\b"
+    ),
+    "has_loan_keyword": (
+        r"\b(?:loan|credit approved|pre-?approved|cash advance|instant loan"
+        r"|prestamo|credito aprobado|prestamo instantaneo|emprestimo|credito aprovado"
+        r"|pret|credit approuve|karza|rin|udhaar|pinjaman|kredit disetujui)\b"
+    ),
+    "has_otp_keyword": r"\b(?:otp|one[- ]time password|verification code|security code|code de verification|codigo de verificacion|codigo de seguranca)\b",
     "has_excessive_punctuation": r"[!?]{2,}",
+    # Impersonation of a bank/government/delivery entity plus a call-to-
+    # action verb - distinct from generic urgency, catches phishing/smishing
+    # framed as an official notice rather than a marketing-style offer.
+    "has_account_verification_keyword": (
+        r"\b(?:verify your account|account suspended|account locked|unusual activity"
+        r"|update your (?:kyc|details|payment)|confirm your identity|reactivate your account"
+        r"|verifica tu cuenta|cuenta suspendida|confirme sua conta)\b"
+    ),
+    "has_delivery_scam_keyword": (
+        r"\b(?:package (?:is )?held|delivery failed|redeliver(?:y)?|customs fee|pay a? ?small fee"
+        r"|shipment on hold|track your (?:package|parcel|order)|paquete retenido|entrega fallida)\b"
+    ),
+    "has_crypto_investment_keyword": (
+        r"\b(?:crypto|bitcoin|invest(?:ment)? opportunity|guaranteed returns?|double your money"
+        r"|forex signals?|trading bot|inversion garantizada|criptomoneda|retornos garantidos)\b"
+    ),
+    "has_tax_authority_impersonation_keyword": (
+        r"\b(?:irs|tax refund|income tax department|tax rebate|customs duty|penalty notice"
+        r"|reembolso de impuestos|receita federal|imposto de renda)\b"
+    ),
 }
 
 # --- Text embeddings (features/text_embeddings.py) -----------------------
