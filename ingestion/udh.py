@@ -76,6 +76,30 @@ def parse_udh(raw: bytes) -> UdhInfo:
     takes. Real concat-only and port-only headers (the SMPP multipart test
     fixture; the SS7 dcs=4 Application Port Addressing case) still pass,
     since those DO populate one of the two.
+
+    TRADEOFF, CHECKED AGAINST THE FULL REAL CORPUS, NOT JUST THEORY: this
+    also rejects any real (spec-legal) UDH whose ONLY IEs are neither
+    concat nor port (e.g. GSM 03.40 National Language Locking/Single Shift,
+    0x24/0x25) - a theoretical regression risk versus the OLD (pre-this-fix)
+    behavior, which stripped ANY structurally-valid header regardless of
+    which IE it contained. Verified this isn't a real regression on this
+    data: replaying the OLD accept-anything logic against the full raw
+    SMPP+SS7 corpus (10,464,214 content rows) found 162,486 rows where OLD
+    said "header present" and this (new) logic says "not present" - among
+    those, decoding with OLD's stripping was MORE printable
+    (_printable_score, >0.05 margin) for only 802 rows (0.5%), and among
+    the highest-confidence subset of those (score>0.9, >0.1 margin) EVERY
+    example was a degenerate near-empty leftover fragment (e.g. a single
+    non-ASCII byte trivially scoring 1.0), not real legible text - i.e.
+    zero genuine "real header with an unrecognized IE" cases found. Over
+    the same disagreement set, 12,477 rows (7.7%) showed the OPPOSITE - NOT
+    stripping (this module's new behavior) was clearly more printable,
+    meaning OLD's looser accept-anything check was actively WRONG on those
+    rows (stripping real leading text it mistook for a header). Net: this
+    fix is a real improvement on the actual data in this system, not a
+    theoretical tradeoff that happens to also cost something real -
+    re-run this same comparison if a future data source is added, don't
+    assume it transfers unchanged.
     """
     if len(raw) < 2:
         return UdhInfo(False, 0, None, None, None, None)

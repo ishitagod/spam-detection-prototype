@@ -1,11 +1,28 @@
 """
 FastAPI service - CLAUDE.md's "Next: 1. FastAPI service combining both
-scores" step. Both scores are computed: rule_pattern_score
-(serving/scoring.py) drives fraud_results/recommended_action per the
-external response contract; anomaly_score (serving/anomaly_scoring.py) is
-computed alongside it and surfaced on ScoreResponse.anomaly_score for
-visibility only - see serving/schemas.py's module docstring for why it
-doesn't gate the FRAUD/NOT_FRAUD decision yet.
+scores" step. Three scores are computed: rule_pattern_score
+(serving/scoring.py), anomaly_score (serving/anomaly_scoring.py), and -
+when a decision-fusion champion is available for this source -
+fusion_score (serving/fusion_scoring.py), a small trained model over the
+first two. See serving/schemas.py's module docstring for the SCOPE note.
+
+DECISION FUSION, how it gates the decision without violating CLAUDE.md's
+"no averaging, keep disagreement visible":
+  1. rule_pattern_score and anomaly_score are always both computed and
+     always both surfaced unchanged (risk_score still derives from
+     rule_pattern_score; anomaly_score is its own field) - fusion never
+     overwrites either.
+  2. anomaly_score is computed before the fraud_type loop now (fusion
+     needs it for the decision, not just display) - same best-effort
+     try/except as before.
+  3. If a fusion champion exists for canonical.source and anomaly_score
+     succeeded, fusion_score drives `prediction`/`recommended_action`
+     (same _FRAUD_THRESHOLD). Otherwise prediction falls back to
+     rule_pattern_score alone - identical to pre-fusion behavior.
+  4. When fusion is the reason a row is FRAUD (rule_pattern_score alone
+     was below threshold, anomaly_score pushed it over), `_reason_codes()`
+     adds ANOMALY_SIGNAL_ESCALATION - see that function's docstring for
+     why the opposite direction isn't reason-coded.
 
 TWO endpoints (/v1/score/smpp, /v1/score/ss7), ONE scoring path: SMPP and
 SS7 carry genuinely different raw wire fields (serving/schemas.py's
@@ -64,6 +81,8 @@ from serving.anomaly_scoring import ChampionUnavailableError as AnomalyChampionU
 from serving.anomaly_scoring import CorpusUnavailableError
 from serving.canonical import CanonicalRow, map_smpp_transaction, map_ss7_transaction
 from serving.feature_lookup import get_imsi_features, get_sender_features
+from serving.fusion_scoring import score_fusion
+from serving.fusion_scoring import ChampionUnavailableError as FusionChampionUnavailableError
 from serving.schemas import (
     FeatureContribution,
     FraudPredictionResult,
@@ -129,6 +148,7 @@ def _confidence(cold_start: bool, text_decode_failed: bool) -> int:
 
 def _reason_codes(
     row: dict, cold_start: bool, contributions: list[tuple[str, float, float]],
+    fusion_delta: str | None = None,
 ) -> list[str]:
     """Reason codes for a FRAUD prediction, membership now driven by REAL
     per-request SHAP contributions (serving.scoring.explain_rule_pattern),
@@ -140,7 +160,15 @@ def _reason_codes(
     cold_start/text_decode_failed codes plus the base code, same as
     before explainability existed.
 
-    TODO: these 5 codes are still OUR OWN placeholder set, not validated
+    `fusion_delta`: "escalated" when fusion_score is the reason this row is
+    FRAUD at all (rule_pattern_score alone was below threshold, anomaly_score
+    pushed it over). None on agreement, or when no fusion champion exists
+    yet. The opposite direction (fusion suppressing a would-be FRAUD call)
+    isn't reason-coded - reason_codes are FRAUD-only, same cost-control
+    convention as this function's other codes; still visible via the raw
+    risk_score/anomaly_score/fusion_score fields.
+
+    TODO: these codes are still OUR OWN placeholder set, not validated
     against the external spec's Table 8-4 enum (unknown as of writing -
     the one example response seen so far used "PROMOTIONAL_CONTENT",
     which isn't in this list). Revisit once Table 8-4 is available: align
@@ -159,6 +187,8 @@ def _reason_codes(
         codes.append("NEW_SENDER_LOW_HISTORY")
     if row.get("text_decode_failed"):
         codes.append("UNDECODABLE_CONTENT")
+    if fusion_delta == "escalated":
+        codes.append("ANOMALY_SIGNAL_ESCALATION")
     return codes
 
 
@@ -219,6 +249,45 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
         reference, model_version, probability, int((time.perf_counter() - stage_start) * 1000),
     )
 
+    # Computed ahead of the fraud_type loop now - fusion needs it to make
+    # the decision, not just display it. Best-effort, same as before.
+    stage_start = time.perf_counter()
+    try:
+        anomaly_score, _, _ = score_anomaly(canonical, behavioral)
+        logger.info(
+            "[%s] anomaly_score (IsolationForest + FAISS near-dup) = %.4f in %dms",
+            reference, anomaly_score, int((time.perf_counter() - stage_start) * 1000),
+        )
+    except (AnomalyChampionUnavailableError, CorpusUnavailableError) as e:
+        logger.warning("[%s] anomaly_score unavailable: %s", reference, e)
+        anomaly_score = None
+    except Exception as e:
+        logger.warning("[%s] anomaly_score failed: %s", reference, e)
+        anomaly_score = None
+
+    # Only runs if anomaly_score succeeded and a fusion champion exists for
+    # this source. `decision_score` drives prediction below; `fusion_score`
+    # (possibly None) is surfaced on the response.
+    fusion_score: float | None = None
+    if anomaly_score is not None:
+        stage_start = time.perf_counter()
+        try:
+            fusion_score, fusion_version = score_fusion(canonical.source, probability, anomaly_score)
+            logger.info(
+                "[%s] fusion_score (decision_fusion v%s) = %.4f in %dms",
+                reference, fusion_version, fusion_score, int((time.perf_counter() - stage_start) * 1000),
+            )
+        except FusionChampionUnavailableError as e:
+            logger.info("[%s] fusion_score unavailable, falling back to rule_pattern_score alone: %s", reference, e)
+        except Exception as e:
+            logger.warning("[%s] fusion_score failed, falling back to rule_pattern_score alone: %s", reference, e)
+    decision_score = fusion_score if fusion_score is not None else probability
+    fusion_escalated = (
+        fusion_score is not None
+        and decision_score >= _FRAUD_THRESHOLD
+        and probability < _FRAUD_THRESHOLD
+    )
+
     # Empty/omitted fraud_types means "evaluate every supported type", per
     # the API spec - NOT "evaluate nothing" (see SS7ScoreRequest's
     # docstring; the old `if "SPAM_SMS" in request.fraud_types` check got
@@ -236,7 +305,7 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
     fraud_results: list[FraudPredictionResult] = []
     for fraud_type in to_evaluate:
         if fraud_type == "SPAM_SMS":
-            prediction = "FRAUD" if probability >= _FRAUD_THRESHOLD else "NOT_FRAUD"
+            prediction = "FRAUD" if decision_score >= _FRAUD_THRESHOLD else "NOT_FRAUD"
 
             reason_codes: list[str] = []
             feature_contributions: list[FeatureContribution] = []
@@ -256,7 +325,10 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
                 except Exception as e:
                     logger.warning("[%s] reason-code explanation unavailable: %s", reference, e)
                     contributions = []
-                reason_codes = _reason_codes(row, cold_start, contributions)
+                reason_codes = _reason_codes(
+                    row, cold_start, contributions,
+                    fusion_delta="escalated" if fusion_escalated else None,
+                )
                 feature_contributions = [
                     FeatureContribution(feature=f, value=v, contribution=c)
                     for f, v, c in contributions[:_TOP_K_CONTRIBUTIONS]
@@ -277,26 +349,6 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
 
     recommended_action = "BLOCK" if any(r.prediction == "FRAUD" for r in fraud_results) else "PASS"
 
-    # Independent of rule_pattern_score above - a failure here (no
-    # promoted anomaly champion yet, no corpus for this source, etc.)
-    # must NOT turn a successful rule_pattern_score result into
-    # status=FAILURE; anomaly_score is surfaced for visibility, not a
-    # required part of this response (see schemas.ScoreResponse's
-    # anomaly_score docstring).
-    stage_start = time.perf_counter()
-    try:
-        anomaly_score, _, _ = score_anomaly(canonical, behavioral)
-        logger.info(
-            "[%s] anomaly_score (IsolationForest + FAISS near-dup) = %.4f in %dms",
-            reference, anomaly_score, int((time.perf_counter() - stage_start) * 1000),
-        )
-    except (AnomalyChampionUnavailableError, CorpusUnavailableError) as e:
-        logger.warning("[%s] anomaly_score unavailable: %s", reference, e)
-        anomaly_score = None
-    except Exception as e:
-        logger.warning("[%s] anomaly_score failed: %s", reference, e)
-        anomaly_score = None
-
     processing_time_ms = int((time.perf_counter() - start) * 1000)
     logger.info(
         "[%s] scored in %dms -> prediction=%s recommended_action=%s",
@@ -312,4 +364,5 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
         model_version=model_version,
         fraud_results=fraud_results,
         anomaly_score=anomaly_score,
+        fusion_score=fusion_score,
     )

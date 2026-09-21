@@ -252,11 +252,19 @@ def run(
         # fits/transforms internally), since `pipeline` bundles the
         # preprocessor itself - that's the actual input shape a caller of
         # this logged model must supply, not the already-transformed X.
-        combined, _, _ = build_combined_frame(df)
-        input_example = combined.head(5)
+        # Built on df.head(5) only, NOT the full df again - rebuilding the
+        # combined frame for the whole corpus a second time here (after
+        # training already peaked memory) OOM'd on SS7's 2.74M-row corpus;
+        # 5 rows is all infer_signature/log_model actually need.
+        input_example, _, _ = build_combined_frame(df.head(5))
         signature = infer_signature(input_example, pipeline.predict(input_example))
+        # skops_trusted_types: ChunkedEmbeddingReducer (models/anomaly/data.py)
+        # is our own class, not a stdlib sklearn one - mlflow's skops-based
+        # serializer refuses unrecognized types by default (a real safety
+        # check, not a bug) unless explicitly told this one is trusted.
         mlflow.sklearn.log_model(
-            pipeline, name="model", signature=signature, input_example=input_example
+            pipeline, name="model", signature=signature, input_example=input_example,
+            skops_trusted_types=["models.anomaly.data.ChunkedEmbeddingReducer"],
         )
         print(
             f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={experiment_name})"

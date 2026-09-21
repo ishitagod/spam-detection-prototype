@@ -14,7 +14,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.anomaly.data import (
-    BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, IMSI_DISTINCT_ORIG_KNOWN_COL,
+    BEHAVIORAL_COLS, CONTENT_FLAG_COLS, IMSI_DISTINCT_ORIG_COL,
+    IMSI_DISTINCT_ORIG_KNOWN_COL,
     NEAR_DUP_COLS, SENDER_AGE_BUCKET_COLS, SENDER_AGE_BUCKET_EDGES_DAYS,
     SENDER_AGE_BUCKET_LABELS, SENDER_AGE_DAYS_COL,
     SENDER_DIVERSITY_LONG_COL, SENDER_DIVERSITY_LONG_KNOWN_COL,
@@ -61,6 +62,8 @@ def _sample_df(n=5):
     rows = {col: (vals * reps)[:n] for col, vals in base.items()}
     rows["source"] = ["SMPP"] * n
     rows["record_id"] = [str(i) for i in range(n)]
+    for col in CONTENT_FLAG_COLS:
+        rows[col] = ([0, 0, 1, 0, 1] * reps)[:n]
     # Genuinely independent columns (not e.g. linspace(-1,1,n)+i, which
     # are all perfectly correlated after standardization - a rank-1
     # embedding block, which makes PCA's later components numerically
@@ -129,7 +132,8 @@ def test_output_width_matches_n_components_plus_other_features():
     # SHORT_COL/LONG_COL themselves are still present by name - only gated,
     # not replaced the way age is - so no "-1" for those, unlike age).
     expected_width = (
-        2 + (len(BEHAVIORAL_COLS) - 1) + len(NEAR_DUP_COLS) + 2 + 2 + 2 + len(SENDER_AGE_BUCKET_COLS)
+        2 + (len(BEHAVIORAL_COLS) - 1) + len(NEAR_DUP_COLS) + 2 + 2 + 2
+        + len(SENDER_AGE_BUCKET_COLS) + len(CONTENT_FLAG_COLS)
     )
     assert X.shape[1] == expected_width
     assert len(feature_names) == expected_width
@@ -151,9 +155,9 @@ def test_pca_explained_variance_is_accessible():
     on why this gets printed every run rather than assumed once."""
     df = _sample_df()
     _, _, preprocessor = _build(df, n_components=2)
-    pca = preprocessor.named_steps["reduce"].named_transformers_["embeddings"].named_steps["pca"]
-    assert len(pca.explained_variance_ratio_) == 2
-    assert 0.0 <= pca.explained_variance_ratio_.sum() <= 1.0
+    reducer = preprocessor.named_steps["reduce"].named_transformers_["embeddings"]
+    assert len(reducer.explained_variance_ratio_) == 2
+    assert 0.0 <= reducer.explained_variance_ratio_.sum() <= 1.0
 
 
 def test_output_is_standardized_roughly_zero_mean_unit_variance():
@@ -220,6 +224,7 @@ def test_preprocessor_is_returned_and_reusable():
         [
             transformed[non_age_behavioral_cols + NEAR_DUP_COLS + imsi_cols + velocity_cols + diversity_known_cols],
             age_bucket_dummies,
+            transformed[CONTENT_FLAG_COLS],
             transformed[embedding_cols],
         ],
         axis=1,

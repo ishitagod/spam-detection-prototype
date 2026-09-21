@@ -7,17 +7,16 @@ for batch training), one shared ScoreResponse out - see serving/app.py's
 module docstring for why there are two request parsers but one scoring
 path.
 
-SCOPE: rule_pattern_score (serving/scoring.py) drives fraud_results/
-recommended_action, per the external response contract this build has to
-match. anomaly_score (serving/anomaly_scoring.py) is scored alongside it
-and surfaced on ScoreResponse.anomaly_score for visibility - per
-CLAUDE.md's "Keep rule_pattern_score and anomaly_score separate. Do not
-average them. Disagreements between the two scores are valuable and
-should remain visible", it does NOT feed the FRAUD/NOT_FRAUD decision or
-recommended_action yet; that's a deliberate, disclosed follow-up (same
-staged-rollout status as LIME/SHAP - see serving/app.py's module
-docstring on _confidence/_reason_codes being disclosed heuristics, not
-final).
+SCOPE: rule_pattern_score (serving/scoring.py) and anomaly_score
+(serving/anomaly_scoring.py) are both scored independently and both stay
+visible on ScoreResponse - per CLAUDE.md's "keep them separate, don't
+average, disagreement stays visible", neither overwrites the other.
+DECISION FUSION (serving/fusion_scoring.py, models/decision_fusion/) adds
+a third, additive score - fusion_score, a small LogisticRegression over
+[rule_pattern_score, anomaly_score] - which drives prediction/
+recommended_action when a fusion champion is available for this source,
+falling back to rule_pattern_score alone otherwise (see serving/app.py's
+module docstring).
 """
 from typing import Annotated, Literal
 
@@ -185,3 +184,9 @@ class ScoreResponse(BaseModel):
     # never downgraded to FAILURE just because anomaly_score couldn't be
     # computed, see serving/app.py's score().
     anomaly_score: float | None = None
+    # ADDITIVE field, same status as anomaly_score above - the decision-
+    # fusion model's own output, so the real driver of `prediction`/
+    # `recommended_action` (when a fusion champion exists) is auditable.
+    # None when no fusion champion exists yet - decision falls back to
+    # rule_pattern_score alone.
+    fusion_score: float | None = None

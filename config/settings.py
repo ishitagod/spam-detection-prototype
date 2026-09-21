@@ -18,7 +18,7 @@ import os
 # override via env var for a non-docker-compose Postgres or CI.
 MLFLOW_TRACKING_URI = os.environ.get(
     "MLFLOW_TRACKING_URI",
-    "postgresql+psycopg2://spam_detection:spam_detection@localhost:5432/mlflow",
+    "postgresql+psycopg2://spam_detection:spam_detection@localhost:5433/mlflow",
 )
 
 # --- SMPP ingestion (ingestion/smpp.py) ---------------------------------

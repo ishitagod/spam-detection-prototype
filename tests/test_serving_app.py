@@ -156,6 +156,76 @@ def test_empty_fraud_types_evaluates_all_supported_not_nothing(client, monkeypat
     assert body["fraud_results"][0]["fraud_type"] == "SPAM_SMS"
 
 
+def test_fusion_escalates_low_rule_pattern_score_to_fraud(client, monkeypatch):
+    """rule_pattern_score alone (0.1) is below _FRAUD_THRESHOLD, but a
+    strongly agreeing anomaly_score pushes the FUSED decision over it -
+    ANOMALY_SIGNAL_ESCALATION must appear, and recommended_action must be
+    BLOCK even though rule_pattern_score alone would have said PASS."""
+    monkeypatch.setattr(app_module, "score_rule_pattern", _mock_score(0.1))
+    monkeypatch.setattr(
+        app_module, "score_anomaly",
+        lambda canonical, behavioral: (0.9, "anomaly_SS7/v1", {}),
+    )
+    monkeypatch.setattr(
+        app_module, "score_fusion",
+        lambda source, rule_pattern_score, anomaly_score: (0.8, "decision_fusion_model_SS7/v1"),
+    )
+    resp = client.post("/v1/score/ss7", json=SS7_PAYLOAD)
+    body = resp.json()
+
+    assert body["anomaly_score"] == pytest.approx(0.9)
+    assert body["fusion_score"] == pytest.approx(0.8)
+    assert body["recommended_action"] == "BLOCK"
+    result = body["fraud_results"][0]
+    assert result["prediction"] == "FRAUD"
+    assert result["risk_score"] == 10  # unchanged - still rule_pattern_score-based
+    assert "ANOMALY_SIGNAL_ESCALATION" in result["reason_codes"]
+
+
+def test_fusion_agreement_does_not_add_escalation_code(client, monkeypatch):
+    """Fusion available and agrees with rule_pattern_score (both already
+    say FRAUD) - no escalation happened, so the code must not fire."""
+    monkeypatch.setattr(app_module, "score_rule_pattern", _mock_score(0.95))
+    monkeypatch.setattr(
+        app_module, "score_anomaly",
+        lambda canonical, behavioral: (0.9, "anomaly_SS7/v1", {}),
+    )
+    monkeypatch.setattr(
+        app_module, "score_fusion",
+        lambda source, rule_pattern_score, anomaly_score: (0.97, "decision_fusion_model_SS7/v1"),
+    )
+    resp = client.post("/v1/score/ss7", json=SS7_PAYLOAD)
+    body = resp.json()
+
+    result = body["fraud_results"][0]
+    assert result["prediction"] == "FRAUD"
+    assert "ANOMALY_SIGNAL_ESCALATION" not in result["reason_codes"]
+
+
+def test_no_fusion_champion_falls_back_to_rule_pattern_score_alone(client, monkeypatch):
+    """No fusion champion for this source yet - fusion_score is None on
+    the response and the decision is identical to pre-fusion behavior."""
+    from serving.fusion_scoring import ChampionUnavailableError as FusionChampionUnavailableError
+
+    monkeypatch.setattr(app_module, "score_rule_pattern", _mock_score(0.05))
+    monkeypatch.setattr(
+        app_module, "score_anomaly",
+        lambda canonical, behavioral: (0.99, "anomaly_SS7/v1", {}),
+    )
+
+    def raise_unavailable(source, rule_pattern_score, anomaly_score):
+        raise FusionChampionUnavailableError("no fusion champion promoted yet")
+
+    monkeypatch.setattr(app_module, "score_fusion", raise_unavailable)
+    resp = client.post("/v1/score/ss7", json=SS7_PAYLOAD)
+    body = resp.json()
+
+    assert body["fusion_score"] is None
+    assert body["anomaly_score"] == pytest.approx(0.99)  # still surfaced despite fusion failing
+    result = body["fraud_results"][0]
+    assert result["prediction"] == "NOT_FRAUD"  # rule_pattern_score (0.05) alone, unaffected
+
+
 def test_champion_unavailable_returns_failure_status_not_http_error(client, monkeypatch):
     def raise_unavailable(canonical, behavioral):
         raise ChampionUnavailableError("no champion promoted yet")

@@ -66,6 +66,7 @@ def _decode_row(content_hex, dcs) -> dict:
         "concat_ref": None,
         "concat_total_parts": None,
         "concat_part_num": None,
+        "udh_dest_port": None,
     }
     if not isinstance(content_hex, str) or not content_hex:
         return empty

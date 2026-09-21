@@ -46,23 +46,41 @@ discovery, hardened incrementally from the current working baseline.
 - Rule-pattern model trains only on `rule_evaluated == True`.
 - Keep `rule_pattern_score` and `anomaly_score` separate. Do not average them.
 - Disagreements between the two scores are valuable and should remain visible.
+- Decision fusion (`models/decision_fusion/`, `serving/fusion_scoring.py`) is a
+  small trained LogisticRegression over `[rule_pattern_score, anomaly_score]`,
+  logged as its own additive `fusion_score` - not an average. It drives
+  `prediction`/`recommended_action` when a fusion champion exists for the
+  request's source, falling back to `rule_pattern_score` alone otherwise. Both
+  raw scores stay on the response unchanged either way; `ANOMALY_SIGNAL_
+  ESCALATION` reason-codes the case where fusion is why a row is FRAUD.
 
 ## ML
 
 ### Rule-pattern model
 - LightGBM.
 - Models known rule-engine patterns, not novel spam.
-- Features: canonical + behavioral + source.
-- No embeddings.
+- Features: canonical + behavioral + content-rule flags + source.
+- No embeddings by default (`--with_embeddings`/`--with_tfidf` opt in).
 - Primary metrics: PR-AUC and log loss.
 
 ### Anomaly model
 - Isolation Forest.
 - Unsupervised; no labels during training.
-- Features: MiniLM embedding + behavioral + FAISS features.
+- Features: MiniLM embedding + behavioral + content-rule flags + FAISS features.
 - MiniLM: `paraphrase-multilingual-MiniLM-L12-v2`.
 - PCA embeddings to 30 dimensions.
 - Validation against rule labels is allowed but labels must not influence training.
+
+### Content-rule flags
+- Deterministic regex features (`has_url`, `has_phone_number`,
+  `has_gambling_keyword`, etc.) computed from `text` alone -
+  `config/settings.py::CONTENT_FLAG_PATTERNS`, `features/content_flags.py`.
+- Base features for BOTH models above, same treatment as behavioral - not
+  ablation-gated like TF-IDF/embeddings.
+- A second, independent label source from the upstream rule engine (which
+  has no content/regex matching of its own) - see `labels/rule_labels.py`'s
+  `content_flagged`/`is_content_evaluated`, kept in a separate
+  `label_source` from the telecom-derived `rule_flagged`, never merged.
 
 ### FAISS
 - Near-duplicate detection using 1h and 24h windows.
@@ -178,6 +196,14 @@ Completed:
   (SS7: 2.74M vectors) - DONE, uncommitted; `m=64` empirically validated
   against a synthetic near-dup benchmark, not yet re-verified against
   the real corpus.
+- Decision fusion (`models/decision_fusion/`, `serving/fusion_scoring.py`) -
+  DONE for the mechanism (training, serving wiring, graceful fallback), but
+  no champion promoted yet for either source. SMPP's fusion training pool
+  is real (139,546 rows, both classes, 100% anomaly_score coverage); SS7's
+  is small (~19k/2.65M rows) until Isolation Forest is retrained on SS7's
+  full corpus - re-run `models.anomaly.train --sources SS7` first, then
+  `models.decision_fusion.train --source SS7`, then promote both via
+  `models.compare_versions`.
 
 Next:
 0. Kafka-fed streaming ingestion, replacing scheduled-batch behavioral

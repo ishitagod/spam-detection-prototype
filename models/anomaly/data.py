@@ -50,8 +50,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, IncrementalPCA
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -241,21 +242,74 @@ def embedding_pca_pipeline(n_embedding_components: int) -> Pipeline:
     ])
 
 
+EMBEDDING_CHUNK_SIZE = 200_000  # rows per partial_fit/transform batch
+
+
+class ChunkedEmbeddingReducer(BaseEstimator, TransformerMixin):
+    """
+    Same operation as embedding_pca_pipeline() (StandardScaler -> PCA),
+    fit/transformed in EMBEDDING_CHUNK_SIZE-row batches via partial_fit -
+    ONLY used inside build_preprocessor() below, for training at the full
+    multi-million-row corpus scale where a plain StandardScaler.fit() on
+    the whole embedding matrix at once is unsafe: numpy upcasts float32 X
+    to float64 when subtracting sklearn's float64 mean internally
+    (X - T in sklearn.utils.extmath._incremental_mean_and_var), so a
+    single (n_rows, 384) fit briefly needs float64-sized memory (~2x the
+    raw embeddings.npy) regardless of X's own dtype - measured to OOM a
+    16GB machine on SS7's 2.74M-row corpus. Chunking bounds that
+    intermediate to EMBEDDING_CHUNK_SIZE rows at a time, fitting the exact
+    same full corpus, not a sample - see docs/experiments/anomaly.md.
+    embedding_pca_pipeline() itself is untouched (still a plain
+    Pipeline(StandardScaler, PCA)) - rule_pattern's embeddings path and
+    live single-row serving (serving/scoring.py) don't operate at this
+    scale and don't need chunking.
+    """
+
+    def __init__(self, n_components: int, chunk_size: int = EMBEDDING_CHUNK_SIZE):
+        self.n_components = n_components
+        self.chunk_size = chunk_size
+
+    def fit(self, X, y=None):
+        X = np.asarray(X, dtype=np.float32)
+        self.scaler_ = StandardScaler()
+        for start in range(0, len(X), self.chunk_size):
+            self.scaler_.partial_fit(X[start:start + self.chunk_size])
+
+        self.pca_ = IncrementalPCA(n_components=self.n_components)
+        for start in range(0, len(X), self.chunk_size):
+            chunk = self.scaler_.transform(X[start:start + self.chunk_size])
+            self.pca_.partial_fit(chunk)
+
+        self.explained_variance_ratio_ = self.pca_.explained_variance_ratio_
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        out = np.empty((len(X), self.n_components), dtype=np.float32)
+        for start in range(0, len(X), self.chunk_size):
+            end = start + self.chunk_size
+            out[start:end] = self.pca_.transform(self.scaler_.transform(X[start:end]))
+        return out
+
+
 def build_preprocessor(embedding_cols: list[str], other_cols: list[str], n_embedding_components: int) -> Pipeline:
     """
-    embedding_cols -> embedding_pca_pipeline(); other_cols -> passthrough
+    embedding_cols -> ChunkedEmbeddingReducer(); other_cols -> passthrough
     (already log1p'd/one-hot by the caller); both concatenated, THEN a
     final StandardScaler over the combined result - the PCA components
     themselves have very unequal variance (the first component always
     varies far more than the last), so re-scaling after PCA matters for
-    the same reason scaling mattered before it.
+    the same reason scaling mattered before it. The final StandardScaler
+    is NOT chunked - its input is already PCA-reduced (n_embedding_
+    components wide, not 384), small enough that a full-corpus fit stays
+    well within memory even with the same float64-upcast behavior.
 
     Returned as a single fitted-once, reused-everywhere Pipeline - this
     IS the artifact that must travel to inference unchanged, not
     something to refit on new data (train/serve skew otherwise).
     """
     reduce = ColumnTransformer([
-        ("embeddings", embedding_pca_pipeline(n_embedding_components), embedding_cols),
+        ("embeddings", ChunkedEmbeddingReducer(n_embedding_components), embedding_cols),
         ("other", "passthrough", other_cols),
     ])
     return Pipeline([
@@ -285,7 +339,13 @@ def build_combined_frame(
     None (default, every training caller) preserves the old nunique()>1
     behavior exactly - unaffected by this parameter.
     """
-    transformed = df.copy()
+    # Excludes emb_* columns from the copy - nothing below mutates them,
+    # and copying a (n_rows, 384) float32 block just to leave it untouched
+    # doubles memory for no reason (measured: this alone OOM'd SS7's full
+    # 2.74M-row corpus on a 16GB machine). embedding_cols is read straight
+    # from df at the bottom of this function instead.
+    embedding_cols = [c for c in df.columns if c.startswith("emb_")]
+    transformed = df.drop(columns=embedding_cols).copy()
     for col in COUNT_COLS:
         transformed[col] = np.log1p(transformed[col])
 
@@ -365,7 +425,6 @@ def build_combined_frame(
         SENDER_DIVERSITY_SHORT_COL, SENDER_DIVERSITY_SHORT_KNOWN_COL,
         SENDER_DIVERSITY_LONG_COL, SENDER_DIVERSITY_LONG_KNOWN_COL,
     ]
-    embedding_cols = [c for c in transformed.columns if c.startswith("emb_")]
     other_cols = (
         raw_passthrough_behavioral_cols + list(NEAR_DUP_COLS) + imsi_cols + velocity_cols
         + diversity_cols + SENDER_AGE_BUCKET_COLS + CONTENT_FLAG_COLS
@@ -386,7 +445,7 @@ def build_combined_frame(
         source_dummies = pd.get_dummies(transformed["source"], prefix="source")
         other_cols += list(source_dummies.columns)
         pieces.append(source_dummies)
-    pieces.append(transformed[embedding_cols])
+    pieces.append(df[embedding_cols])
 
     combined = pd.concat(pieces, axis=1)
     return combined, embedding_cols, other_cols
@@ -405,7 +464,7 @@ def build_feature_matrix(
     preprocessor = build_preprocessor(embedding_cols, other_cols, n_embedding_components)
     X = preprocessor.fit_transform(combined)
 
-    explained = preprocessor.named_steps["reduce"].named_transformers_["embeddings"].named_steps["pca"].explained_variance_ratio_
+    explained = preprocessor.named_steps["reduce"].named_transformers_["embeddings"].explained_variance_ratio_
     print(f"  PCA: {n_embedding_components} components retain {explained.sum():.1%} of embedding variance")
 
     feature_names = [f"emb_pca_{i}" for i in range(n_embedding_components)] + other_cols

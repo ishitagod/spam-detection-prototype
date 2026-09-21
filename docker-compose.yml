@@ -23,12 +23,15 @@ services:
       POSTGRES_PASSWORD: spam_detection
       POSTGRES_DB: feast_registry
     ports:
-      - "5432:5432"
+      # Host-side 5433, not 5432: this machine already runs a native
+      # Postgres on 5432, and both listeners cause connections to land on
+      # the wrong server (intermittent password-auth failures).
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/postgres_init:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U spam_detection"]
+      test: ["CMD-SHELL", "pg_isready -U spam_detection -d feast_registry"]
       interval: 5s
       timeout: 5s
       retries: 5
