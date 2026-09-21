@@ -395,20 +395,26 @@ def build_feature_matrix(
     return matrix.to_numpy(dtype=np.float64), y, matrix.columns.tolist(), fitted
 
 
-def load_labelled_messages_with_embeddings(
-    source_dir: Path, messages_path: Path
-) -> pd.DataFrame:
+def join_embeddings(df: pd.DataFrame, source_dir: Path) -> pd.DataFrame:
     """
-    Same rule_evaluated==True filter as load_labelled_messages(), INNER
-    JOINED with features/text_embeddings.py's output (emb_0..emb_{d-1}).
-    See module docstring - coverage depends on `source_dir`'s own
-    embeddings.npy: full-dataset for SS7 as of writing, still
-    sample-scale (or absent) for SMPP. The inner join silently restricts
-    to whatever's actually present - pass a single source_dir/messages_path
-    pair per source rather than assuming combined coverage.
+    INNER JOIN of ANY frame with source/record_id columns against
+    features/text_embeddings.py's output (emb_0..emb_{d-1}) for
+    `source_dir` - shared by load_labelled_messages_with_embeddings() below
+    and models/rule_pattern/train.py's --include_content_labels
+    --with_embeddings path (content-labelled rows come from the
+    rule_evaluated==False pool, which is NOT pre-joined with embeddings the
+    way load_labelled_messages_with_embeddings() is, so callers that need
+    embeddings on that pool too call this directly).
+
+    Coverage depends on `source_dir`'s own embeddings.npy - full-dataset
+    for SS7 as of writing (features/text_embeddings.py runs over the WHOLE
+    messages_with_behavioral.csv, not just rule_evaluated rows, so this
+    join works the same regardless of df's rule_evaluated composition),
+    still absent for SMPP. The inner join silently restricts to whatever's
+    actually present - pass a single source_dir/df pair per source rather
+    than assuming combined coverage.
     """
     source_dir = Path(source_dir)
-    df = load_labelled_messages(messages_path)
     df = df.copy()
     df["message_key"] = df["source"] + "|" + df["record_id"]
 
@@ -420,3 +426,16 @@ def load_labelled_messages_with_embeddings(
     emb_df["message_key"] = id_map["message_key"].to_numpy()
 
     return df.merge(emb_df, on="message_key", how="inner").reset_index(drop=True)
+
+
+def load_labelled_messages_with_embeddings(
+    source_dir: Path, messages_path: Path
+) -> pd.DataFrame:
+    """
+    Same rule_evaluated==True filter as load_labelled_messages(), INNER
+    JOINED with features/text_embeddings.py's output via join_embeddings()
+    above. See that function's docstring for coverage caveats - pass a
+    single source_dir/messages_path pair per source rather than assuming
+    combined coverage.
+    """
+    return join_embeddings(load_labelled_messages(messages_path), Path(source_dir))

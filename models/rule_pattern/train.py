@@ -71,16 +71,28 @@ positives mined from rows the telecom rule engine never evaluated
 rule_flagged labels (labels/rule_labels.py::fit_content_flag_weights() /
 content_flagged_by_weight()) rather than an unweighted flag count or a
 hand-picked combination - each content flag's weight is its OWN measured
-coefficient toward rule_flagged, printed at run start. Must be fit on a
-pool with both classes present, so this is fit on the combined SMPP+SS7
-labelled pool (SMPP alone has zero confirmed-clean rule_evaluated rows -
-CLAUDE.md). See models/rule_pattern/data.py::label_content_flagged_positives()
-for why these are POSITIVE-only additions, never labelled-clean rows.
-Adds a test-set breakdown BY label_source (telecom_rule_engine vs
+coefficient toward rule_flagged, printed at run start. Must be fit on
+whichever `sources` pool has both classes present (SMPP alone has zero
+confirmed-clean rule_evaluated rows - CLAUDE.md - so a SMPP-only run
+raises; SS7 alone or SMPP+SS7 combined both work). See
+models/rule_pattern/data.py::label_content_flagged_positives() for why
+these are POSITIVE-only additions, never labelled-clean rows. Adds a
+test-set breakdown BY label_source (telecom_rule_engine vs
 content_static_rules) alongside the existing per-source breakdown, since
 the content_static_rules slice's label is still derived from
 CONTENT_FLAG_COLS, which are also features here - a good score on just
 that slice is expected, not evidence of real generalization on its own.
+
+COMBINABLE with --with_embeddings/--with_tfidf: content-labelled rows get
+embeddings joined the same way as the base pool
+(models/rule_pattern/data.py::join_embeddings(), since
+features/text_embeddings.py runs over the WHOLE messages_with_behavioral.csv,
+not just rule_evaluated rows - a row without embedding coverage is
+silently dropped from the content-labelled addition, not the whole run).
+TF-IDF needs no such join (fit straight from `text`, works for any row
+regardless of label_source). In practice this still means `--sources SS7`
+for the embeddings combination today - SMPP has no embeddings.npy yet
+(see --with_embeddings note above), independent of content labels.
 """
 
 import argparse
@@ -104,6 +116,7 @@ from models.rule_pattern.data import (
     TFIDF_MIN_DF,
     TFIDF_NGRAM_RANGE,
     build_feature_matrix,
+    join_embeddings,
     label_content_flagged_positives,
     load_labelled_messages,
     load_labelled_messages_with_embeddings,
@@ -188,17 +201,6 @@ def run(
     include_content_labels: bool = False,
     content_flag_weight_threshold: float = 0.5,
 ) -> None:
-    if include_content_labels and with_embeddings:
-        # content-labelled rows (models/rule_pattern/data.py::
-        # label_content_flagged_positives) never carry emb_* columns,
-        # since they come from the rule_evaluated==False pool, not the
-        # embeddings-joined one - unsupported combination, fail loudly
-        # rather than silently building a feature matrix some rows can't
-        # actually populate.
-        raise ValueError(
-            "--include_content_labels is not supported together with --with_embeddings"
-        )
-
     print(
         f"Loading rule_evaluated rows for sources: {sources} "
         f"(with_embeddings={with_embeddings}, with_tfidf={with_tfidf}, "
@@ -231,11 +233,26 @@ def run(
 
         content_frames = []
         for source in sources:
-            messages_path = data_dir / source / "messages_with_behavioral.csv"
+            source_dir = data_dir / source
+            messages_path = source_dir / "messages_with_behavioral.csv"
             unevaluated = load_unevaluated_messages(messages_path)
             content_df = label_content_flagged_positives(
                 unevaluated, weight_model, threshold=content_flag_weight_threshold
             )
+            if with_embeddings:
+                # features/text_embeddings.py runs over the WHOLE
+                # messages_with_behavioral.csv (see join_embeddings()'s
+                # docstring), so these rule_evaluated==False rows can get
+                # real embeddings the same way the base pool does above -
+                # an inner join, silently restricted to whatever coverage
+                # source_dir's embeddings.npy actually has.
+                before = len(content_df)
+                content_df = join_embeddings(content_df, source_dir)
+                if len(content_df) < before:
+                    print(
+                        f"  {source}: {before - len(content_df)} content-flagged row(s) "
+                        f"dropped - no embedding coverage for them in {source_dir}"
+                    )
             print(
                 f"  {source}: +{len(content_df)} content-flagged row(s) "
                 f"(rule_evaluated==False, weight_threshold={content_flag_weight_threshold})"
@@ -510,8 +527,10 @@ def main():
         "rule engine never evaluated (rule_evaluated==False), scored by a LogisticRegression "
         "fit on the REAL rule_flagged labels (labels/rule_labels.py::fit_content_flag_weights) "
         "instead of an unweighted flag count - see models/rule_pattern/data.py::"
-        "label_content_flagged_positives()'s docstring. Not supported together with "
-        "--with_embeddings (those rows have no emb_* columns).",
+        "label_content_flagged_positives()'s docstring. Combinable with --with_embeddings: "
+        "those rows get embeddings joined the same way as the base pool (see "
+        "join_embeddings()'s docstring), silently dropped if a source's embeddings.npy "
+        "doesn't cover them.",
     )
     parser.add_argument(
         "--content_flag_weight_threshold",

@@ -101,7 +101,12 @@ discovery, hardened incrementally from the current working baseline.
   evaluated as its own breakdown (`test_by_label_source_*` metrics)
   because that slice's label is still derived from `CONTENT_FLAG_COLS`,
   which are also features. Routes to the experimental MLflow experiment,
-  same as `--with_embeddings`/`--with_tfidf`.
+  same as `--with_embeddings`/`--with_tfidf`. Combinable with both: TF-IDF
+  needs no extra work (fit straight from `text`); embeddings are joined
+  onto the content-labelled rows too via `models/rule_pattern/data.py::
+  join_embeddings()`, since `features/text_embeddings.py` runs over the
+  whole file, not just `rule_evaluated` rows - still `--sources SS7` only
+  in practice today, since SMPP has no `embeddings.npy` yet.
 
 ### FAISS
 - Near-duplicate detection using 1h and 24h windows.
