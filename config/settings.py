@@ -64,31 +64,53 @@ CONTENT_FLAG_PATTERNS = {
     "has_shortlink": r"\b(?:bit\.ly|tinyurl\.com|t\.co|goo\.gl|is\.gd|ow\.ly|rebrand\.ly|cutt\.ly|tiny\.cc|shorturl\.at)\b",
     "has_phone_number": r"\b(?:\+?\d[\d\-\s]{8,}\d)\b",
     "has_currency_symbol": r"[$€£₹¥₩₦]|\b(?:usd|inr|eur|gbp|jpy|krw|ngn)\b",
-    # English + Spanish/Portuguese/French/Hindi(Latin-script)/Indonesian
-    # urgency phrasing - same MiniLM multilingual corpus this project
-    # already embeds text with (paraphrase-multilingual-MiniLM-L12-v2), so
-    # these regex flags cover the same language mix rather than English-only.
+    # English + Spanish/Portuguese/French/Hindi(Latin-script)/Indonesian/
+    # Malay urgency phrasing, plus a SEPARATE no-\b alternation for
+    # CJK/Tamil/Malayalam script terms - \b relies on Unicode word-char
+    # transitions, and CJK/Indic text is often unspaced, so a \b-wrapped
+    # Chinese/Tamil/Malayalam term embedded mid-run would fail to match;
+    # those terms are plain substring alternatives instead. Non-English
+    # entries are a best-effort starting list, NOT native-speaker-vetted -
+    # same caveat as the English list above, treat as a starting point.
     "has_urgency_keyword": (
         r"\b(?:urgent|immediately|act now|expires?|last chance|final notice|limited time"
         r"|urgente|inmediatamente|ahora mismo|expira|ultima chance|urgent(?:e)?|immediatement"
-        r"|jaldi|abhi|turant|segera|sekarang)\b"
+        r"|jaldi|abhi|turant|segera|sekarang|cepat|tamat tempoh)\b"
+        r"|紧急|立即|马上|最后机会|限时优惠"
+        r"|அவசரம்|உடனடியாக|கடைசி வாய்ப்பு"
+        r"|അടിയന്തിരം|ഉടൻ|അവസാന അവസരം"
     ),
     "has_prize_keyword": (
         r"\b(?:won|winner|prize|reward|claim now|congratulations|selected"
         r"|ganador|premio|felicidades|reclamar ahora|ganhador|premio|parabens"
-        r"|felicitations|gagnant|inaam|jeeta|badhai ho|pemenang|hadiah|selamat)\b"
+        r"|felicitations|gagnant|inaam|jeeta|badhai ho|pemenang|hadiah|selamat|tahniah)\b"
+        r"|中奖|恭喜|奖金|中奖了"
+        r"|வெற்றியாளர்|பரிசு|வாழ்த்துக்கள்"
+        r"|വിജയി|സമ്മാനം|അഭിനന്ദനങ്ങൾ"
     ),
     "has_gambling_keyword": (
         r"\b(?:casino|betting|lottery|jackpot|bet now|poker"
         r"|loteria|apuesta|apostar ahora|loteria|aposta|sorteio"
-        r"|satta|matka|jua|judi|togel)\b"
+        r"|satta|matka|jua|judi|togel|loteri|nombor ekor)\b"
+        r"|赌场|彩票|博彩|老虎机"
+        r"|சூதாட்டம்|லாட்டரி"
+        r"|ചൂതാട്ടം|ലോട്ടറി"
     ),
     "has_loan_keyword": (
         r"\b(?:loan|credit approved|pre-?approved|cash advance|instant loan"
         r"|prestamo|credito aprobado|prestamo instantaneo|emprestimo|credito aprovado"
-        r"|pret|credit approuve|karza|rin|udhaar|pinjaman|kredit disetujui)\b"
+        r"|pret|credit approuve|karza|rin|udhaar|pinjaman|kredit disetujui|diluluskan)\b"
+        r"|贷款|借款|已批准"
+        r"|கடன்|முன் அங்கீகரிக்கப்பட்ட"
+        r"|വായ്പ|മുൻകൂർ അംഗീകാരം"
     ),
-    "has_otp_keyword": r"\b(?:otp|one[- ]time password|verification code|security code|code de verification|codigo de verificacion|codigo de seguranca)\b",
+    "has_otp_keyword": (
+        r"\b(?:otp|one[- ]time password|verification code|security code"
+        r"|code de verification|codigo de verificacion|codigo de seguranca)\b"
+        r"|验证码"
+        r"|சரிபார்ப்பு குறியீடு"
+        r"|സ്ഥിരീകരണ കോഡ്"
+    ),
     "has_excessive_punctuation": r"[!?]{2,}",
     # Impersonation of a bank/government/delivery entity plus a call-to-
     # action verb - distinct from generic urgency, catches phishing/smishing
