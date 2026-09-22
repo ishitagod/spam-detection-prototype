@@ -1,32 +1,23 @@
 """
 Training data for the decision-fusion meta-model - one row per
-rule_evaluated message with BOTH base scores (rule_pattern_score,
-anomaly_score - kept separate per CLAUDE.md, never averaged) plus the real
-label, so a small third model can learn how to weigh their disagreement.
+rule_evaluated message with both base scores (rule_pattern_score,
+anomaly_score) plus the real label.
 
-GROUND TRUTH: rule_flagged (labels/rule_labels.py) - the same label
-rule_pattern_score trains on. content_flagged is deliberately not used
-(never silently merge label sources, per that module).
+Ground truth: rule_flagged (labels/rule_labels.py) - same label
+rule_pattern_score trains on. content_flagged is not used.
 
-ANOMALY_SCORE COVERAGE IS UNEVEN, measured not assumed: joined by
-message_key against data/processed/<source>/anomaly_scores.parquet (inner
-join, same partial-coverage convention as
-models/rule_pattern/data.py::load_labelled_messages_with_embeddings()).
-SMPP: anomaly_scores.parquet covers the full 5,505,921-row corpus (100%
-join coverage) - and, correcting a stale claim elsewhere
-(models/rule_pattern/train.py's "SMPP: all flagged" note), SMPP's real
-rule_evaluated pool is 139,546 rows / 2,692 flagged, a real two-class pool.
-SS7: anomaly_scores.parquet is still a 20,000-row sample (pre-dates the
-full embeddings.npy build), so only ~0.7% (19,369/2,654,369) of SS7's
-rule_evaluated pool joins - re-run `models.anomaly.train --sources SS7` to
-refresh it, then re-run this. Printed every run, not hidden.
+Anomaly_score coverage is uneven: joined by message_key against
+data/processed/<source>/anomaly_scores.parquet (inner join). SMPP:
+100% join coverage (139,546-row rule_evaluated pool, 2,692 flagged). SS7:
+anomaly_scores.parquet is still a 20,000-row sample, so only ~0.7%
+(19,369/2,654,369) of SS7's pool joins - re-run
+`models.anomaly.train --sources SS7` to refresh it. Printed every run.
 
-RULE_PATTERN_SCORE MUST BE OUT-OF-FOLD: the champion LightGBM was fit on
-this exact pool, so scoring it with that same model would teach the fusion
-model to trust memorized rows, not real disagreement (stacking leakage).
-Uses cross_val_predict (StratifiedKFold) with a fresh LightGBM over
-models/rule_pattern/data.py::_base_feature_frame() (base features only, no
-TF-IDF/embeddings - matches the production champion's default path).
+rule_pattern_score must be out-of-fold: scoring with the champion model
+fit on this same pool would teach fusion to trust memorized rows
+(stacking leakage). Uses cross_val_predict (StratifiedKFold) with a fresh
+LightGBM over models/rule_pattern/data.py::_base_feature_frame() (base
+features only, matching the production champion's default path).
 """
 from pathlib import Path
 
@@ -44,8 +35,8 @@ def build_fusion_training_data(
     source: str, data_dir: Path, random_state: int = 42,
 ) -> pd.DataFrame:
     """Returns [message_key, source, rule_pattern_score, anomaly_score,
-    rule_flagged_label]. Empty (0 rows) if the source's rule_evaluated pool
-    is single-class - callers must handle that."""
+    rule_flagged_label]. Empty if the source's rule_evaluated pool is
+    single-class - callers must handle that."""
     source_dir = Path(data_dir) / source
     messages_path = source_dir / "messages_with_behavioral.csv"
 
@@ -87,10 +78,9 @@ def build_fusion_training_data(
 
 
 def build_feature_matrix(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """X = [rule_pattern_score, anomaly_score] raw (unscaled - the fusion
-    Pipeline scales internally), y = rule_flagged_label. Deliberately just
-    these two columns - fusion's job is weighing the two scores that
-    already exist, not re-deriving a third opinion from raw features."""
+    """X = [rule_pattern_score, anomaly_score] raw (the fusion Pipeline
+    scales internally), y = rule_flagged_label. Just these two columns -
+    fusion weighs existing scores, not raw features."""
     feature_names = ["rule_pattern_score", "anomaly_score"]
     X = df[feature_names].to_numpy(dtype=np.float64)
     y = df["rule_flagged_label"].to_numpy(dtype=int)

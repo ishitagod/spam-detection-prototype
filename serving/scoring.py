@@ -64,7 +64,12 @@ import pandas as pd
 import shap
 
 from features.content_flags import compute_content_flags
-from models.anomaly.data import BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL
+from models.anomaly.data import (
+    BEHAVIORAL_COLS,
+    IMSI_DISTINCT_ORIG_COL,
+    SENDER_VELOCITY_ZSCORE_COL,
+    compute_content_flag_meta_features,
+)
 from models.registry import MLFLOW_TRACKING_URI
 from serving.canonical import CanonicalRow
 
@@ -169,6 +174,24 @@ def _load_champion(source: str) -> _LoadedRulePatternModel:
     return _cached[source]
 
 
+KNOWN_SOURCES = ["SMPP", "SS7"]
+
+
+def preload() -> None:
+    """Warms _cached for every known source at process startup, so the
+    MLflow registry round-trip + model/vectorizer/PCA-pipeline deserialize
+    + shap.TreeExplainer build happen once at boot instead of on whichever
+    request happens to hit a cold cache first. Best-effort per source: a
+    source with no promoted champion yet is a real, expected state (see
+    ChampionUnavailableError) and must not block startup for a source that
+    does have one."""
+    for source in KNOWN_SOURCES:
+        try:
+            _load_champion(source)
+        except ChampionUnavailableError as e:
+            logger.warning("preload: rule_pattern_score champion unavailable for source=%s: %s", source, e)
+
+
 def reset_cache() -> None:
     """Test hook - forces the next score_rule_pattern() call to reload
     from MLflow instead of reusing whatever this process already cached."""
@@ -230,8 +253,16 @@ def build_rule_pattern_row(
     # used. Base features - always computed, same as the columns above,
     # not gated behind tfidf_vectorizer/embedding_pca_pipeline like
     # tfidf_*/emb_pca_* below.
-    flags = compute_content_flags(pd.Series([text])).iloc[0]
+    flags_df = compute_content_flags(pd.Series([text]))
+    flags = flags_df.iloc[0]
     for name, value in flags.items():
+        row[name] = int(value)
+    # content_flag_hit_count/any/high_conf - engineered on top of the
+    # flags above, same discipline as training (models/anomaly/data.py::
+    # compute_content_flag_meta_features()), computed here on the same
+    # single-row frame so serving matches training exactly.
+    meta = compute_content_flag_meta_features(flags_df).iloc[0]
+    for name, value in meta.items():
         row[name] = int(value)
     if tfidf_vectorizer is not None:
         tfidf_vector = tfidf_vectorizer.transform([text]).toarray()[0]

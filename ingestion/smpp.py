@@ -16,7 +16,11 @@ from common.schemas import (
     validate_features,
     validate_labels,
 )
-from config.settings import SMPP_SUBMIT_SM_OPERATION
+from config.settings import (
+    SMPP_DELIVER_SM_OPERATION,
+    SMPP_DELIVER_SM_RECEIPT_ESME_CLASS,
+    SMPP_SUBMIT_SM_OPERATION,
+)
 from ingestion.dcs_codecs import decode_by_dcs
 from ingestion.udh import UdhInfo, parse_udh as _parse_udh, strip_udh as _strip_udh
 from labels.rule_labels import build_rule_labels, is_rule_evaluated
@@ -103,9 +107,14 @@ def decode_sms_text(content_hex, dcs) -> str | None:
 
 def clean(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Keep ONLY smpp_operation == SMPP_SUBMIT_SM_OPERATION (submit_sm request
-    rows) - the actual A2P message submission that passes through the
-    network and is what's revenue-relevant for spam here.
+    Keep smpp_operation == SMPP_SUBMIT_SM_OPERATION (submit_sm, op-4) rows -
+    the actual A2P message submission that's revenue-relevant for spam
+    here - plus smpp_operation == SMPP_DELIVER_SM_OPERATION (deliver_sm,
+    op-5) rows whose esme_class != SMPP_DELIVER_SM_RECEIPT_ESME_CLASS:
+    op-5 also carries genuine inbound/forwarded message content, but
+    esme_class == 4 marks a delivery receipt (an ack about a prior
+    submission, no spam-relevant content of its own), which must stay
+    excluded.
 
     Rows with no decodable text are KEPT, not dropped: inference can't
     just refuse to score a message because its text didn't decode, so
@@ -129,7 +138,13 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     Rows with neither are genuinely single-part messages: concat_total_parts
     = concat_part_num = 1, concat_ref = None (forms its own group of one).
     """
-    df = df[df["smpp_operation"] == SMPP_SUBMIT_SM_OPERATION].copy()
+    df = df[
+        (df["smpp_operation"] == SMPP_SUBMIT_SM_OPERATION)
+        | (
+            (df["smpp_operation"] == SMPP_DELIVER_SM_OPERATION)
+            & (df["esme_class"] != SMPP_DELIVER_SM_RECEIPT_ESME_CLASS)
+        )
+    ].copy()
 
     df["dcs"] = pd.to_numeric(df["dcs"], errors="coerce") % 256
 

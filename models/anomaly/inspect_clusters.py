@@ -1,49 +1,36 @@
 """
-Human-facing inspection tool for models/anomaly/cluster_discovery.py's
-output (`fraud_type_clusters.parquet`) - makes
-docs/experiments/anomaly_clustering.md's step 4 ("hand-label each cluster")
-concrete and runnable, instead of a manual pandas join redone by hand every
-time. Joins cluster_label/anomaly_score back to messages_with_behavioral.csv
-for the actual text/originator a human needs to SEE to name a cluster.
+Human-facing inspection tool for cluster_discovery.py's output
+(`fraud_type_clusters.parquet`) - makes anomaly_clustering.md's step 4
+("hand-label each cluster") runnable instead of a manual pandas join
+redone by hand. Joins cluster_label/anomaly_score back to
+messages_with_behavioral.csv for the text/originator a human needs to
+name a cluster.
 
-DON'T LABEL FROM SAMPLE TEXTS ALONE - two real failure modes that a
-handful of sample rows can't catch:
-1. The sample can look uniform while the cluster isn't - N_SAMPLES rows
-   out of a cluster that might be thousands is not a promise the rest
-   look the same. `n_unique_texts`/`n_unique_originators` below are the
-   whole-cluster diversity check: a cluster with n_unique_texts==1 really
-   is one exact repeated message; a cluster where n_unique_texts is close
-   to n_rows is NOT one coherent pattern, whatever the 5 samples suggested.
-2. Text alone can't tell "one sender flooding the same content" apart
-   from "many senders running the same template" - same-looking text,
-   different fraud shape, and a different real-world response. That's
-   what the behavioral column means below are for (imported from
-   models.anomaly.data.BEHAVIORAL_COLS - the same columns
-   cluster_discovery.py's own summarize_clusters() prints, just not
-   previously surfaced here too). A high mean sender_msgs_last_1hr with
-   n_unique_originators==1 is a single-actor flood; a similar text
-   pattern with n_unique_originators close to n_rows and LOW per-sender
-   velocity is a templated multi-sender campaign instead - name these
-   differently.
+DON'T LABEL FROM SAMPLE TEXTS ALONE:
+1. A small sample can look uniform while the cluster isn't -
+   n_unique_texts/n_unique_originators below check the WHOLE cluster
+   (n_unique_texts==1 confirms one repeated message; close to n_rows
+   means no coherent pattern, whatever the sample suggested).
+2. Text alone can't tell "one sender flooding the same content" from
+   "many senders running the same template" - the BEHAVIORAL_COLS means
+   below distinguish them: high mean sender_msgs_last_1hr with
+   n_unique_originators==1 is a single-actor flood; similar text with
+   n_unique_originators near n_rows and low per-sender velocity is a
+   templated multi-sender campaign.
 
-near-dup columns (near_dup_match_count_1hr/24hr etc.) are DELIBERATELY
-NOT recomputed here - they're not in messages_with_behavioral.csv, and
-cluster_discovery.py already prints/logs them per cluster (its own
-printed summary, and cluster_summary.json on the matching MLflow run) -
-check there rather than duplicating that join.
+near-dup columns aren't recomputed here - not in
+messages_with_behavioral.csv; check cluster_discovery.py's own printed
+summary/cluster_summary.json instead.
 
-NOT the label-INGESTION step - see anomaly_clustering.md's step 5. This
-tool only produces what a human needs to assign fraud-type names; it does
-not feed anything back into training. The CSV it writes
-(cluster_labels_template.csv, one row per cluster with a blank
-fraud_type_label column) is meant to be hand-filled-in and become the real
-label source once that ingestion path exists - it doesn't exist yet
-(no labels/cluster_labels.py counterpart to labels/rule_labels.py).
+NOT the label-ingestion step (anomaly_clustering.md step 5) - only
+produces what a human needs to assign fraud-type names. The CSV it
+writes (cluster_labels_template.csv, blank fraud_type_label column) is
+meant to be hand-filled and become the real label source once that
+ingestion path exists (doesn't yet).
 
-CLUSTER IDS ARE PER-RUN, NOT STABLE (see cluster_discovery.py's docstring)
-- always run this against the fraud_type_clusters.parquet produced by the
-SAME cluster_discovery.py run you're currently hand-labeling, never a
-stale one from an earlier run with a different --eps/--anomaly_percentile.
+Cluster IDs are per-run, not stable - always run against the
+fraud_type_clusters.parquet from the SAME cluster_discovery.py run
+you're hand-labeling.
 
 Usage:
     python -m models.anomaly.inspect_clusters --source SS7
@@ -62,22 +49,14 @@ N_SAMPLES_DEFAULT = 5
 
 
 def load_cluster_messages(source: str, data_dir: Path) -> pd.DataFrame:
-    """
-    cluster_discovery.py's fraud_type_clusters.parquet (message_key,
-    anomaly_score, cluster_label) joined back to
-    messages_with_behavioral.csv's real content - message_key is
-    "{source}|{record_id}" (see cluster_discovery.py's df_out
-    construction), so record_id is recovered by splitting it rather than
-    needing a second source column here (this file is already
-    single-source, unlike the combined pool cluster_discovery.py itself
-    may have clustered over).
+    """fraud_type_clusters.parquet joined back to
+    messages_with_behavioral.csv's real content. message_key is
+    "{source}|{record_id}", so record_id is recovered by splitting it.
 
-    fraud_type/rule_flagged are pulled through too, deliberately: a
-    cluster where most rows already carry a REAL rule-engine fraud_type is
-    a strong, free hint for naming it (e.g. "the rules already call this
-    generic fraud, not spam specifically") even though these are, by
-    construction, mostly from the unresolved/never-rule-evaluated pool
-    (anomaly_score's training scope - see docs/ml/modeling.md).
+    fraud_type is pulled through too - a cluster where most rows already
+    carry a real rule-engine fraud_type is a strong free hint for naming
+    it, even though these are mostly from the unresolved/
+    never-rule-evaluated pool (anomaly_score's training scope).
     """
     source_dir = data_dir / source
     clusters_path = source_dir / "fraud_type_clusters.parquet"
@@ -102,16 +81,9 @@ def load_cluster_messages(source: str, data_dir: Path) -> pd.DataFrame:
 
 
 def cluster_diagnostics(group: pd.DataFrame) -> dict:
-    """The whole-cluster checks sample texts alone can't give you - see
-    module docstring. n_unique_texts/n_unique_originators are computed
-    over EVERY row in the cluster, not just the printed/template sample -
-    that's the point: a low n_unique_texts confirms "one repeated
-    message" even when the sample happened to only show 2 of them: a
-    n_unique_texts close to n_rows means the sample's apparent uniformity
-    doesn't generalize to the whole cluster. Behavioral means are the
-    same BEHAVIORAL_COLS cluster_discovery.py's own summarize_clusters()
-    already prints - surfaced here too so the CSV template alone (without
-    reopening that run's terminal output) is still enough to tell a
+    """Whole-cluster checks sample texts alone can't give you - see
+    module docstring. Computed over every row in the cluster, not just
+    the printed sample, so the CSV template alone is enough to tell a
     single-actor flood apart from a templated multi-sender campaign."""
     return {
         "n_unique_texts": int(group["text"].nunique()),
@@ -121,11 +93,9 @@ def cluster_diagnostics(group: pd.DataFrame) -> dict:
 
 
 def print_cluster_samples(df: pd.DataFrame, n_samples: int) -> None:
-    """Largest cluster first (matches cluster_discovery.py's own
-    print_cluster_summary() ordering) - noise (-1) included, same "real
-    finding, not a failure" treatment as everywhere else this label
-    appears. A fixed random_state keeps the printed sample and the
-    template file's sample_texts column showing the SAME rows."""
+    """Largest cluster first, noise (-1) included. Fixed random_state
+    keeps the printed sample and the template file's sample_texts column
+    showing the same rows."""
     sizes = df.groupby("cluster_label").size().sort_values(ascending=False)
     for cluster_id, n_rows in sizes.items():
         label = "noise (-1)" if cluster_id == -1 else f"cluster {cluster_id}"
@@ -145,12 +115,9 @@ def print_cluster_samples(df: pd.DataFrame, n_samples: int) -> None:
 
 
 def write_labeling_template(df: pd.DataFrame, out_path: Path, n_samples: int) -> pd.DataFrame:
-    """One row per cluster (noise included) - enough context (size, mean
-    anomaly_score, rule-flagged count, a handful of real sample texts) to
-    name it WITHOUT reopening the terminal output, plus a blank
-    fraud_type_label column for a human to fill in and save. This file
-    itself becomes the hand-confirmed label source once step 5's ingestion
-    path is built - see module docstring."""
+    """One row per cluster (noise included), enough context to name it
+    without reopening the terminal output, plus a blank fraud_type_label
+    column to fill in and save - see module docstring."""
     rows = []
     for cluster_id, group in df.groupby("cluster_label"):
         sample = group.sample(min(n_samples, len(group)), random_state=0)
@@ -183,12 +150,8 @@ def run(source: str, data_dir: Path, n_samples: int) -> None:
 
 
 def main():
-    # Real SMS content includes multilingual text and (on text_decode_failed
-    # rows) genuinely garbled bytes - Windows' default console codepage
-    # (cp1252) can't encode a lot of that and crashes mid-print rather than
-    # just showing it oddly. errors="replace" swaps the unprintable
-    # character for a placeholder instead of raising - never crash a
-    # hand-labeling session over a display quirk.
+    # Windows' cp1252 console can't encode real multilingual/garbled SMS
+    # content and crashes mid-print - replace instead of crashing.
     sys.stdout.reconfigure(errors="replace")
 
     parser = argparse.ArgumentParser()

@@ -1,28 +1,20 @@
 """
-The label-INGESTION step for the cluster-discovery workflow -
-docs/experiments/anomaly_clustering.md's step 5. Reads a source's
-fraud_type_clusters.parquet (models/anomaly/cluster_discovery.py's output)
-and cluster_labels_template.csv (models/anomaly/inspect_clusters.py's
-output, hand-filled by a human), calls labels.cluster_labels.build_cluster_labels()
-to join them, and accumulates the result into a durable, appendable
-cluster_labels.parquet - the actual training-label source for anything
-downstream that wants confirmed cluster-derived labels.
+The label-INGESTION step for the cluster-discovery workflow
+(anomaly_clustering.md step 5). Reads a source's fraud_type_clusters.parquet
+(cluster_discovery.py's output) and cluster_labels_template.csv
+(inspect_clusters.py's output, hand-filled by a human), joins them via
+labels.cluster_labels.build_cluster_labels(), and accumulates the result
+into a durable, appendable cluster_labels.parquet - the training-label
+source for confirmed cluster-derived labels.
 
-NOT a re-implementation of the join logic - all of that lives in
-labels/cluster_labels.py (pure, no file I/O), mirroring how
-models/rule_pattern/train.py calls labels/rule_labels.py rather than
-deriving rule_flagged itself. This script is only the CLI/file-I/O shell
-around it, same division as inspect_clusters.py is the CLI shell around
-its own pure per-cluster summary functions.
+Join logic itself lives in labels/cluster_labels.py (pure, no file I/O) -
+this script is just the CLI/file-I/O shell around it.
 
 WHY ACCUMULATE, NOT OVERWRITE: cluster_label values are per-run, not
-stable (see cluster_discovery.py's docstring) - a human will run
-cluster_discovery.py -> inspect_clusters.py -> this script repeatedly over
-time, each time against a freshly (differently-numbered) clustered batch.
-Each run's newly-confirmed labels must ADD to the accumulated label pool,
-not replace it - overwriting would silently discard every previous hand-
-labeling session's work. See ingest() below for the exact accumulation/
-dedup rule.
+stable, so a human reruns cluster_discovery -> inspect_clusters -> this
+script repeatedly over time against freshly-renumbered batches. Each
+run's confirmed labels must ADD to the pool, not replace it - see
+accumulate_labels() for the dedup rule.
 
 Usage:
     python -m models.anomaly.ingest_cluster_labels --source SS7
@@ -39,11 +31,8 @@ DEFAULT_DATA_DIR = Path("data/processed")
 
 
 def load_inputs(source: str, data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Reads the two per-source files this step depends on. Raises a
-    clear, specific error (not a silent empty frame) naming the exact
-    upstream command to run if either is missing - same convention as
-    cluster_discovery.py's load_features_and_scores() and
-    inspect_clusters.py's load_cluster_messages()."""
+    """Reads the two per-source input files; raises a clear error naming
+    the upstream command to run if either is missing."""
     source_dir = data_dir / source
     clusters_path = source_dir / "fraud_type_clusters.parquet"
     template_path = source_dir / "cluster_labels_template.csv"
@@ -65,35 +54,23 @@ def load_inputs(source: str, data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame
 
 def accumulate_labels(new_labels: pd.DataFrame, out_path: Path) -> tuple[pd.DataFrame, int]:
     """
-    Merges this run's freshly-confirmed labels into whatever's already
-    accumulated at out_path, de-duplicated on message_key so a message
-    confirmed in an earlier labeling session that reappears in a later
-    run's confirmed set ends up with exactly ONE row, not two.
+    Merges this run's confirmed labels into whatever's accumulated at
+    out_path, de-duplicated on message_key.
 
-    KEEP-NEWEST: when the same message_key is confirmed in both the
-    existing file and this run's new_labels, this run's row wins. A later
-    hand-review is presumably a more informed, more recent judgment than
-    whatever produced the earlier one (the reviewer may have seen more
-    context, refined their fraud-type taxonomy, or corrected an earlier
-    mistake) - "keep first" would let a stale, possibly-wrong label from
-    an old run permanently shadow a deliberate re-labeling. This does mean
-    a message's cluster_fraud_type_label can change across runs if a human
-    genuinely changes their mind - that's intended, not a bug: this file
-    is a living accumulated view of "current best confirmed label per
-    message", not an immutable append-only log.
+    KEEP-NEWEST: if a message_key is confirmed in both the existing file
+    and this run, this run's label wins - a later hand-review is assumed
+    more current than an older one. Means a label can change across runs
+    if a human changes their mind - intended, this file is a living
+    "current best label per message" view, not an append-only log.
 
     Returns (full accumulated frame, count of message_keys newly added
-    this run - i.e. not present in the file before this run at all, a
-    separate number from "how many total rows changed/were reconfirmed").
+    this run - distinct from rows reconfirmed/changed).
     """
     if out_path.exists():
         existing = pd.read_parquet(out_path)
         n_new = len(set(new_labels["message_key"]) - set(existing["message_key"]))
         combined = pd.concat([existing, new_labels], ignore_index=True)
-        # keep="last": new_labels was concatenated AFTER existing, so for any
-        # message_key present in both, the new_labels row (this run's,
-        # presumably more current) is the one that survives - see
-        # docstring's KEEP-NEWEST reasoning.
+        # keep="last": new_labels concatenated after existing, so ties go to this run (KEEP-NEWEST).
         combined = combined.drop_duplicates(subset="message_key", keep="last").reset_index(drop=True)
     else:
         n_new = new_labels["message_key"].nunique()

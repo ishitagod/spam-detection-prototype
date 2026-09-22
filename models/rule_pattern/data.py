@@ -1,105 +1,63 @@
 """
 Loads + prepares the supervised (`rule_pattern_score`) training data:
-messages_with_behavioral.csv, filtered to rule_evaluated==True,
-labelled by rule_flagged (True=spam, False=confirmed-clean).
+messages_with_behavioral.csv, filtered to rule_evaluated==True, labelled
+by rule_flagged (True=spam, False=confirmed-clean).
 
-GENUINELY DIFFERENT SCOPE from models/anomaly/data.py, not just a
-different model: per README.md's modeling plan, LightGBM's features are
-canonical schema + behavioral + source - NOT embeddings, NOT FAISS
-near-dup. That means this module reads straight from
-messages_with_behavioral.csv (the FULL dataset, every row, every
-source), unrestricted by features/text_embeddings.py's sampled subset -
-Isolation Forest needs that sample because it needs embeddings;
-LightGBM doesn't touch embeddings at all, so it isn't bottlenecked by
-it. Real pool: 2,693 SMPP + 349,962 SS7 rule_evaluated rows - much
-bigger than Isolation Forest's ~60k-row sample-bounded input.
+Different scope from models/anomaly/data.py: LightGBM's features are
+canonical + behavioral + source, not embeddings/FAISS. Reads straight
+from messages_with_behavioral.csv (full dataset, every source), not
+Isolation Forest's sampled subset. Real pool: 2,693 SMPP + 349,962 SS7
+rule_evaluated rows.
 
-FEATURES, deliberately narrower than Isolation Forest's:
-  - behavioral: the same 4 columns as models/anomaly/data.py, imported
-    from there rather than duplicated
-  - canonical: dcs, text_decode_failed, plus text_length (a cheap
-    derived signal, zero extra cost to add)
-  - content-rule flags (features/content_flags.py, CONTENT_FLAG_COLS):
-    base features here too, same as Isolation Forest - see that module's
-    CONTENT_FLAG_COLS comment and the architecture plan's Section 3 for
-    why these aren't gated behind use_embeddings/use_tfidf the way
-    corpus-fit TF-IDF/embeddings are
+Features (narrower than Isolation Forest's):
+  - behavioral: same 4 columns as models/anomaly/data.py
+  - canonical: dcs, text_decode_failed, text_length
+  - content-rule flags (features/content_flags.py, CONTENT_FLAG_COLS)
   - source (one-hot)
-EXCLUDED ON PURPOSE for this first build: originator/destination - too
-high-cardinality to one-hot without real overfitting risk on a pool
-this size, and behavioral features already capture originator-level
-BEHAVIOR (velocity, repeat content) without needing the raw identity.
-CatBoost's native categorical handling - already named in README.md as
-the reason to benchmark it later - is the right place to revisit this,
-not a one-hot hack here.
+Excluded: originator/destination - too high-cardinality to one-hot
+without overfitting risk; behavioral features already capture
+originator-level behavior. CatBoost's native categorical handling is the
+right place to revisit this later.
 
-NOT SCALED: unlike Isolation Forest, tree-based LightGBM splits are
-scale-invariant - no StandardScaler needed here.
+Not scaled - tree-based LightGBM splits are scale-invariant.
 
-LABEL: rule_flagged, restricted to rule_evaluated==True - NEVER
-decision==1 directly (labels/rule_labels.py found ~7.5% of SS7's
-decision==1 rows are non-spam fraud types; rule_flagged already encodes
-fraud_type=="spam" specifically, decision alone doesn't).
+Label: rule_flagged, restricted to rule_evaluated==True - never
+decision==1 directly (~7.5% of SS7's decision==1 rows are non-spam fraud
+types; rule_flagged encodes fraud_type=="spam" specifically).
 
-OPT-IN SECOND LABEL POOL: load_unevaluated_messages() +
-label_content_flagged_positives() below add confident POSITIVES (never
-negatives) from rule_evaluated==False rows, scored by a LogisticRegression
-fit on the REAL rule_flagged labels (labels/rule_labels.py::
-fit_content_flag_weights()/content_flagged_by_weight()) instead of an
-unweighted flag count - gated behind models/rule_pattern/train.py's
---include_content_labels, never in the default load_labelled_messages()
-path. Kept in its own label_source column, same "never silently merge
-label sources" rule as labels/rule_labels.py's content_flagged() -
-CONTENT_FLAG_COLS are also features here, so this pool's label is still
-derived from them; see label_content_flagged_positives()'s docstring for
-the full reasoning.
+Opt-in second label pool: load_unevaluated_messages() +
+label_content_flagged_positives() below add confident positives (never
+negatives) from rule_evaluated==False rows, scored by a
+LogisticRegression fit on real rule_flagged labels
+(labels/rule_labels.py::fit_content_flag_weights()/
+content_flagged_by_weight()), gated behind train.py's
+--include_content_labels. Kept in its own label_source column - never
+silently merged with the base pool.
 
-EMBEDDINGS/TF-IDF, both OPTIONAL and INDEPENDENTLY toggleable
-(use_embeddings=, use_tfidf= on build_feature_matrix() below): "not
-embeddings" in the module summary above is a scoping decision for the
-DEFAULT path, not a permanent architectural stance - real evidence points
-the other way. A trained baseline model's own feature importances show
-`text_length` (the only content-adjacent signal it has) as the single
-most important feature by a wide margin - meaning even a crude proxy for
-content carries real separating power, so genuine content would plausibly
-help more, not be redundant. Confirmed empirically for TF-IDF specifically:
-a standalone TfidfVectorizer+LogisticRegression test on the full real SS7
-rule_evaluated pool, split by UNIQUE TEXT (no template leaking across
-train/test), scored PR-AUC 0.934 vs a 0.669 naive baseline - real
-generalizing signal, not just template memorization.
+Embeddings/TF-IDF are optional and independently toggleable
+(use_embeddings=, use_tfidf= on build_feature_matrix()). A baseline
+model's own feature importances show `text_length` as its top feature by
+a wide margin, suggesting real content would help. Confirmed for TF-IDF:
+a standalone TfidfVectorizer+LogisticRegression test, split by unique
+text, scored PR-AUC 0.934 vs a 0.669 naive baseline.
 
-use_embeddings is NOW actually usable, not yet tried: features/
-text_embeddings.py's full-dataset run (previously a ~21hr blocker) has
-completed - embeddings now cover 100% of both sources' rule_evaluated
-pool (139,546/139,546 SMPP, 2,654,369/2,654,369 SS7 - verified against
-embeddings_id_map.parquet), not the ~1% sample-era overlap this docstring
-used to describe. The `--with_embeddings` comparison in
-models/rule_pattern/train.py is a real, runnable experiment now - see
-docs/experiments/rule_pattern.md for the case for running it (baseline
-`text_length` feature importance) and its result once run.
+use_embeddings is usable: features/text_embeddings.py's full-dataset run
+has completed, covering 100% of both sources' rule_evaluated pool
+(139,546/139,546 SMPP, 2,654,369/2,654,369 SS7). See
+docs/experiments/rule_pattern.md.
 
-Embeddings and TF-IDF are deliberately independent flags, not one combined
-"with_content" toggle: they catch different things in real spam here - TF-IDF
-is good at recognizing literal repeated TEMPLATES (this dataset's real spam
-is heavily templated), embeddings are the ones that could plausibly
-generalize to spam that's semantically similar but not worded the same.
-LightGBM can use both together without one dominating the other the way
-raw embeddings dominated Isolation Forest's joint distance-based scoring
-(scripts/check_embedding_dominance.py) - tree splits evaluate each
-feature's information gain independently, they don't blend into one
-distance metric, so the 384-vs-500-vs-~10 dimension imbalance that
-mattered for Isolation Forest isn't the same risk here.
+Embeddings and TF-IDF are independent flags, not combined: TF-IDF
+recognizes literal repeated templates (this dataset's spam is heavily
+templated); embeddings could generalize to semantically-similar but
+differently-worded spam. LightGBM handles both together without one
+dominating (unlike Isolation Forest's distance-based scoring, see
+scripts/check_embedding_dominance.py) since tree splits evaluate each
+feature's information gain independently.
 
-FIT-ON-TRAIN-ONLY: both the embedding PCA and the TF-IDF vocabulary are
-corpus-dependent transformers - fitting them on the full pool (train+test
-together) would leak test-set distribution/vocabulary into featurization
-itself, before the model ever sees a train/test split. build_feature_matrix()
-takes a `train_mask` for exactly this reason: fit happens on
-df[train_mask] only, transform applies to every row. (This also FIXES a
-pre-existing minor leak: the previous embeddings-only path fit PCA on the
-full df before train.py's split - harmless in practice for PCA, but worth
-closing now that TF-IDF's vocabulary fit makes the same mistake far more
-consequential.)
+Fit-on-train-only: embedding PCA and TF-IDF vocabulary are
+corpus-dependent transformers - fitting on the full pool would leak
+test-set information into featurization. build_feature_matrix() takes a
+`train_mask` for this: fit on df[train_mask] only, transform every row.
 """
 
 from pathlib import Path
@@ -116,9 +74,11 @@ from labels.rule_labels import (
 from models.anomaly.data import (
     BEHAVIORAL_COLS,
     CONTENT_FLAG_COLS,
+    CONTENT_FLAG_META_COLS,
     IMSI_DISTINCT_ORIG_COL,
     N_EMBEDDING_COMPONENTS,
     SENDER_VELOCITY_ZSCORE_COL,
+    compute_content_flag_meta_features,
     embedding_pca_pipeline,
 )
 
@@ -131,9 +91,8 @@ REQUIRED_COLS = (
     + CONTENT_FLAG_COLS
 )
 
-# Validated empirically (see module docstring) on the full real SS7 corpus,
-# not tuned against a target metric - a reasonable starting point, same
-# spirit as N_EMBEDDING_COMPONENTS above.
+# Validated empirically (see module docstring) on the full SS7 corpus,
+# not tuned against a target metric - a reasonable starting point.
 TFIDF_MAX_FEATURES = 500
 TFIDF_NGRAM_RANGE = (1, 3)
 TFIDF_MIN_DF = 5
@@ -142,21 +101,13 @@ TFIDF_MIN_DF = 5
 def _load_messages_csv(messages_path: Path) -> pd.DataFrame:
     """
     Shared dtype-explicit CSV read behind load_labelled_messages() and
-    load_content_labelled_messages() below - every row of ONE source's
-    full messages_with_behavioral.csv, unfiltered (callers pick their own
-    rule_evaluated slice).
+    load_content_labelled_messages() below - every row of one source's
+    full messages_with_behavioral.csv, unfiltered.
 
-    NO low_memory=False here, unlike most other CSV reads in this
-    codebase (features/behavioral.py, features/text_embeddings.py,
-    etc.) - those all operate on a single hourly file or the much
-    smaller embedding-sample scale. This is the first reader in the
-    project to load a source's ENTIRE messages_with_behavioral.csv in
-    one call (up to 5.5M rows, unrestricted by the embedding sample -
-    see module docstring for why) - low_memory=False forces pandas to
-    buffer the whole file for one-shot dtype inference, which is what
-    actually ran out of memory here. Explicit dtypes below make that
-    inference unnecessary instead, which is both the fix and the
-    faster/lower-memory path for a file this size.
+    No low_memory=False here: this reads up to 5.5M rows in one call, and
+    low_memory=False forces pandas to buffer the whole file for one-shot
+    dtype inference, which ran out of memory. Explicit dtypes below make
+    inference unnecessary - faster and lower-memory for a file this size.
     """
     messages_path = Path(messages_path)
     dtypes = {
@@ -172,55 +123,36 @@ def _load_messages_csv(messages_path: Path) -> pd.DataFrame:
         "sender_age_days": "float64",
         "sender_recipient_diversity_ratio_5min": "float64",
         "sender_recipient_diversity_ratio_1hr": "float64",
-        "sender_velocity_zscore_5min": "float64",  # can be NaN - a plain
-        # float64 column already handles that fine, unlike rule_flagged's
-        # nullable "boolean" below (True/False/NA trichotomy needs the
-        # extension dtype; a NaN float doesn't need one).
-        # pandas' nullable extension dtype, not plain bool: rule_flagged
-        # is genuinely True/False/NA (labels/rule_labels.py - NA is a
-        # real, distinct value, not missing data to impute), and without
-        # an explicit dtype here pandas sees different apparent types
-        # across chunks (bool-only vs bool+None) and throws a
-        # DtypeWarning - this is the fix, not a suppression of it.
+        "sender_velocity_zscore_5min": "float64",  # can be NaN
+        # Nullable extension dtype, not plain bool: rule_flagged is
+        # genuinely True/False/NA (NA is a real, distinct value) - without
+        # this pandas sees inconsistent types across chunks and warns.
         "rule_flagged": "boolean",
     }
     df = pd.read_csv(
         messages_path,
         usecols=lambda c: c in set(REQUIRED_COLS),
-        dtype=dtypes,  # `text` deliberately left out - free text doesn't fit a fixed dtype
+        dtype=dtypes,  # `text` left out - free text doesn't fit a fixed dtype
     )
-    # No dtype entry above for IMSI_DISTINCT_ORIG_COL on purpose - it's
-    # SS7-only (see models/anomaly/data.py's comment) and entirely absent
-    # from SMPP's file, so the lambda usecols() above silently drops it
-    # for SMPP rather than erroring. Add it back as all-NaN so every
-    # caller sees the same column regardless of source - LightGBM treats
-    # NaN as a genuine "missing" split, no imputation needed (same
-    # handling as `dcs` above).
+    # IMSI_DISTINCT_ORIG_COL is SS7-only, absent from SMPP's file - add
+    # back as all-NaN so every caller sees the same column regardless of
+    # source (LightGBM treats NaN as a genuine missing split).
     if IMSI_DISTINCT_ORIG_COL not in df.columns:
         df[IMSI_DISTINCT_ORIG_COL] = np.nan
-    # Same "absent -> default, not a required column" treatment as IMSI
-    # above, but 0 (no flags known) rather than NaN - see
-    # models/anomaly/data.py::load_source_features()'s matching comment.
+    # Same treatment for content flags, but 0 (no flags known) not NaN.
     for col in CONTENT_FLAG_COLS:
         if col not in df.columns:
             df[col] = 0
-    # source/record_id already forced to str via the dtype= dict above -
-    # same convention as every other module in this codebase (a real bug
-    # hit before: pandas can infer one source file's record_id/
-    # originator as int64 and another's as str, which silently breaks
-    # downstream joins/dtype consistency once concatenated).
     return df
 
 
 def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
     """
-    Rows with rule_evaluated==True only, from ONE source's full
-    messages_with_behavioral.csv - the real, telecom-rule-engine-derived
-    label pool. Caller concatenates across sources. label_source is always
-    tagged LABEL_SOURCE_TELECOM_RULE_ENGINE (labels/rule_labels.py) so a
-    caller that also mixes in load_content_labelled_messages() below can
-    tell the two pools apart in evaluation, never by silently assuming
-    "everything in df is telecom-labelled".
+    Rows with rule_evaluated==True only, from one source's full
+    messages_with_behavioral.csv - the telecom-rule-engine-derived label
+    pool. Caller concatenates across sources. label_source is always
+    tagged LABEL_SOURCE_TELECOM_RULE_ENGINE so a caller mixing in
+    load_content_labelled_messages() below can tell the pools apart.
     """
     df = _load_messages_csv(messages_path)
     df = df[df["rule_evaluated"] == True].copy()  # noqa: E712
@@ -230,11 +162,10 @@ def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
 
 def load_unevaluated_messages(messages_path: Path) -> pd.DataFrame:
     """
-    Rows with rule_evaluated==False only, from ONE source's full
+    Rows with rule_evaluated==False only, from one source's full
     messages_with_behavioral.csv - the pool label_content_flagged_positives()
-    below draws candidate positives from. Unlike load_labelled_messages(),
-    rule_flagged is NOT a usable label here (NA for every row in this
-    pool, by definition of rule_evaluated==False).
+    below draws candidate positives from. rule_flagged is NA for every
+    row here, unlike load_labelled_messages().
     """
     df = _load_messages_csv(messages_path)
     return df[df["rule_evaluated"] == False].copy()  # noqa: E712
@@ -244,31 +175,23 @@ def label_content_flagged_positives(
     unevaluated_df: pd.DataFrame, weight_model, threshold: float = 0.5,
 ) -> pd.DataFrame:
     """
-    Confident POSITIVES only, from a rule_evaluated==False pool
-    (load_unevaluated_messages()) - expands the rule_pattern_score
-    training pool beyond the rule-evaluated pool using
+    Confident positives only, from a rule_evaluated==False pool
+    (load_unevaluated_messages()) - expands the training pool using
     labels/rule_labels.py::content_flagged_by_weight(): `weight_model` is
-    a LogisticRegression fit by fit_content_flag_weights() on the REAL
-    labelled pool (rule_evaluated==True, both sources - see that
-    function's docstring for why SMPP alone can't fit one), so each
-    content flag counts toward the label in proportion to how well it
-    ACTUALLY predicted rule_flagged, not an unweighted count or a
-    hand-picked combination.
+    a LogisticRegression fit by fit_content_flag_weights() on the real
+    labelled pool, so each content flag counts toward the label in
+    proportion to how well it actually predicted rule_flagged.
 
-    NO negatives come from this pool: a row scoring below `threshold` is
-    not labelled clean here - a low content-flag score doesn't mean
-    "not spam" (it may be spam that doesn't use these literal patterns at
-    all, or ordinary untouched traffic) - only a confident positive hit is
-    a strong enough signal to use as a label at all.
+    No negatives come from this pool: a row scoring below `threshold` is
+    not labelled clean - a low content-flag score doesn't mean "not spam",
+    only a confident positive hit is a strong enough signal to use.
 
-    label_source is tagged LABEL_SOURCE_CONTENT_STATIC_RULES - NEVER
-    silently blended with load_labelled_messages()'s telecom-derived rows;
-    a caller that combines both must keep this column so evaluation can be
-    broken down per label_source (see models/rule_pattern/train.py's
-    --include_content_labels), since these rows' rule_flagged label is
-    still derived from the same CONTENT_FLAG_COLS this model also uses as
-    features - real risk of an inflated-looking metric on this slice
-    specifically, disclosed rather than hidden inside one combined number.
+    label_source is tagged LABEL_SOURCE_CONTENT_STATIC_RULES - never
+    blended with load_labelled_messages()'s telecom-derived rows, since
+    these rows' label is derived from the same CONTENT_FLAG_COLS this
+    model also uses as features (real risk of an inflated-looking metric
+    on this slice, disclosed via the label_source breakdown in
+    --include_content_labels).
     """
     positives = unevaluated_df[
         content_flagged_by_weight(unevaluated_df, weight_model, threshold=threshold)
@@ -281,28 +204,19 @@ def label_content_flagged_positives(
 def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     """
     The canonical + behavioral + source columns build_feature_matrix()
-    always includes, regardless of use_embeddings/use_tfidf.
-    `dcs` can be NaN in real data - left as-is deliberately, LightGBM
-    has native missing-value handling built in, no imputation needed.
+    always includes, regardless of use_embeddings/use_tfidf. `dcs` can be
+    NaN - left as-is, LightGBM has native missing-value handling.
     """
     text_length = df["text"].fillna("").str.len().rename("text_length")
     text_decode_failed = (
         df["text_decode_failed"].astype(int).rename("text_decode_failed")
     )
-    # Absent entirely for a caller that didn't run it through
-    # load_labelled_messages() (e.g. a test fixture) - same "NaN means
-    # unknown, not missing" treatment as `dcs`, not a required column.
+    # Absent for a caller that skipped load_labelled_messages() (e.g. a
+    # test fixture) - same NaN-means-unknown treatment as `dcs`.
     if IMSI_DISTINCT_ORIG_COL in df.columns:
         imsi_col = df[[IMSI_DISTINCT_ORIG_COL]]
     else:
         imsi_col = pd.DataFrame({IMSI_DISTINCT_ORIG_COL: np.nan}, index=df.index)
-    # SENDER_VELOCITY_ZSCORE_COL: same "absent -> NaN, not a required
-    # column" treatment - unlike IMSI this IS present for every row of
-    # every source in the real file (see models/anomaly/data.py's
-    # comment), so absence here only happens for a test fixture that
-    # didn't include it. Raw NaN passthrough, no _known indicator needed
-    # (unlike models/anomaly/data.py's sklearn Pipeline, LightGBM handles
-    # NaN natively - same reasoning as `dcs` above).
     if SENDER_VELOCITY_ZSCORE_COL in df.columns:
         velocity_col = df[[SENDER_VELOCITY_ZSCORE_COL]]
     else:
@@ -317,11 +231,10 @@ def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         text_decode_failed,
         text_length,
         df[CONTENT_FLAG_COLS],
+        compute_content_flag_meta_features(df),
     ]
-    # Same reasoning as models/anomaly/data.py's build_feature_matrix():
-    # `source` is dead weight (a constant column) once a run is restricted
-    # to one source (--sources SMPP/SS7 for a split model) - only add it
-    # when this run's df actually spans more than one source.
+    # `source` is dead weight once a run is restricted to one source -
+    # only add it when df actually spans more than one.
     if df["source"].nunique() > 1:
         pieces.append(pd.get_dummies(df["source"], prefix="source"))
     return pd.concat(pieces, axis=1)
@@ -338,24 +251,17 @@ def build_feature_matrix(
     tfidf_min_df: int = TFIDF_MIN_DF,
 ) -> tuple[np.ndarray, np.ndarray, list[str], dict]:
     """
-    Returns (X, y, feature_names, fitted). X/y cover ALL rows of df in its
-    original order (caller slices by idx_train/idx_test) - `fitted` is a
+    Returns (X, y, feature_names, fitted). X/y cover all rows of df in its
+    original order (caller slices by idx_train/idx_test). `fitted` is a
     dict of whichever corpus-dependent transformers were actually used
-    ({"embedding_pca_pipeline": ..., "tfidf_vectorizer": ...}, only the
-    keys for flags that were True), empty if neither use_embeddings nor
-    use_tfidf is set. Both must be reused unchanged at inference time,
-    same reason as models/anomaly/data.py's preprocessor.
+    ({"embedding_pca_pipeline": ..., "tfidf_vectorizer": ...}), empty if
+    neither flag is set. Both must be reused unchanged at inference time.
 
-    `train_mask`: boolean array, same length as df, True = this row is in
-    the training fold. Embeddings PCA and TF-IDF vocabulary are FIT on
-    df[train_mask] ONLY, then applied (.transform()) to every row - see
-    module docstring for why this matters (test-set leakage into
-    featurization itself, not just into the model). Defaults to "every
-    row is train" (all-True) when omitted - correct for the base-features-
-    only path (nothing here is corpus-fit) and for tests that don't care
-    about train/test leakage, but the real training entrypoint
-    (models/rule_pattern/train.py) must always pass a real mask whenever
-    use_embeddings or use_tfidf is True.
+    `train_mask`: boolean array, same length as df, True = training fold.
+    Embeddings PCA and TF-IDF vocabulary are fit on df[train_mask] only,
+    then applied to every row (see module docstring). Defaults to
+    all-True when omitted; models/rule_pattern/train.py must always pass
+    a real mask whenever use_embeddings or use_tfidf is True.
     """
     if train_mask is None:
         train_mask = np.ones(len(df), dtype=bool)
@@ -397,22 +303,14 @@ def build_feature_matrix(
 
 def join_embeddings(df: pd.DataFrame, source_dir: Path) -> pd.DataFrame:
     """
-    INNER JOIN of ANY frame with source/record_id columns against
+    Inner join of any frame with source/record_id columns against
     features/text_embeddings.py's output (emb_0..emb_{d-1}) for
-    `source_dir` - shared by load_labelled_messages_with_embeddings() below
-    and models/rule_pattern/train.py's --include_content_labels
-    --with_embeddings path (content-labelled rows come from the
-    rule_evaluated==False pool, which is NOT pre-joined with embeddings the
-    way load_labelled_messages_with_embeddings() is, so callers that need
-    embeddings on that pool too call this directly).
+    `source_dir` - shared by load_labelled_messages_with_embeddings()
+    below and train.py's --include_content_labels --with_embeddings path.
 
     Coverage depends on `source_dir`'s own embeddings.npy - full-dataset
-    for SS7 as of writing (features/text_embeddings.py runs over the WHOLE
-    messages_with_behavioral.csv, not just rule_evaluated rows, so this
-    join works the same regardless of df's rule_evaluated composition),
-    still absent for SMPP. The inner join silently restricts to whatever's
-    actually present - pass a single source_dir/df pair per source rather
-    than assuming combined coverage.
+    for SS7, still absent for SMPP. Silently restricts to whatever's
+    present - pass a single source_dir/df pair per source.
     """
     source_dir = Path(source_dir)
     df = df.copy()
@@ -432,10 +330,8 @@ def load_labelled_messages_with_embeddings(
     source_dir: Path, messages_path: Path
 ) -> pd.DataFrame:
     """
-    Same rule_evaluated==True filter as load_labelled_messages(), INNER
-    JOINED with features/text_embeddings.py's output via join_embeddings()
-    above. See that function's docstring for coverage caveats - pass a
-    single source_dir/messages_path pair per source rather than assuming
-    combined coverage.
+    Same rule_evaluated==True filter as load_labelled_messages(), inner
+    joined with embeddings via join_embeddings() above. See that
+    function's docstring for coverage caveats.
     """
     return join_embeddings(load_labelled_messages(messages_path), Path(source_dir))

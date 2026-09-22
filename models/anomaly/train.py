@@ -1,64 +1,30 @@
 """
 Trains the unsupervised anomaly layer (`anomaly_score`) - Isolation
-Forest over [MiniLM embedding + behavioral features + FAISS near-dup
-features] jointly, per README.md's modeling plan. Zero labels used for
-training, on purpose - see that section for why this is the layer meant
-to catch spam the rule engine has never encoded.
+Forest over [MiniLM embedding + behavioral + FAISS near-dup features]
+jointly, zero labels used for training (this layer exists to catch spam
+the rule engine hasn't encoded).
 
-NOT wired into pipeline.py: training is a deliberate, versioned action,
-not a deterministic feature-computation step - see pipeline.py's own
-docstring and the discussion this was built from. Run this by hand:
+CURRENT SCALE: full corpus per source (SMPP 5.5M / SS7 2.74M rows) - see
+models/anomaly/data.py's ChunkedEmbeddingReducer for the memory-bounded
+embedding preprocessing this needs at that scale.
 
-    python -m models.anomaly.train
-    python -m models.anomaly.train --n_estimators 200 --contamination 0.02
+OUTPUT SCORE: `-model.decision_function(X)`, negated so higher = more
+anomalous (sklearn's decision_function is lower for anomalies).
+`contamination` left at "auto" - it only governs `.predict()`'s binary
+cutoff, which this project doesn't use (block/allow happens later, at
+serving time).
 
-CURRENT SCALE: trains on the full corpus per source (SMPP 5.5M / SS7
-2.74M rows), not a --sample_n subset - see models/anomaly/data.py's
-ChunkedEmbeddingReducer for how the embedding preprocessing stays
-memory-bounded at that scale (plain StandardScaler.fit() upcasts
-float32 input to float64 internally and OOMs on the full SS7 corpus).
+EVALUATION: rule_evaluated/rule_flagged labels are used as a VALIDATION
+set only, never fed into training. `evaluate_against_rule_labels()`
+computes real PR-AUC/log loss (overall + per source) plus
+precision@top-K% (0.1/0.5/1.0/5.0%, more representative of how this
+score actually gets used - only the extreme top, see
+cluster_discovery.py).
 
-OUTPUT SCORE: `-model.decision_function(X)`, not `.predict()`'s binary
-label. sklearn's decision_function is HIGHER for normal points, LOWER
-(more negative) for anomalies - negated here so higher = more anomalous,
-matching this project's `anomaly_score` convention (see
-docs/prototype_plan.md's response contract). `contamination` is left at
-scikit-learn's default ("auto") rather than tuned, since it only governs
-`.predict()`'s binary cutoff, which this project's architecture doesn't
-use - the confidence-gated block/allow decision happens later, at
-serving time, not baked into training (see README.md's "problem,
-precisely" section).
-
-EVALUATION: trained with zero labels, but NOT evaluated with zero
-labels - the real rule_evaluated/rule_flagged labels (the same ones
-LightGBM will train on later) are used here purely as a validation set,
-never fed into training. `evaluate_against_rule_labels()` computes real
-PR-AUC and log loss (per README.md's stated evaluation convention:
-PR-AUC/log loss primary, evaluated overall + per source), checking
-whether anomaly_score actually ranks real rule-confirmed spam above
-rule-confirmed clean. Also logs precision@top-K% (models/metrics.py's
-evaluate_precision_at_k(), at 0.1/0.5/1.0/5.0% by default) alongside
-PR-AUC - more honest than the full PR-AUC curve for how this project
-actually uses the score (only the extreme top ever gets acted on, see
-models/anomaly/cluster_discovery.py), though it's still restricted to
-the same rule_evaluated pool - see the honesty note right below.
-
-BE HONEST ABOUT WHAT THIS METRIC DOES AND DOESN'T PROVE: it measures
-agreement with patterns the RULE ENGINE ALREADY KNOWS - the exact
-opposite of this layer's real purpose (catching spam the rules can't
-see, on the unlabelled majority). There is no way to formally evaluate
-THAT without labels, which is precisely why this layer exists in the
-first place. Treat a good score here as a floor-level sanity check, not
-proof of novel-spam detection.
-
-SMPP HAS NO CONFIRMED-CLEAN LABELS (verified: 2,693/2,693 rule-evaluated
-SMPP rows are flagged, zero are confirmed-clean - see README.md's data
-reality check) - PR-AUC is mathematically undefined with only one class
-present, so SMPP-only PR-AUC is skipped, not silently computed wrong.
-
-Also kept: a simpler plausibility_check() (mean anomaly_score by group)
-- weaker than PR-AUC (doesn't account for the full score distribution),
-but cheap and easy to sanity-eyeball alongside the real metric.
+CAVEAT: this only measures agreement with patterns the rule engine
+ALREADY knows - the opposite of this layer's real purpose (catching
+spam rules can't see). Treat a good score as a floor-level sanity check,
+not proof of novel-spam detection.
 """
 
 import argparse
@@ -73,7 +39,11 @@ from sklearn.ensemble import IsolationForest
 from sklearn.pipeline import Pipeline
 
 from config.settings import MLFLOW_TRACKING_URI
-from models.anomaly.data import build_combined_frame, build_feature_matrix, load_source_features
+from models.anomaly.data import (
+    build_combined_frame,
+    build_feature_matrix,
+    load_source_features,
+)
 from models.metrics import evaluate_overall_and_per_source, evaluate_precision_at_k
 
 MLFLOW_EXPERIMENT_NAME = "isolation_forest"
@@ -103,16 +73,11 @@ def score_anomalies(model: IsolationForest, X: np.ndarray) -> np.ndarray:
 
 
 def plausibility_check(df: pd.DataFrame, anomaly_score: np.ndarray) -> dict:
-    """
-    Label-free sanity check, NOT a training signal or a formal metric -
-    see module docstring. Returns a plain dict, loggable straight to
-    MLflow as metrics.
-    """
-    # `== True` rather than `.fillna(False).to_numpy(dtype=bool)`: these
-    # columns are nullable-bool-shaped (True/False/None, see
-    # labels/rule_labels.py) - `== True` treats None/NaN as not-True
-    # directly, without pandas' fillna-then-downcast path, which throws
-    # a FutureWarning on object-dtype columns as of this pandas version.
+    """Label-free sanity check, not a training signal or formal metric -
+    see module docstring. Returns a plain dict, loggable to MLflow."""
+    # `== True` (not fillna+astype) - these cols are nullable-bool
+    # (True/False/None); `== True` treats None as not-True directly and
+    # avoids a pandas FutureWarning on object-dtype columns.
     evaluated = (df["rule_evaluated"] == True).to_numpy()  # noqa: E712
     flagged = (df["rule_flagged"] == True).to_numpy() & evaluated
     clean = evaluated & ~flagged
@@ -132,27 +97,17 @@ def plausibility_check(df: pd.DataFrame, anomaly_score: np.ndarray) -> dict:
 
 
 def evaluate_against_rule_labels(df: pd.DataFrame, anomaly_score: np.ndarray) -> dict:
-    """
-    Real PR-AUC/log loss (models/metrics.py, shared with
-    models/rule_pattern/train.py), using rule_evaluated==True rows as a
-    VALIDATION set only - never used in training. See module docstring
-    for exactly what this does and doesn't prove, and why SMPP-only is
-    skipped (mathematically undefined, not computed wrong).
+    """Real PR-AUC/log loss (models/metrics.py, shared with
+    rule_pattern/train.py) using rule_evaluated==True rows as a
+    VALIDATION set only - see module docstring for what this does/
+    doesn't prove, and why SMPP-only PR-AUC is skipped.
 
-    Evaluated three ways, per README.md's stated convention: overall,
-    then per source - an aggregate number can hide one source
-    performing badly, and SMPP/SS7's labelled pools look very different
-    (see the data reality check in README.md).
-
-    Also computes precision@top-K% (models/metrics.py's
-    evaluate_precision_at_k()) on the SAME (y_true, score) pair -
-    PR-AUC integrates over every threshold, most of which nothing in
-    this project ever operates at; precision at the percentiles this
-    system actually thresholds at (cluster_discovery.py's
-    --anomaly_percentile) is the more honest operational number. Same
-    "known-pattern-only" ceiling as the PR-AUC above applies here too -
-    see module docstring - this doesn't get around that, it's just a
-    more actionable read of the same restricted evaluation pool.
+    Evaluated overall + per source (an aggregate can hide one source
+    performing badly). Also computes precision@top-K% on the same
+    (y_true, score) pair - more honest than full PR-AUC for how this
+    score is actually used (only the extreme top, via
+    cluster_discovery.py's --anomaly_percentile); same known-pattern-only
+    ceiling still applies.
     """
     evaluated = (df["rule_evaluated"] == True).to_numpy()  # noqa: E712
     flagged = (df["rule_flagged"] == True).to_numpy() & evaluated
@@ -171,13 +126,10 @@ def run(
     contamination: str,
     random_state: int,
 ) -> None:
-    # A source-restricted run (e.g. --sources SMPP alone) gets its own
-    # MLflow experiment, suffixed by source - keeps a source-specific
-    # champion/challenger lineage separate from the combined-sources
-    # experiment, so compare_versions.py never compares a challenger
-    # trained on one population against a champion trained on another.
-    # The full default (both sources) keeps the plain experiment name -
-    # no behavior change for existing combined runs.
+    # Source-restricted run gets its own MLflow experiment, suffixed by
+    # source - keeps compare_versions.py from comparing a challenger and
+    # champion trained on different populations. Full default (both
+    # sources) keeps the plain experiment name.
     experiment_name = MLFLOW_EXPERIMENT_NAME
     if sorted(sources) != sorted(["SMPP", "SS7"]):
         experiment_name += "_" + "_".join(sources)
@@ -248,32 +200,27 @@ def run(
         mlflow.log_dict({"feature_names": feature_names}, "feature_names.json")
 
         pipeline = Pipeline([("preprocessor", preprocessor), ("iforest", model)])
-        # Signature/input_example describe the RAW pre-preprocessor frame
-        # (build_combined_frame() - same construction build_feature_matrix()
-        # fits/transforms internally), since `pipeline` bundles the
-        # preprocessor itself - that's the actual input shape a caller of
-        # this logged model must supply, not the already-transformed X.
-        # Built on df.head(5) only, NOT the full df again - rebuilding the
-        # combined frame for the whole corpus a second time here (after
-        # training already peaked memory) OOM'd on SS7's 2.74M-row corpus;
-        # 5 rows is all infer_signature/log_model actually need.
+        # Signature/input_example describe the RAW pre-preprocessor frame,
+        # since `pipeline` bundles the preprocessor itself. df.head(5)
+        # only - rebuilding the combined frame for the full corpus again
+        # here OOM'd on SS7's 2.74M rows; 5 rows is all infer_signature needs.
         input_example, _, _ = build_combined_frame(df.head(5))
         signature = infer_signature(input_example, pipeline.predict(input_example))
-        # skops_trusted_types: ChunkedEmbeddingReducer (models/anomaly/data.py)
-        # is our own class, not a stdlib sklearn one - mlflow's skops-based
-        # serializer refuses unrecognized types by default (a real safety
-        # check, not a bug) unless explicitly told this one is trusted.
+        # ChunkedEmbeddingReducer is our own class, not stdlib sklearn -
+        # mlflow's skops serializer refuses unrecognized types by default.
         mlflow.sklearn.log_model(
-            pipeline, name="model", signature=signature, input_example=input_example,
+            pipeline,
+            name="model",
+            signature=signature,
+            input_example=input_example,
             skops_trusted_types=["models.anomaly.data.ChunkedEmbeddingReducer"],
         )
         print(
             f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={experiment_name})"
         )
 
-    # Score-per-message output, one file per source, min-max normalized
-    # column added for convenience (0-1, easy to eyeball) alongside the
-    # raw decision_function-derived score (the actual anomaly_score).
+    # min-max normalized column (0-1, easy to eyeball) added alongside
+    # the raw decision_function-derived anomaly_score.
     score_min, score_max = anomaly_score.min(), anomaly_score.max()
     normalized = (
         (anomaly_score - score_min) / (score_max - score_min)

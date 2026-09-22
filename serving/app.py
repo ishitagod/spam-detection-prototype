@@ -73,9 +73,13 @@ feature_contributions, it never turns a successful score into FAILURE.
 """
 import logging
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+import serving.anomaly_scoring as anomaly_scoring
+import serving.fusion_scoring as fusion_scoring
+import serving.scoring as scoring
 from serving.anomaly_scoring import score_anomaly
 from serving.anomaly_scoring import ChampionUnavailableError as AnomalyChampionUnavailableError
 from serving.anomaly_scoring import CorpusUnavailableError
@@ -108,7 +112,26 @@ from serving.scoring import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Spam Detection Scoring API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Warms every scorer's per-source champion cache (and, for
+    anomaly_scoring, the full FAISS corpus) before the app starts
+    accepting traffic - moves the cold-cache load cost (MLflow registry
+    lookup + model/pipeline deserialize + FAISS index build over the full
+    corpus) to process boot, off the first request's latency. Each
+    preload() is independently best-effort per source (see their
+    docstrings) - a source with no promoted champion yet must not block
+    startup for a source that has one, or for the other two scorers."""
+    load_start = time.perf_counter()
+    logger.info("preloading model caches...")
+    scoring.preload()
+    anomaly_scoring.preload()
+    fusion_scoring.preload()
+    logger.info("preload done in %dms", int((time.perf_counter() - load_start) * 1000))
+    yield
+
+
+app = FastAPI(title="Spam Detection Scoring API", lifespan=lifespan)
 
 # Only fraud_type this build actually models - see module docstring.
 # A tuple, not a set: deep_scan's early-stop semantics (score.py's

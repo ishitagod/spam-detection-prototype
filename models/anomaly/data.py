@@ -5,46 +5,25 @@ matrix for Isolation Forest, by message_key:
   - embeddings.npy + embeddings_id_map.parquet (MiniLM embeddings)
   - faiss_output.parquet          (near-dup features, both windows)
 
-INNER join, not left: embeddings/faiss now cover the FULL corpus (the
-former --sample_n-only restriction is gone - features/text_embeddings.py's
-full 8.2M-row encode, previously a ~21hr job, has since completed; see
-docs/experiments/anomaly.md's "Current scale"). INNER (not LEFT) is kept
-regardless, on principle - a row missing embeddings/faiss output should
-drop out explicitly, not silently train on a partially-NaN feature row.
+INNER join (not left) - a row missing embeddings/faiss output should
+drop out explicitly, not silently train on a partially-NaN row.
 
-`source` IS included as a feature (one-hot), not used to route to
-separate models - per CLAUDE.md's "one model to start, not two"
-decision. `rule_evaluated`/`rule_flagged` are carried through for
-train.py's label-free plausibility check ONLY - never as a training
-input, since Isolation Forest is trained on the FULL traffic stream with
-zero labels by design (see README.md's modeling plan).
+`source` is a one-hot feature, not a routing key (CLAUDE.md's "one
+model to start, not two"). `rule_evaluated`/`rule_flagged` are carried
+through only for train.py's label-free plausibility check - Isolation
+Forest itself trains on zero labels.
 
-PREPROCESSING, two things, not one:
-  1. log1p on heavy-tailed count features - real observed ranges make
-     this necessary, not optional: sender_msgs_last_1hr up to 16,971,
-     near_dup_match_count_24hr up to 381 vs. embedding dimensions
-     confined to roughly [-1, 1].
-  2. PCA on the 384 embedding dimensions down to N_EMBEDDING_COMPONENTS,
-     BEFORE combining with the 12 hand-built behavioral+near-dup
-     features - measured, not assumed, to be necessary: a real ablation
-     (scripts/check_embedding_dominance.py) showed the joint model's
-     anomaly-score rankings correlated 0.808 with an embeddings-only
-     model but only 0.326 with a behavioral-only model - the 384-vs-12
-     dimension imbalance was genuinely drowning out the hand-built
-     features, not just a theoretical risk. PCA is applied via a
-     ColumnTransformer (sklearn.compose) so it only touches the
-     embedding columns - the 12 hand-built features pass through
-     unchanged into the same final joint StandardScaler. (The "12" above
-     is the ablation's real measured count at the time it ran - six more
-     hand-built columns were added after: IMSI_DISTINCT_ORIG_COL + its
-     _known indicator, SENDER_VELOCITY_ZSCORE_COL + its _known indicator,
-     and two new BEHAVIORAL_COLS entries (sender_age_days,
-     sender_recipient_diversity_ratio_5min/1hr count as +3, not +2 -
-     see that list's own comment) added for the "bank marketing vs spam"
-     gap. The imbalance direction the ablation found doesn't change from
-     a few more hand-built columns against 384 embedding dimensions, so
-     it wasn't worth re-running check_embedding_dominance.py for this -
-     revisit if a future ablation ever suggests otherwise.)
+PREPROCESSING:
+  1. log1p on heavy-tailed count features (e.g. sender_msgs_last_1hr up
+     to 16,971) vs. embedding dims confined to ~[-1, 1].
+  2. PCA on the 384 embedding dims down to N_EMBEDDING_COMPONENTS before
+     combining with the hand-built features - an ablation
+     (scripts/check_embedding_dominance.py) found the joint model's
+     score rankings correlated 0.808 with embeddings-only but only 0.326
+     with behavioral-only, i.e. embeddings were drowning out the
+     hand-built features without this. Applied via ColumnTransformer so
+     only embedding columns get PCA'd; hand-built features pass through
+     into the same final joint StandardScaler.
 """
 from pathlib import Path
 
@@ -56,14 +35,44 @@ from sklearn.decomposition import PCA, IncrementalPCA
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from config.settings import CONTENT_FLAG_PATTERNS
+from config.settings import CONTENT_FLAG_HIGH_CONFIDENCE_COMBINATIONS, CONTENT_FLAG_PATTERNS
 
-# features/content_flags.py's output columns - already binary 0/1 (int8),
-# passed through unchanged into `other_cols` below, same treatment as
-# NEAR_DUP_COLS's similarity scores (already ~0-1, no log1p/bucketing
-# needed) - see the architecture plan's Section 3 for why these are base
-# features here too, not gated like embeddings/TF-IDF.
+# features/content_flags.py's output columns - already binary 0/1,
+# passed through unchanged (same as NEAR_DUP_COLS's ~0-1 similarity scores).
 CONTENT_FLAG_COLS = list(CONTENT_FLAG_PATTERNS.keys())
+
+# Engineered on top of CONTENT_FLAG_COLS, not read from CSV - same
+# treatment as any other passthrough feature (0/1 or small int, no
+# scaling needed). content_flag_high_conf reuses the exact combination
+# list labels/rule_labels.py's content_flagged() uses to build the
+# SEPARATE content_flagged label - safe as a FEATURE against
+# rule_flagged (the telecom-engine label these models actually train
+# against, computed with zero content/regex matching - see
+# labels/rule_labels.py's module docstring), but would be tautological
+# if content_flagged were ever used as a training target instead.
+CONTENT_FLAG_META_COLS = [
+    "content_flag_hit_count",
+    "content_flag_any",
+    "content_flag_high_conf",
+]
+
+
+def compute_content_flag_meta_features(df: pd.DataFrame) -> pd.DataFrame:
+    """CONTENT_FLAG_META_COLS from a frame already carrying CONTENT_FLAG_COLS."""
+    flags = df[CONTENT_FLAG_COLS].astype(int)
+    hit_count = flags.sum(axis=1)
+    any_flag = (hit_count > 0).astype(int)
+    high_conf = pd.Series(False, index=df.index)
+    for combination in CONTENT_FLAG_HIGH_CONFIDENCE_COMBINATIONS:
+        high_conf |= flags[combination].all(axis=1)
+    return pd.DataFrame(
+        {
+            "content_flag_hit_count": hit_count,
+            "content_flag_any": any_flag,
+            "content_flag_high_conf": high_conf.astype(int),
+        },
+        index=df.index,
+    )
 
 BEHAVIORAL_COLS = [
     "sender_msgs_last_5min", "sender_msgs_last_1hr",
@@ -71,81 +80,48 @@ BEHAVIORAL_COLS = [
     "sender_age_days",
     "sender_recipient_diversity_ratio_5min", "sender_recipient_diversity_ratio_1hr",
 ]
-# sender_velocity_zscore_5min is DELIBERATELY kept OUT of BEHAVIORAL_COLS,
-# same reason as IMSI_DISTINCT_ORIG_COL below: it CAN be NaN (fewer than 2
-# prior same-sender readings, or zero variance - see
-# features/behavioral.py's VELOCITY note) so it needs the same
-# fillna(0)-plus-_known-indicator treatment build_combined_frame() applies
-# to IMSI, which a plain BEHAVIORAL_COLS passthrough doesn't give it.
-# UNLIKE IMSI, this column IS present for every row of every source (not
-# SS7-only) - real measured NaN rate is negligible (<0.1% of rows, both
-# sources) but still real, and sklearn's Pipeline can't take ANY NaN.
-# This is the sender-relative burst signal the "any bulk sender looks
-# anomalous" problem needs: a bank's normal marketing blast scores near
-# its OWN typical burst size (z-score near 0), where a spam sender's burst
-# (against its own usually-quiet or brand-new baseline) doesn't.
+# sender_velocity_zscore_5min: kept OUT of BEHAVIORAL_COLS since it can be
+# NaN (<0.1% of rows, both sources - fewer than 2 prior same-sender
+# readings, or zero variance) and needs the fillna(0)+_known-indicator
+# treatment below (sklearn's Pipeline can't take NaN). Sender-relative
+# burst signal: a bank's normal marketing blast scores near its OWN
+# typical burst size (z-score ~0); a spam burst against a quiet/new
+# baseline doesn't.
 SENDER_VELOCITY_ZSCORE_COL = "sender_velocity_zscore_5min"
 SENDER_VELOCITY_ZSCORE_KNOWN_COL = f"{SENDER_VELOCITY_ZSCORE_COL}_known"
-# SS7-only SIM-farming signal (features/behavioral.py's IMSI-LINKAGE note) -
-# kept OUT of BEHAVIORAL_COLS deliberately: unlike those 4, this column is
-# entirely ABSENT (not NaN-filled) from SMPP's messages_with_behavioral.csv,
-# so callers that read it need the presence check load_source_features()
-# does below, not a plain usecols=[...] that would raise on SMPP. Real SS7
-# data also has null imsi on ~31.7% of rows even where the column exists -
-# both cases collapse to the same "genuinely unknown" NaN, handled uniformly
-# in build_feature_matrix() (fillna(0) + a separate _known indicator, since
-# sklearn's Pipeline can't take NaN the way LightGBM natively can).
+# SS7-only SIM-farming signal - entirely absent (not NaN) from SMPP's
+# messages_with_behavioral.csv, so load_source_features() needs a presence
+# check. Also null on ~31.7% of SS7 rows even where present - both cases
+# collapse to the same fillna(0)+_known-indicator treatment.
 IMSI_DISTINCT_ORIG_COL = "imsi_distinct_originators_1hr"
 IMSI_DISTINCT_ORIG_KNOWN_COL = f"{IMSI_DISTINCT_ORIG_COL}_known"
 
-# sender_age_days is kept in BEHAVIORAL_COLS above (still read from CSV/
-# Feast/serving unchanged, still passed RAW to rule_pattern_score - see
-# models/rule_pattern/data.py's _base_feature_frame(), which never calls
-# build_combined_frame() below) but is DELIBERATELY NOT passed raw into
-# Isolation Forest - real measured failure (docs/experiments/anomaly.md /
-# the conversation this was built from): in this prototype's fixed ~2-day
-# CDR sample, sender_age_days only ever ranges 0.0-2.0, so "brand new
-# sender" is trivially separable by isolation splits regardless of
-# content - real measured result, top-0.1%-by-anomaly_score median
-# sender_age_days (0.625) vs overall median (1.247), with a clean
-# monotonic gradient and precision@top-0.1% BELOW the naive baseline.
-# Bucketed into coarse, REAL-WORLD-meaningful edges instead (not fit to
-# this dataset's own narrow range, which would just re-encode the same
-# problem) - collapses the fine-grained ordering isolation splits were
-# exploiting, while staying genuinely useful once production data spans
-# weeks/months and a truly-old sender becomes rare again (right now,
-# nearly everything falls in the two lowest buckets - that's expected and
-# fine, it's what actually fixes the problem on this sample; the buckets
-# above that are for when they eventually start populating).
+# sender_age_days: kept in BEHAVIORAL_COLS (still passed raw to
+# rule_pattern_score) but NOT passed raw into Isolation Forest - this
+# prototype's ~2-day CDR sample only has sender_age_days in [0.0, 2.0],
+# so isolation splits trivially separated "brand new sender" regardless
+# of content (measured: top-0.1%-by-anomaly_score median age 0.625 vs
+# overall 1.247, precision@top-0.1% below baseline). Bucketed into
+# coarse, real-world-meaningful edges instead, which collapses that
+# exploitable fine-grained ordering (most rows fall in the two lowest
+# buckets today - expected on this sample; higher buckets matter once
+# production data spans weeks/months).
 SENDER_AGE_DAYS_COL = "sender_age_days"
 SENDER_AGE_BUCKET_EDGES_DAYS = [-np.inf, 1 / 24, 1, 7, 30, np.inf]  # hour, day, week, month
 SENDER_AGE_BUCKET_LABELS = ["lt_1hr", "1hr_to_1day", "1day_to_7day", "7day_to_30day", "gte_30day"]
 SENDER_AGE_BUCKET_COLS = [f"sender_age_bucket_{label}" for label in SENDER_AGE_BUCKET_LABELS]
 
-# sender_recipient_diversity_ratio_5min/1hr are kept in BEHAVIORAL_COLS
-# above (still read raw, still passed RAW to rule_pattern_score - see
-# models/rule_pattern/data.py, which never calls build_combined_frame()
-# below) but NOT passed raw into Isolation Forest either - a DIFFERENT
-# failure mode from sender_age_days above, even more severe by real
-# measurement: this ratio is unique_destinations / message_count in the
-# window, so a sender with only 1 message in that window gets a
-# TRIVIALLY extreme ratio (1.0 - one destination out of one message,
-# guaranteed) regardless of real behavioral diversity. Bucketing the
-# VALUE (like age above) wouldn't fix this - a ratio of 1.0 from 1
-# message and a ratio of 1.0 from 20 messages would still land in the
-# same bucket, treated identically, even though only the second one
-# means anything. Real measured result: top-0.1%-by-anomaly_score MEAN
-# sender_recipient_diversity_ratio_5min (0.718) vs overall MEDIAN
-# (0.002) - ~48x enrichment by mean, effectively unbounded by median.
-# Fixed by gating on the underlying message count instead - below
-# SENDER_DIVERSITY_MIN_MSGS messages in that window, the ratio is
-# genuinely unreliable (not just an extreme value), treated as unknown
-# via the SAME NaN -> fillna(0) + _known-indicator pattern as
-# SENDER_VELOCITY_ZSCORE_COL/IMSI_DISTINCT_ORIG_COL above, rather than a
-# sharp, spurious 0/1 the model can trivially isolate on.
-SENDER_DIVERSITY_MIN_MSGS = 3  # starting point, not tuned against a real
-# target - same "documented, not proven" status as
-# FAISS_NEAR_DUP_THRESHOLD/N_EMBEDDING_COMPONENTS.
+# sender_recipient_diversity_ratio_5min/1hr: also kept raw in
+# BEHAVIORAL_COLS but not passed raw into Isolation Forest - ratio is
+# unique_destinations/message_count, so 1 message in the window always
+# gives a trivially extreme ratio of 1.0 regardless of real diversity.
+# Bucketing wouldn't fix it (1.0-from-1-msg and 1.0-from-20-msgs would
+# still land in the same bucket). Measured: top-0.1%-by-anomaly_score
+# MEAN ratio 0.718 vs overall MEDIAN 0.002 - ~48x enrichment. Fixed by
+# gating on message count instead - below SENDER_DIVERSITY_MIN_MSGS, the
+# ratio is unreliable, treated as unknown via the same
+# fillna(0)+_known-indicator pattern as velocity/IMSI above.
+SENDER_DIVERSITY_MIN_MSGS = 3  # starting point, not tuned
 SENDER_DIVERSITY_SHORT_COL = "sender_recipient_diversity_ratio_5min"
 SENDER_DIVERSITY_SHORT_KNOWN_COL = f"{SENDER_DIVERSITY_SHORT_COL}_known"
 SENDER_DIVERSITY_SHORT_MSGS_COL = "sender_msgs_last_5min"  # gate column - same window
@@ -158,35 +134,27 @@ NEAR_DUP_COLS = [
     "near_dup_match_count_24hr", "near_dup_max_similarity_24hr", "near_dup_distinct_senders_24hr",
 ]
 # Heavy-tailed count columns that get log1p'd before scaling - ratios
-# (already 0-1) and similarity scores (already ~0-1) are left alone.
+# and similarity scores (already ~0-1) are left alone.
 COUNT_COLS = [
     "sender_msgs_last_5min", "sender_msgs_last_1hr", "sender_unique_destinations_1hr",
     "near_dup_match_count_1hr", "near_dup_distinct_senders_1hr",
     "near_dup_match_count_24hr", "near_dup_distinct_senders_24hr",
 ]
 
-# Not tuned against a real target explained-variance threshold - a
-# starting point that brings 384 down to something closer in order of
-# magnitude to the 12 hand-built features, per the ablation finding
-# above. build_feature_matrix() prints the actual retained variance at
-# this component count every run, so this number stays honest rather
-# than a one-time guess nobody checks again.
+# Not tuned against a target explained-variance threshold - a starting
+# point to bring 384 dims closer in magnitude to the hand-built
+# features (see module docstring's ablation). build_feature_matrix()
+# prints actual retained variance every run.
 N_EMBEDDING_COMPONENTS = 30
 
 
 def load_source_features(source_dir: Path, messages_path: Path) -> pd.DataFrame:
-    """
-    One row per SAMPLED message (see module docstring on the inner-join
-    restriction), with behavioral + near_dup + embedding columns
+    """One row per message with behavioral + near_dup + embedding columns
     (`emb_0`..`emb_{d-1}`) plus `source`/`rule_evaluated`/`rule_flagged`
-    carried through unscaled, for the caller to split off before/after
-    building the model's actual input matrix.
-    """
+    carried through unscaled."""
     source_dir = Path(source_dir)
-    # Lambda usecols (not a plain list) so a source file missing
-    # IMSI_DISTINCT_ORIG_COL entirely (SMPP - see that constant's comment
-    # above) is silently skipped rather than raising - a plain list would
-    # error on any name not present in the file's header.
+    # Lambda usecols so a file missing IMSI_DISTINCT_ORIG_COL (SMPP) is
+    # skipped rather than raising, unlike a plain list.
     wanted_cols = (
         ["source", "record_id"] + BEHAVIORAL_COLS
         + [IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL]
@@ -198,13 +166,9 @@ def load_source_features(source_dir: Path, messages_path: Path) -> pd.DataFrame:
     )
     if IMSI_DISTINCT_ORIG_COL not in messages.columns:
         messages[IMSI_DISTINCT_ORIG_COL] = np.nan
-    # Absent entirely for a messages_with_behavioral.csv produced before
-    # features/content_flags.py existed - default to 0 (no flags known),
-    # not NaN, since sklearn's Pipeline can't take NaN and "unknown" isn't
-    # a meaningful state for a deterministic regex feature the way it is
-    # for IMSI/velocity (those measure something that may genuinely be
-    # unobserved; a missing content-flag column just means this run
-    # predates the feature).
+    # Absent entirely for a pre-content_flags.py CSV - default 0, not NaN
+    # (unlike IMSI/velocity, "unknown" isn't meaningful for a deterministic
+    # regex feature; missing just means this run predates the feature).
     for col in CONTENT_FLAG_COLS:
         if col not in messages.columns:
             messages[col] = 0
@@ -225,17 +189,10 @@ def load_source_features(source_dir: Path, messages_path: Path) -> pd.DataFrame:
 
 
 def embedding_pca_pipeline(n_embedding_components: int) -> Pipeline:
-    """
-    StandardScaler -> PCA(n_embedding_components), for embedding columns
-    ONLY - shared by this module's build_preprocessor() (which wraps it
-    in a final joint scaler too, since Isolation Forest needs everything
-    on a comparable scale) and models/rule_pattern/data.py's embeddings-
-    aware feature matrix (which does NOT scale its other features - tree
-    splits don't need it - so it uses this piece alone, not the full
-    build_preprocessor()). One fit, reused everywhere the embedding-PCA
-    step itself is needed, rather than two models independently
-    re-deriving the same reduction.
-    """
+    """StandardScaler -> PCA(n_embedding_components), embedding columns
+    only. Shared by build_preprocessor() below (wrapped in a final joint
+    scaler) and models/rule_pattern/data.py's embeddings-aware matrix
+    (which skips scaling other features - tree splits don't need it)."""
     return Pipeline([
         ("scale", StandardScaler()),
         ("pca", PCA(n_components=n_embedding_components, random_state=42)),
@@ -246,24 +203,15 @@ EMBEDDING_CHUNK_SIZE = 200_000  # rows per partial_fit/transform batch
 
 
 class ChunkedEmbeddingReducer(BaseEstimator, TransformerMixin):
-    """
-    Same operation as embedding_pca_pipeline() (StandardScaler -> PCA),
+    """Same as embedding_pca_pipeline() (StandardScaler -> PCA), but
     fit/transformed in EMBEDDING_CHUNK_SIZE-row batches via partial_fit -
-    ONLY used inside build_preprocessor() below, for training at the full
-    multi-million-row corpus scale where a plain StandardScaler.fit() on
-    the whole embedding matrix at once is unsafe: numpy upcasts float32 X
-    to float64 when subtracting sklearn's float64 mean internally
-    (X - T in sklearn.utils.extmath._incremental_mean_and_var), so a
-    single (n_rows, 384) fit briefly needs float64-sized memory (~2x the
-    raw embeddings.npy) regardless of X's own dtype - measured to OOM a
-    16GB machine on SS7's 2.74M-row corpus. Chunking bounds that
-    intermediate to EMBEDDING_CHUNK_SIZE rows at a time, fitting the exact
-    same full corpus, not a sample - see docs/experiments/anomaly.md.
-    embedding_pca_pipeline() itself is untouched (still a plain
-    Pipeline(StandardScaler, PCA)) - rule_pattern's embeddings path and
-    live single-row serving (serving/scoring.py) don't operate at this
-    scale and don't need chunking.
-    """
+    only used in build_preprocessor() below, for full-corpus training. A
+    plain StandardScaler.fit() over the whole embedding matrix briefly
+    upcasts float32 X to float64 internally (~2x embeddings.npy's size),
+    which measured to OOM a 16GB machine on SS7's 2.74M rows. Chunking
+    bounds that, still fitting the full corpus, not a sample. Unused by
+    rule_pattern's embeddings path or live single-row serving - neither
+    operates at this scale."""
 
     def __init__(self, n_components: int, chunk_size: int = EMBEDDING_CHUNK_SIZE):
         self.n_components = n_components
@@ -293,21 +241,12 @@ class ChunkedEmbeddingReducer(BaseEstimator, TransformerMixin):
 
 
 def build_preprocessor(embedding_cols: list[str], other_cols: list[str], n_embedding_components: int) -> Pipeline:
-    """
-    embedding_cols -> ChunkedEmbeddingReducer(); other_cols -> passthrough
-    (already log1p'd/one-hot by the caller); both concatenated, THEN a
-    final StandardScaler over the combined result - the PCA components
-    themselves have very unequal variance (the first component always
-    varies far more than the last), so re-scaling after PCA matters for
-    the same reason scaling mattered before it. The final StandardScaler
-    is NOT chunked - its input is already PCA-reduced (n_embedding_
-    components wide, not 384), small enough that a full-corpus fit stays
-    well within memory even with the same float64-upcast behavior.
-
-    Returned as a single fitted-once, reused-everywhere Pipeline - this
-    IS the artifact that must travel to inference unchanged, not
-    something to refit on new data (train/serve skew otherwise).
-    """
+    """embedding_cols -> ChunkedEmbeddingReducer(); other_cols ->
+    passthrough (already log1p'd/one-hot); both concatenated, then a
+    final (non-chunked - already PCA-reduced, small) StandardScaler over
+    the combined result, since PCA components themselves have unequal
+    variance. Returned Pipeline is the artifact that must travel to
+    inference unchanged - never refit on new data."""
     reduce = ColumnTransformer([
         ("embeddings", ChunkedEmbeddingReducer(n_embedding_components), embedding_cols),
         ("other", "passthrough", other_cols),
@@ -321,84 +260,58 @@ def build_preprocessor(embedding_cols: list[str], other_cols: list[str], n_embed
 def build_combined_frame(
     df: pd.DataFrame, known_sources: list[str] | None = None,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
-    """
-    The pre-preprocessor frame build_feature_matrix() fits/transforms -
-    factored out so callers that need the RAW input shape the returned
-    Pipeline actually expects (e.g. models/anomaly/train.py logging an
-    MLflow model signature for the full preprocessor+model pipeline) can
-    get it without duplicating this construction. Returns (combined,
-    embedding_cols, other_cols) - same three pieces build_feature_matrix()
-    passes to build_preprocessor().
+    """The pre-preprocessor frame build_feature_matrix() fits/transforms -
+    factored out for callers (e.g. train.py logging an MLflow model
+    signature) that need the raw input shape without duplicating this
+    construction. Returns (combined, embedding_cols, other_cols).
 
-    `known_sources`: forces one-hot columns for EVERY name in this list to
-    exist in the output, regardless of how many distinct `source` values
-    `df` itself contains - for serving/anomaly_scoring.py's single live
-    row, where `df["source"].nunique()` is always 1 and would otherwise
-    silently drop whichever source_* column the fitted preprocessor still
-    expects (it was fit on a combined-sources df where both existed).
-    None (default, every training caller) preserves the old nunique()>1
-    behavior exactly - unaffected by this parameter.
+    `known_sources`: forces one-hot columns for every name in this list
+    to exist in the output, regardless of how many distinct `source`
+    values `df` contains - needed by serving/anomaly_scoring.py's single
+    live row (`nunique()` always 1), which would otherwise silently drop
+    a source_* column the fitted preprocessor still expects. None
+    (default, all training callers) preserves the old nunique()>1 behavior.
     """
-    # Excludes emb_* columns from the copy - nothing below mutates them,
-    # and copying a (n_rows, 384) float32 block just to leave it untouched
-    # doubles memory for no reason (measured: this alone OOM'd SS7's full
-    # 2.74M-row corpus on a 16GB machine). embedding_cols is read straight
-    # from df at the bottom of this function instead.
+    # Excludes emb_* from the copy - nothing below mutates them, and
+    # copying a (n_rows, 384) float32 block untouched doubles memory for
+    # no reason (measured to OOM SS7's full 2.74M-row corpus on 16GB).
     embedding_cols = [c for c in df.columns if c.startswith("emb_")]
     transformed = df.drop(columns=embedding_cols).copy()
     for col in COUNT_COLS:
         transformed[col] = np.log1p(transformed[col])
 
-    # IMSI_DISTINCT_ORIG_COL may be entirely absent (test fixtures, or any
-    # caller other than load_source_features() that didn't add it) - treat
-    # that the same as "present but NaN", not a required column, so the
-    # rest of this function has one code path either way.
+    # May be entirely absent (test fixtures) - treat as "present but NaN".
     if IMSI_DISTINCT_ORIG_COL not in transformed.columns:
         transformed[IMSI_DISTINCT_ORIG_COL] = np.nan
-    # NaN means "genuinely unknown" here (no imsi at all for this source,
-    # or a null imsi on this SS7 row) - not zero. fillna(0) alone would
-    # fabricate "zero distinct originators" for rows where the thing this
-    # feature measures was never observed; the _known indicator lets the
-    # model tell the two apart instead of silently conflating them.
+    # NaN = genuinely unknown, not zero - fillna(0) alone would fabricate
+    # "zero distinct originators"; _known lets the model tell them apart.
     transformed[IMSI_DISTINCT_ORIG_KNOWN_COL] = transformed[IMSI_DISTINCT_ORIG_COL].notna().astype(float)
     transformed[IMSI_DISTINCT_ORIG_COL] = np.log1p(transformed[IMSI_DISTINCT_ORIG_COL].fillna(0))
 
-    # SENDER_VELOCITY_ZSCORE_COL: same _known-indicator treatment as IMSI
-    # above, NOT log1p'd (already roughly z-score-shaped, can be negative -
-    # see BEHAVIORAL_COLS' comment on why this column is handled here
-    # rather than living in that list directly). fillna(0) is a genuinely
-    # neutral default for a z-score specifically (0 = "exactly at this
-    # sender's own typical burst size"), not a fabricated count like 0
-    # would be for IMSI - still paired with a _known indicator so the
-    # model can tell "genuinely average" from "no baseline existed yet"
-    # if that distinction carries real signal.
+    # Same _known treatment as IMSI, but NOT log1p'd (already z-score
+    # shaped, can be negative). fillna(0) is a neutral default here (0 =
+    # "at this sender's own typical burst size"), unlike IMSI's fabricated-
+    # count concern - still paired with _known in case the distinction matters.
     if SENDER_VELOCITY_ZSCORE_COL not in transformed.columns:
         transformed[SENDER_VELOCITY_ZSCORE_COL] = np.nan
     transformed[SENDER_VELOCITY_ZSCORE_KNOWN_COL] = transformed[SENDER_VELOCITY_ZSCORE_COL].notna().astype(float)
     transformed[SENDER_VELOCITY_ZSCORE_COL] = transformed[SENDER_VELOCITY_ZSCORE_COL].fillna(0.0)
 
-    # SENDER_AGE_DAYS_COL: bucketed, NOT passed raw - see
-    # SENDER_AGE_BUCKET_EDGES_DAYS's comment above for why (real measured
-    # failure on this dataset's narrow 0.0-2.0 range). pd.cut with an
-    # explicit `labels=` always yields ALL SENDER_AGE_BUCKET_LABELS as
-    # categories regardless of which bins this particular df actually
-    # populates - verified this holds even for a single-row df - so
-    # get_dummies() below always produces all SENDER_AGE_BUCKET_COLS, the
-    # same "single live row must still match the fitted preprocessor's
-    # expected columns" guarantee `known_sources` gives `source` below,
-    # without needing an equivalent parameter here.
+    # Bucketed, not raw - see SENDER_AGE_BUCKET_EDGES_DAYS's comment.
+    # pd.cut with explicit `labels=` always yields all
+    # SENDER_AGE_BUCKET_LABELS as categories (verified even for a
+    # single-row df), so get_dummies() below always produces all
+    # SENDER_AGE_BUCKET_COLS - same column-stability guarantee
+    # `known_sources` gives `source`, without needing a parameter here.
     age_bucket = pd.cut(
         transformed[SENDER_AGE_DAYS_COL],
         bins=SENDER_AGE_BUCKET_EDGES_DAYS, labels=SENDER_AGE_BUCKET_LABELS,
     )
     age_bucket_dummies = pd.get_dummies(age_bucket, prefix="sender_age_bucket")
 
-    # SENDER_DIVERSITY_SHORT_COL/LONG_COL: gated on the underlying message
-    # count, NOT passed raw - see SENDER_DIVERSITY_MIN_MSGS's comment above
-    # for why (real measured failure, more severe than age's). Uses `df`
-    # (the original, pre-log1p frame), not `transformed` - the COUNT_COLS
-    # loop above already log1p'd transformed[*_MSGS_COL] in place, and the
-    # gate needs the REAL message count, not its log1p'd value.
+    # Gated on message count, not passed raw - see SENDER_DIVERSITY_MIN_MSGS.
+    # Uses `df` (pre-log1p), not `transformed` - the gate needs the real
+    # message count, not the log1p'd value COUNT_COLS already applied.
     below_min_short = df[SENDER_DIVERSITY_SHORT_MSGS_COL] < SENDER_DIVERSITY_MIN_MSGS
     transformed.loc[below_min_short, SENDER_DIVERSITY_SHORT_COL] = np.nan
     transformed[SENDER_DIVERSITY_SHORT_KNOWN_COL] = transformed[SENDER_DIVERSITY_SHORT_COL].notna().astype(float)
@@ -409,12 +322,9 @@ def build_combined_frame(
     transformed[SENDER_DIVERSITY_LONG_KNOWN_COL] = transformed[SENDER_DIVERSITY_LONG_COL].notna().astype(float)
     transformed[SENDER_DIVERSITY_LONG_COL] = transformed[SENDER_DIVERSITY_LONG_COL].fillna(0.0)
 
-    # `source` is only a real feature when more than one source is present
-    # in this training run - a single-source run (e.g. --sources SMPP for
-    # a split model, see CLAUDE.md's "Split by source" note) would produce
-    # a constant one-hot column carrying zero information, just dead
-    # weight through StandardScaler. Combined-sources runs keep the dummy
-    # unchanged - same behavior as before.
+    # `source` is only a real feature with >1 source present - a
+    # single-source run (e.g. --sources SMPP) would produce a constant
+    # one-hot column carrying zero information.
     raw_passthrough_behavioral_cols = [
         c for c in BEHAVIORAL_COLS
         if c not in (SENDER_AGE_DAYS_COL, SENDER_DIVERSITY_SHORT_COL, SENDER_DIVERSITY_LONG_COL)
@@ -425,14 +335,16 @@ def build_combined_frame(
         SENDER_DIVERSITY_SHORT_COL, SENDER_DIVERSITY_SHORT_KNOWN_COL,
         SENDER_DIVERSITY_LONG_COL, SENDER_DIVERSITY_LONG_KNOWN_COL,
     ]
+    content_flag_meta = compute_content_flag_meta_features(transformed)
     other_cols = (
         raw_passthrough_behavioral_cols + list(NEAR_DUP_COLS) + imsi_cols + velocity_cols
-        + diversity_cols + SENDER_AGE_BUCKET_COLS + CONTENT_FLAG_COLS
+        + diversity_cols + SENDER_AGE_BUCKET_COLS + CONTENT_FLAG_COLS + CONTENT_FLAG_META_COLS
     )
     pieces = [
         transformed[raw_passthrough_behavioral_cols + NEAR_DUP_COLS + imsi_cols + velocity_cols + diversity_cols],
         age_bucket_dummies,
         transformed[CONTENT_FLAG_COLS],
+        content_flag_meta,
     ]
     if known_sources is not None:
         source_dummies = pd.get_dummies(

@@ -1,32 +1,25 @@
 """
-Trains the decision-fusion meta-model. Does not violate CLAUDE.md's "keep
-rule_pattern_score and anomaly_score separate, don't average them" - it
-learns a small, fully-inspectable combination of them (2 coefficients + an
-intercept) that serving/fusion_scoring.py exposes as its own additive
-`fusion_score`, alongside the two raw scores which stay unchanged in the
-response (see serving/app.py's module docstring).
+Trains the decision-fusion meta-model. Keeps rule_pattern_score and
+anomaly_score separate per CLAUDE.md - learns a small, inspectable
+combination (2 coefficients + intercept) exposed by
+serving/fusion_scoring.py as its own additive `fusion_score`, alongside
+the two unchanged raw scores.
 
-MODEL: StandardScaler -> LogisticRegression on exactly 2 features
-(rule_pattern_score, anomaly_score). Deliberately the smallest model that
-could plausibly work: the inputs are already two models' opinions, so
-fusion's only job is learning how much to trust each - 2 coefficients are
-enough, and unlike a boosted-tree meta-model they're directly readable off
-the fitted model (model.coef_) without SHAP.
+Model: StandardScaler -> LogisticRegression on exactly 2 features
+(rule_pattern_score, anomaly_score) - deliberately the smallest model
+that could work, and readable off model.coef_ without SHAP.
 
-TRAINING POOL IS SMALL AND SOURCE-SKEWED RIGHT NOW: see
-models/decision_fusion/data.py's module docstring (SS7's
-anomaly_scores.parquet is still a 20k-row sample) - printed at run time,
-not smoothed over. Re-run once SS7's Isolation Forest is retrained on its
-full corpus.
+Training pool is small and source-skewed right now (SS7's
+anomaly_scores.parquet is still a 20k-row sample - see
+models/decision_fusion/data.py). Printed at run time, not smoothed over.
+Re-run once SS7's Isolation Forest is retrained on its full corpus.
 
-NOT wired into pipeline.py, same reasoning as the other train.py scripts.
-Run by hand, per source:
+Not wired into pipeline.py. Run by hand, per source:
 
     python -m models.decision_fusion.train --source SS7
     python -m models.decision_fusion.train --source SMPP
 
-EVALUATION: same shared PR-AUC/log-loss/precision@K helpers
-(models/metrics.py) as the two base models.
+Evaluation: shared PR-AUC/log-loss/precision@K helpers (models/metrics.py).
 """
 import argparse
 from pathlib import Path

@@ -1,10 +1,8 @@
 """
-Serving-side model loading - the ONLY way inference code (eventually
-FastAPI) should load a trained model. Never load by run_id directly in
-serving code - that hardcodes one specific training run into the
-service. Loading by registered-name + alias means promoting a new
-model (models/compare_versions.py) is just moving the alias, never a
-serving code change.
+Serving-side model loading - the only way inference code should load a
+trained model. Never load by run_id directly in serving code - loading by
+registered-name + alias means promoting a new model
+(models/compare_versions.py) is just moving the alias, never a code change.
 """
 import mlflow
 
@@ -15,11 +13,9 @@ def load_champion(registered_name: str, alias: str = "champion"):
     """
     Loads whatever model version currently holds `alias` for
     `registered_name`. Uses the generic pyfunc loader (works across
-    sklearn/LightGBM/etc. flavors uniformly) - NOT for artifacts that
-    aren't themselves predictive models (e.g. the standalone embedding
-    PCA pipeline models/rule_pattern/train.py --with_embeddings logs
-    separately - that one has no .predict(), no pyfunc wrapper exists
-    for it, and needs its native mlflow.sklearn.load_model() instead).
+    sklearn/LightGBM/etc. uniformly) - not for non-model artifacts like
+    the standalone embedding PCA pipeline (needs its native
+    mlflow.sklearn.load_model() instead, no .predict()/pyfunc wrapper).
     """
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     return mlflow.pyfunc.load_model(f"models:/{registered_name}@{alias}")

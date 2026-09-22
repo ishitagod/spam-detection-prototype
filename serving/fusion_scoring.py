@@ -4,15 +4,14 @@ models/decision_fusion/train.py) and scores one (rule_pattern_score,
 anomaly_score) pair - same per-source champion-cache pattern as
 serving/scoring.py and serving/anomaly_scoring.py.
 
-SCOPE: an additive third score, not a replacement for the two it combines
-- see serving/app.py's module docstring for how fusion_score drives the
-decision (falls back to rule_pattern_score alone when no champion exists
-yet). Both raw scores stay in the response unchanged regardless.
+An additive third score, not a replacement for the two it combines (see
+serving/app.py - falls back to rule_pattern_score alone when no champion
+exists). Both raw scores stay in the response unchanged.
 
-GRACEFUL DEGRADATION: no fusion champion exists for a source until
-`python -m models.decision_fusion.train --source <SOURCE>` has been run and
-promoted - a real, expected state early in this feature's rollout. Raises
-ChampionUnavailableError, same convention as the other two scorers.
+No fusion champion exists for a source until
+`python -m models.decision_fusion.train --source <SOURCE>` has run and
+been promoted. Raises ChampionUnavailableError, same convention as the
+other two scorers.
 """
 import logging
 import time
@@ -34,15 +33,14 @@ CHAMPION_ALIAS = "champion"
 
 class ChampionUnavailableError(RuntimeError):
     """No model currently holds CHAMPION_ALIAS for this source's
-    registered name - a real, expected state before
-    models/compare_versions.py has promoted a fusion champion for it."""
+    registered name - expected before models/compare_versions.py has
+    promoted a fusion champion for it."""
 
 
 @dataclass
 class _LoadedFusionModel:
     pipeline: object  # sklearn Pipeline(StandardScaler, LogisticRegression)
-    feature_names: list[str]  # from the champion's own feature_names.json -
-    # authoritative column order, not assumed.
+    feature_names: list[str]  # authoritative column order, from feature_names.json
     version: str
 
 
@@ -81,6 +79,21 @@ def _load_champion(source: str) -> _LoadedFusionModel:
         version.version, source, int((time.perf_counter() - load_start) * 1000),
     )
     return _cached[source]
+
+
+KNOWN_SOURCES = ["SMPP", "SS7"]
+
+
+def preload() -> None:
+    """Warms _cached for every known source at process startup, same
+    reasoning as serving.scoring.preload(). A source with no promoted
+    fusion champion yet is expected (app.py falls back to
+    rule_pattern_score alone) and must not block startup."""
+    for source in KNOWN_SOURCES:
+        try:
+            _load_champion(source)
+        except ChampionUnavailableError as e:
+            logger.warning("preload: decision_fusion champion unavailable for source=%s: %s", source, e)
 
 
 def reset_cache() -> None:

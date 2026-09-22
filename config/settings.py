@@ -22,8 +22,11 @@ MLFLOW_TRACKING_URI = os.environ.get(
 )
 
 # --- SMPP ingestion (ingestion/smpp.py) ---------------------------------
-SMPP_SUBMIT_SM_OPERATION = 4  # keep only op-4 (submit_sm) rows - see
-# ingestion/smpp.py clean_smpp_raw()
+SMPP_SUBMIT_SM_OPERATION = 4  # op-4 (submit_sm) rows - always kept
+SMPP_DELIVER_SM_OPERATION = 5  # op-5 (deliver_sm) rows - kept only when
+# esme_class != SMPP_DELIVER_SM_RECEIPT_ESME_CLASS below (excludes
+# delivery receipts, which carry no spam-relevant content)
+SMPP_DELIVER_SM_RECEIPT_ESME_CLASS = 4
 
 # --- Rule-engine label derivation (labels/rule_labels.py) --------------
 # SmartWhitelist rule-name prefix: a `rule` value starting with this is a
@@ -121,7 +124,75 @@ CONTENT_FLAG_PATTERNS = {
         r"\b(?:irs|tax refund|income tax department|tax rebate|customs duty|penalty notice"
         r"|reembolso de impuestos|receita federal|imposto de renda)\b"
     ),
+    # "Free"/no-cost bait, distinct from has_prize_keyword (which is
+    # win/claim-framed) - this is the free-trial/free-bonus framing.
+    "has_free_bonus_keyword": (
+        r"\b(?:free|no cost|free spin|free spins|bonus|new member bonus"
+        r"|percuma|free spin percuma|ahli baru|bonus percuma)\b"
+    ),
+    # E-wallet/gambling-account transaction verbs - distinct from
+    # has_gambling_keyword (names the activity) and has_loan_keyword
+    # (names credit products); this names the money-movement step scam/
+    # gambling campaigns push toward (top up, withdraw, recharge).
+    "has_ewallet_transaction_keyword": (
+        r"\b(?:top ?up|deposit|withdraw(?:al)?|recharge|e-?wallet"
+        r"|topup|depo|rebat|cashback|komisen)\b"
+    ),
+    # Account-creation/login call-to-action - distinct from
+    # has_account_verification_keyword (which targets impersonation of an
+    # existing account being locked/suspended); this targets the
+    # sign-up-for-a-new-account CTA gambling/loan campaigns use.
+    "has_registration_cta_keyword": (
+        r"\b(?:daftar|sertai|log masuk|apply now|register now|sign up now)\b"
+    ),
+    # Bare domain-like tokens on a small set of TLDs heavily reused by
+    # observed spam/phishing infrastructure - distinct from has_url
+    # (scheme-prefixed) and has_shortlink (named shortener services);
+    # this catches an unlinked "promo-xyz123.top"-style mention. Starting
+    # list from real campaigns seen in this corpus, not exhaustive.
+    "has_suspicious_tld": (
+        r"(?i)(?<!@)\b[a-z0-9-]{2,20}\.(?:top|xyz|shop|cc|vip|info|work|buzz|fun|icu|cyou"
+        r"|loan|live|store|site|club|sbs|cfd|bid)\b(?:[/?#]\S*)?"
+    ),
+    # Specific domains/domain-fragments repeatedly observed in confirmed
+    # spam/phishing traffic in this corpus - a denylist, not a heuristic;
+    # revisit/prune as the corpus grows, same caveat as every other list
+    # here (starting point, not exhaustive or permanently accurate).
+    "has_known_malicious_domain": (
+        r"(?i)\b(?:mhi-asv\.(?:top|net)|linkto\.eu|xy2\.eu|ipvtt\.online|waxmugay\.info"
+        r"|hkylsop\.in|maixpint\.top|maxspnt\.cc|hotlinkuta\.(?:link|my)"
+        r"|hotlinksm\.(?:link|my)|ironman66\.ca|jtexhris\.uk|paramountproperty\.my"
+        r"|v12mys\.social|jitexpressii\.uk)\b"
+    ),
+    # Brand-impersonation via character substitution/obfuscation
+    # (vvhatsapp, moxis for Maxis, etc.) or a delivery-brand name paired
+    # with an unofficial domain - observed repeatedly targeting
+    # regionally recognizable brands (JT Express, WhatsApp, Maxis,
+    # Hotlink) rather than generic phishing wording.
+    "has_brand_impersonation_keyword": (
+        r"(?i)\b(?:jt ?express|jtexpre(?:ss|ssmy|sspost)?|jtexhris"
+        r"|whtsapp|whtasapp|vvhatsapp|vvhtasapp|vvhtsapp|vhatsaupp|wapp|wsapp|wassapp"
+        r"|moxis|maxls|hotlinkuta|hotlinksm|mybayar)\b"
+    ),
 }
+
+# High-confidence CONTENT_FLAG_PATTERNS combinations - a single common
+# flag alone (e.g. has_url) is too weak/noisy on its own. Unvalidated
+# starting point, revisit once measured against confirmed spam. Lives
+# here (not in labels/rule_labels.py, which imports CONTENT_FLAG_COLS
+# from models/anomaly/data.py) so both that module and
+# models/anomaly/data.py's own feature builder can import it without a
+# circular import.
+CONTENT_FLAG_HIGH_CONFIDENCE_COMBINATIONS = [
+    ["has_gambling_keyword"],
+    ["has_known_malicious_domain"],
+    ["has_brand_impersonation_keyword"],
+    ["has_otp_keyword", "has_urgency_keyword"],
+    ["has_url", "has_urgency_keyword"],
+    ["has_url", "has_prize_keyword"],
+    ["has_loan_keyword", "has_urgency_keyword"],
+    ["has_registration_cta_keyword", "has_urgency_keyword"],
+]
 
 # --- Text embeddings (features/text_embeddings.py) -----------------------
 # paraphrase-multilingual-MiniLM-L12-v2 was picked

@@ -14,7 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.anomaly.data import (
-    BEHAVIORAL_COLS, CONTENT_FLAG_COLS, IMSI_DISTINCT_ORIG_COL,
+    BEHAVIORAL_COLS, CONTENT_FLAG_COLS, CONTENT_FLAG_META_COLS, IMSI_DISTINCT_ORIG_COL,
     IMSI_DISTINCT_ORIG_KNOWN_COL,
     NEAR_DUP_COLS, SENDER_AGE_BUCKET_COLS, SENDER_AGE_BUCKET_EDGES_DAYS,
     SENDER_AGE_BUCKET_LABELS, SENDER_AGE_DAYS_COL,
@@ -22,7 +22,8 @@ from models.anomaly.data import (
     SENDER_DIVERSITY_MIN_MSGS, SENDER_DIVERSITY_SHORT_COL,
     SENDER_DIVERSITY_SHORT_KNOWN_COL,
     SENDER_VELOCITY_ZSCORE_COL, SENDER_VELOCITY_ZSCORE_KNOWN_COL,
-    build_combined_frame, build_feature_matrix, load_source_features,
+    build_combined_frame, build_feature_matrix, compute_content_flag_meta_features,
+    load_source_features,
 )
 
 N_EMBEDDING_DIMS = 4  # small, for test speed - real data uses 384
@@ -133,7 +134,7 @@ def test_output_width_matches_n_components_plus_other_features():
     # not replaced the way age is - so no "-1" for those, unlike age).
     expected_width = (
         2 + (len(BEHAVIORAL_COLS) - 1) + len(NEAR_DUP_COLS) + 2 + 2 + 2
-        + len(SENDER_AGE_BUCKET_COLS) + len(CONTENT_FLAG_COLS)
+        + len(SENDER_AGE_BUCKET_COLS) + len(CONTENT_FLAG_COLS) + len(CONTENT_FLAG_META_COLS)
     )
     assert X.shape[1] == expected_width
     assert len(feature_names) == expected_width
@@ -225,6 +226,7 @@ def test_preprocessor_is_returned_and_reusable():
             transformed[non_age_behavioral_cols + NEAR_DUP_COLS + imsi_cols + velocity_cols + diversity_known_cols],
             age_bucket_dummies,
             transformed[CONTENT_FLAG_COLS],
+            compute_content_flag_meta_features(transformed),
             transformed[embedding_cols],
         ],
         axis=1,

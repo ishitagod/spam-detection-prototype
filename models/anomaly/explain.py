@@ -1,68 +1,39 @@
 """
-SHAP + LIME explainability for the anomaly (Isolation Forest) model. Loads
-an ALREADY TRAINED model + preprocessing pipeline from MLflow by run_id -
-same "explain a specific promoted/candidate run, never during train.py
-itself" convention as models/rule_pattern/explain.py. Two tools, not one,
-because the model's input space is genuinely two different kinds of
-feature:
+SHAP + LIME explainability for the anomaly (Isolation Forest) model.
+Loads an already-trained model + preprocessing pipeline from MLflow by
+run_id (never during train.py itself). Two tools, since the input space
+is genuinely two kinds of feature:
 
-  - BEHAVIORAL_COLS + NEAR_DUP_COLS + one-hot source (~10-12 features) -
-    these pass through models/anomaly/data.py's build_preprocessor()
-    UNMIXED: log1p (per-feature) then a joint StandardScaler (per-feature
-    affine) - neither transform blends one column into another, so they
-    keep their real identity/name all the way into the tree splits. SHAP
-    TreeExplainer works great here: exact (not sampled), one vectorized
-    pass over the WHOLE rebuilt dataset, real per-feature attribution.
-    (An earlier version of this docstring claimed SHAP couldn't attribute
-    anything meaningfully here at all - wrong, corrected: only the
-    embedding third has that problem, see below.)
-  - the 384-dim MiniLM embedding - genuinely DOES get mixed:
-    build_preprocessor() PCA-reduces it to N_EMBEDDING_COMPONENTS
-    anonymous linear combinations (`emb_pca_0..29`) before the model ever
-    sees it. A raw SHAP attribution to `emb_pca_7` specifically is real
-    but not actionable - no analyst can say what "emb_pca_7" means. SHAP
-    values across all emb_pca_* columns are summed per-row into one
-    CONTENT_EMBEDDING_BUCKET below (see summarize_shap_importance()) -
-    "how much did the message's content matter overall", which IS
-    answerable, instead of 30 meaningless per-dimension numbers.
+  - BEHAVIORAL_COLS + NEAR_DUP_COLS + one-hot source (~10-12 features)
+    pass through build_preprocessor() unmixed (log1p, then per-feature
+    StandardScaler), keeping their identity into the tree splits - SHAP
+    TreeExplainer gives exact, whole-dataset, real per-feature attribution.
+  - The 384-dim MiniLM embedding genuinely gets mixed - PCA-reduced to
+    N_EMBEDDING_COMPONENTS anonymous combinations (`emb_pca_0..29`)
+    before the model sees it, so per-dimension SHAP attribution isn't
+    actionable. Summed per-row into one CONTENT_EMBEDDING_BUCKET instead
+    (summarize_shap_importance()) - "how much did content matter overall".
 
-SHAP SIGN CONVENTION - READ BEFORE TRUSTING THE NUMBERS: shap.TreeExplainer
-explains IsolationForest's RAW ensemble output (a summed path-length
-statistic), where LOWER raw output = shorter average path = MORE
-anomalous - the OPPOSITE direction of this project's anomaly_score
-convention (higher = more anomalous, models/anomaly/train.py's
-score_anomalies()). compute_shap_contributions() negates the raw SHAP
-values so a POSITIVE number here means "pushed anomaly_score UP" - verified
-empirically (see the conversation this was built from) that this negation
-gives a perfect rank match with anomaly_score (Spearman correlation -1.0
-between raw output and anomaly_score on a synthetic check) - a reliable
-RELATIVE/ranking signal, NOT an exact additive decomposition of
-anomaly_score's own scale (base_value + sum(shap) reconstructs the negated
-raw statistic, not anomaly_score itself, since IsolationForest's
-score_samples()/decision_function() apply their own offset/normalization
-SHAP's tree walk doesn't see).
+SHAP SIGN CONVENTION: shap.TreeExplainer explains IsolationForest's raw
+ensemble output, where LOWER = more anomalous - opposite of this
+project's anomaly_score (higher = more anomalous). Negated in
+compute_shap_contributions() so positive = "pushed anomaly_score up" -
+verified empirically (Spearman -1.0 between raw output and anomaly_score
+on a synthetic check). A reliable ranking signal, not an exact additive
+decomposition of anomaly_score's own scale (IsolationForest's own
+offset/normalization isn't visible to SHAP's tree walk).
 
-WHY LIME ALSO EXISTS (not superseded by SHAP above): SHAP explains the
-message's content only as one aggregate bucket, holding no story for
-which STRUCTURED feature values would need to change to flip the verdict,
-in ORIGINAL (not log1p'd/z-scored) units. LIME's fixed-embedding local
-surrogate (see make_predict_fn()) answers that different, complementary
-question for a handful of specific instances - not a redundant second
-tool for the same job. LIME DOES NOT SCALE THE WAY SHAP's TreeExplainer
-DOES: it fits a fresh local surrogate PER INSTANCE, each requiring
-`num_lime_samples` calls through the full pipeline, so - unlike SHAP above
-- this script only explains a SMALL, deliberately chosen set of instances
-with it (the highest-anomaly-score rows, plus a few random ones for
-contrast), and LIME's own "global" importance output is an AVERAGE OVER
-ONLY THOSE EXPLAINED INSTANCES, not a true dataset-wide statistic the way
-SHAP's is - see main()'s --n_local_examples/--n_random_examples and the
-output CSV's own naming (lime_local_importance_approx.csv, distinct from
-SHAP's shap_global_importance.csv).
+WHY LIME TOO: SHAP explains content only as one aggregate bucket, with
+no story for which structured feature values (in original units) would
+flip the verdict - LIME's fixed-embedding local surrogate
+(make_predict_fn()) answers that for a handful of instances. LIME
+doesn't scale like SHAP - fits a fresh surrogate per instance, so only
+explains a small chosen set (highest-anomaly rows + a few random for
+contrast); its "global" importance is an average over only those
+explained instances, not dataset-wide (hence lime_local_importance_approx.csv).
 
-CURRENT SCALE CAVEAT: like models/anomaly/train.py, this runs against
-whatever features/text_embeddings.py's --sample_n sample the explained
-run was itself trained on (~1% of the full corpus as of writing) - not a
-new limitation, just inherited.
+CURRENT SCALE: like train.py, runs against whatever --sample_n the
+explained run was trained on (~1% of full corpus as of writing).
 
 Run by hand:
     python -m models.anomaly.explain
@@ -118,15 +89,10 @@ def resolve_run_id(run_id: str | None) -> str:
 
 
 def rebuild_dataset(run: mlflow.entities.Run, data_dir: Path) -> pd.DataFrame:
-    """
-    Rebuilds the same per-source join models/anomaly/train.py's run()
-    used (load_source_features() per source in the run's own logged
-    `sources` param, concatenated) - unlike rule_pattern/explain.py there
-    is no train/test split to reproduce: Isolation Forest trains
-    unsupervised on the FULL joined stream (see models/anomaly/train.py's
-    module docstring), so "the data this run trained on" IS the full
-    rebuilt frame, not a slice of it.
-    """
+    """Rebuilds the same per-source join train.py's run() used. Unlike
+    rule_pattern/explain.py, no train/test split to reproduce - Isolation
+    Forest trains unsupervised on the full joined stream, so this full
+    rebuilt frame IS the data the run trained on."""
     sources = run.data.params["sources"].split(",")
     frames = [
         load_source_features(data_dir / s, data_dir / s / "messages_with_behavioral.csv")
@@ -136,38 +102,26 @@ def rebuild_dataset(run: mlflow.entities.Run, data_dir: Path) -> pd.DataFrame:
 
 
 def build_interpretable_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    The non-embedding columns LIME actually perturbs - log1p'd count
-    columns (mirrors models/anomaly/data.py's build_feature_matrix()
-    exactly, same COUNT_COLS) + ratios/similarities as-is + one-hot
-    `source` (only added when this rebuilt df spans more than one source
-    - same "don't add a constant, information-free column" rule
-    build_feature_matrix() itself now follows). Embedding columns are
-    deliberately NOT included here - see module docstring.
+    """The non-embedding columns LIME perturbs - log1p'd COUNT_COLS +
+    ratios/similarities as-is + one-hot `source` (only when the rebuilt
+    df spans >1 source). Embedding columns excluded - see module docstring.
 
-    SENDER_AGE_DAYS_COL: bucketed via the SAME pd.cut()/get_dummies()
-    build_combined_frame() itself uses, NOT passed raw - a real fitted
-    pipeline now expects sender_age_bucket_* columns, not the raw day
-    count (see models/anomaly/data.py's SENDER_AGE_BUCKET_EDGES_DAYS
-    comment for why). Getting this wrong here is not cosmetic: main()'s
-    reindex-to-expected_cols step would silently zero-fill every
-    sender_age_bucket_* column for every row (a state no real row can
-    actually be in - exactly one bucket is always 1) rather than error,
-    silently corrupting X_transformed for BOTH SHAP and LIME, not just
-    whatever this function happened to get wrong about age specifically.
+    SENDER_AGE_DAYS_COL is bucketed (same pd.cut()/get_dummies() as
+    build_combined_frame()), not passed raw - the fitted pipeline expects
+    sender_age_bucket_* columns. Getting this wrong isn't cosmetic:
+    main()'s reindex-to-expected_cols would silently zero-fill every
+    bucket column (a state no real row can be in) instead of erroring,
+    corrupting X_transformed for both SHAP and LIME.
 
-    SENDER_DIVERSITY_SHORT_COL/LONG_COL: same reasoning, gated via the
-    SAME message-count threshold build_combined_frame() uses (see
-    SENDER_DIVERSITY_MIN_MSGS's comment) rather than passed raw - a real
-    fitted pipeline expects the gated value plus a paired _known
-    indicator, not the raw (spuriously-extreme-on-tiny-samples) ratio.
+    SENDER_DIVERSITY_SHORT_COL/LONG_COL: same reasoning, gated on the
+    same message-count threshold (SENDER_DIVERSITY_MIN_MSGS) rather than
+    passed raw.
     """
     transformed = df.copy()
     for col in COUNT_COLS:
         transformed[col] = np.log1p(transformed[col])
 
-    # Uses `df` (pre-log1p), not `transformed` - same reasoning as
-    # build_combined_frame()'s identical gate.
+    # Uses `df` (pre-log1p) - same gate as build_combined_frame().
     below_min_short = df[SENDER_DIVERSITY_SHORT_MSGS_COL] < SENDER_DIVERSITY_MIN_MSGS
     transformed.loc[below_min_short, SENDER_DIVERSITY_SHORT_COL] = np.nan
     transformed[SENDER_DIVERSITY_SHORT_KNOWN_COL] = transformed[SENDER_DIVERSITY_SHORT_COL].notna().astype(float)
@@ -204,37 +158,25 @@ _CONTENT_EMBEDDING_BUCKET = "content_embedding (sum of emb_pca_* |contribution|)
 
 
 def compute_shap_contributions(iforest, X_transformed: np.ndarray) -> np.ndarray:
-    """
-    SHAP TreeExplainer over the FITTED IsolationForest's raw
-    (post-preprocessing) input space - exact, one vectorized pass over
-    however many rows `X_transformed` holds (unlike LIME below, this
-    scales to the whole rebuilt dataset cheaply - see module docstring).
-
-    Returns an (n_rows, n_transformed_features) array, SIGN-FLIPPED from
-    what shap.TreeExplainer.shap_values() itself returns so a POSITIVE
-    value here means "pushed anomaly_score UP" (more anomalous) - see
-    module docstring's SHAP SIGN CONVENTION section for why the raw
-    output needs negating and what that negation does/doesn't guarantee.
-    """
+    """SHAP TreeExplainer over the fitted IsolationForest's raw
+    (post-preprocessing) input space - exact, one vectorized pass, scales
+    to the whole dataset cheaply (unlike LIME below). Returns an
+    (n_rows, n_transformed_features) array, sign-flipped from
+    shap_values() so positive = "pushed anomaly_score up" - see module
+    docstring's SHAP SIGN CONVENTION."""
     explainer = shap.TreeExplainer(iforest)
     raw_shap_values = explainer.shap_values(X_transformed)
     return -raw_shap_values
 
 
 def summarize_shap_importance(shap_contributions: np.ndarray, feature_names: list[str]) -> pd.DataFrame:
-    """
-    Per-feature mean(|contribution|) across all rows in
-    `shap_contributions`, with every `emb_pca_*` column COLLAPSED into one
-    _CONTENT_EMBEDDING_BUCKET row - see module docstring for why
-    individual PCA components aren't reported (no interpretable meaning).
-    The bucket's value is mean-over-rows of (sum-over-embedding-dims of
-    |contribution| for that row) - the total content-driven push per
-    message, averaged across messages - not an average of the individual
-    per-dimension means (a different, less answerable quantity: it would
-    treat 30 small-but-consistent contributions the same as one dominant
-    dimension, when what an analyst actually wants is "how much did
-    content matter for this message, in total").
-    """
+    """Per-feature mean(|contribution|), with every `emb_pca_*` column
+    collapsed into one _CONTENT_EMBEDDING_BUCKET row (individual PCA
+    components aren't interpretable - see module docstring). Bucket value
+    is mean-over-rows of (sum-over-embedding-dims of |contribution|) -
+    total content-driven push per message, not an average of per-dimension
+    means (which would understate one dominant dimension vs. many small
+    consistent ones)."""
     abs_contrib = np.abs(shap_contributions)
     is_embedding = np.array([f.startswith("emb_pca_") for f in feature_names])
 
@@ -255,32 +197,19 @@ def summarize_shap_importance(shap_contributions: np.ndarray, feature_names: lis
 
 
 def make_predict_fn(pipeline, expected_cols: list[str], embedding_cols: list[str], fixed_embedding: np.ndarray):
-    """
-    Returns a LIME-compatible predict_fn(perturbed: np.ndarray) ->
-    np.ndarray of anomaly_score (LimeTabularExplainer's regression mode:
-    a plain 1-D array of predicted values, not class probabilities).
-
-    `interpretable_cols` (the columns `perturbed`'s columns correspond to,
-    positionally) is bound via closure at call sites below - kept out of
-    this signature since it's fixed per explain_instance() call, not per
-    predict_fn call. `fixed_embedding`: this ONE instance's real embedding
-    values, reattached unchanged to every perturbed row (see module
-    docstring's SCOPE note) - a batch of instances would each need their
-    own predict_fn/explainer call, never a shared fixed embedding.
-    """
+    """Returns a LIME-compatible predict_fn(perturbed) -> anomaly_score
+    array (LimeTabularExplainer regression mode). `interpretable_cols` is
+    bound via closure per explain_instance() call. `fixed_embedding`:
+    this one instance's real embedding, reattached unchanged to every
+    perturbed row - a batch of instances each needs its own call."""
     def build(interpretable_cols: list[str]):
         def predict_fn(perturbed: np.ndarray) -> np.ndarray:
             frame = pd.DataFrame(perturbed, columns=interpretable_cols)
             for name, value in zip(embedding_cols, fixed_embedding):
                 frame[name] = value
-            # Reindex to the FITTED ColumnTransformer's exact expected
-            # columns/order - not assumed from how this script happens to
-            # have built `frame` - any column the fitted preprocessor
-            # wants that this rebuild didn't produce (e.g. this explain
-            # run's df has only one source, dropping a dummy column a
-            # multi-source training run had) is filled 0, matching "that
-            # source never appeared in this row" honestly rather than
-            # erroring.
+            # Reindex to the fitted ColumnTransformer's exact expected
+            # columns - any column missing here (e.g. a source dummy this
+            # single-source rebuild never produced) is filled 0.
             for col in expected_cols:
                 if col not in frame.columns:
                     frame[col] = 0
@@ -298,17 +227,17 @@ def main():
     parser.add_argument("--data_dir", type=str, default="data/processed")
     parser.add_argument(
         "--n_local_examples", type=int, default=5,
-        help="Highest-anomaly-score rows to explain individually (see module docstring on why LIME can't cheaply cover a whole test set).",
+        help="Highest-anomaly-score rows to explain individually (see module docstring).",
     )
     parser.add_argument(
         "--n_random_examples", type=int, default=3,
-        help="Additional random (non-top-anomaly) rows to explain, for contrast against the top-anomaly set.",
+        help="Additional random (non-top-anomaly) rows, for contrast.",
     )
     parser.add_argument(
         "--num_lime_samples", type=int, default=500,
-        help="Perturbations LIME draws PER explained instance (its own num_samples param) - "
-        "LIME's library default is 5000; lowered here since this runs once per instance "
-        "(see module docstring) - raise for a more faithful local surrogate at direct runtime cost.",
+        help="Perturbations LIME draws per explained instance. Library default is "
+        "5000; lowered since this runs once per instance - raise for a more "
+        "faithful local surrogate at direct runtime cost.",
     )
     parser.add_argument("--random_state", type=int, default=42)
     parser.add_argument(
@@ -332,7 +261,7 @@ def main():
     interpretable_frame = build_interpretable_frame(df)
     for col in interpretable_cols:
         if col not in interpretable_frame.columns:
-            interpretable_frame[col] = 0  # see make_predict_fn()'s reindex comment - same reasoning
+            interpretable_frame[col] = 0  # same reasoning as make_predict_fn()'s reindex
     interpretable_frame = interpretable_frame[interpretable_cols]
     embeddings = df[embedding_cols].to_numpy(dtype=np.float64)
     print(f"  {len(df)} row(s), {len(interpretable_cols)} interpretable feature(s) (+{len(embedding_cols)} embedding dims held fixed per-instance)")
@@ -343,12 +272,8 @@ def main():
     X_transformed = pipeline.named_steps["preprocessor"].transform(full_frame)
     anomaly_score = score_anomalies(pipeline.named_steps["iforest"], X_transformed)
 
-    # --- SHAP: exact, whole-dataset, behavioral/near-dup features named
-    # individually + embeddings collapsed into one bucket - see module
-    # docstring for why this covers the structured half cheaply, unlike
-    # LIME below. transformed_feature_names is the run's OWN logged
-    # column order for X_transformed (models/anomaly/train.py's
-    # feature_names.json) - authoritative, not re-derived here.
+    # transformed_feature_names is the run's own logged column order
+    # (train.py's feature_names.json) - authoritative, not re-derived here.
     transformed_feature_names = mlflow.artifacts.load_dict(
         f"runs:/{run_id}/feature_names.json"
     )["feature_names"]
@@ -409,9 +334,8 @@ def main():
     local_path = output_dir / "lime_local_explanations.csv"
     local_df.to_csv(local_path, index=False)
 
-    # --- approximate "global" importance: see module docstring, this is
-    # an average over ONLY the explained instances above, not the whole
-    # dataset - named _approx to keep that honest at a glance.
+    # Average over only the explained instances, not the whole dataset -
+    # named _approx to keep that honest.
     approx_importance = (
         local_df.assign(feature_base=local_df["feature"].str.extract(r"^([^ <>=]+)")[0])
         .groupby("feature_base")["weight"]
@@ -434,9 +358,7 @@ def main():
         plt.close(fig)
         print(f"\nSaved representative local explanation plot (row {row_i}) to {plot_path}")
 
-    # Log back to the SAME run, not a new one - ties this explanation to
-    # the specific model version it was computed from (same convention as
-    # models/rule_pattern/explain.py).
+    # Log back to the same run, not a new one - ties this to the model version.
     with mlflow.start_run(run_id=run_id):
         mlflow.log_artifact(str(shap_importance_path))
         mlflow.log_artifact(str(shap_plot_path))

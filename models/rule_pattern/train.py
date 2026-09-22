@@ -1,98 +1,58 @@
 """
-Trains the supervised layer (`rule_pattern_score`) - LightGBM on
-rule_evaluated==True rows only, labelled by rule_flagged. This model can only
-ever re-recognize patterns the rules already encode; it is NOT the
-layer meant to catch novel spam.
+Trains rule_pattern_score: LightGBM on rule_evaluated==True rows only,
+labelled by rule_flagged. Recognizes known rule-engine patterns; does not
+catch novel spam.
 
-NOT wired into pipeline.py, same reasoning as models/anomaly/train.py:
-training is a deliberate, versioned action, not a feature-computation
-step. Run this by hand:
+Not wired into pipeline.py - training is a deliberate, versioned action.
+Run manually:
 
     python -m models.rule_pattern.train
     python -m models.rule_pattern.train --n_estimators 200 --learning_rate 0.05
 
-REAL LABEL COMPOSITION, worth knowing before reading the metrics below:
-SMPP contributes 2,693 rule_evaluated rows, ALL flagged - zero
-confirmed-clean (verified across the full raw dataset, not a sample -
-see README.md's data reality check and CLAUDE.md's roadmap notes).
-SS7 contributes 349,962, split 284,073 flagged / 65,889 confirmed-clean.
-Two consequences:
-  1. SMPP-only PR-AUC is mathematically undefined (one class only) and
-     is skipped, not silently computed wrong - see models/metrics.py.
-  2. Spam is the MAJORITY of this rule-evaluated pool overall (~85%),
-     not the minority - the usual "spam is rare" imbalance framing is
-     backwards here. This is an artifact of WHICH messages the rule
-     engine bothers to evaluate (see the module docstring in
-     models/anomaly/train.py for the same point made about
-     anomaly_score's evaluation), not the true traffic-wide spam rate.
-     No explicit class-weighting is applied here for that reason - it's
-     not obviously warranted given the real, measured composition,
-     rather than assumed from the generic "imbalanced spam" prior.
+Label composition: SMPP has 2,693 rule_evaluated rows, all flagged (zero
+confirmed-clean, so SMPP-only PR-AUC is undefined and skipped - see
+models/metrics.py). SS7 has 349,962 rows, 284,073 flagged / 65,889 clean.
+Spam is the majority of this pool overall (~85%) because of which messages
+the rule engine evaluates, not the true traffic-wide rate - no class
+weighting applied.
 
-EVALUATION: train/test split (stratified by label), PR-AUC + log loss
-via models/metrics.py (shared with models/anomaly/train.py, same
-single-class-skip guard), evaluated on BOTH train and test sets - a
-large train/test gap is the actual overfitting signal to watch for,
-given this pool's small-for-SMPP / imbalanced-for-SS7 shape.
+Evaluation: stratified train/test split, PR-AUC + log loss via
+models/metrics.py, on both train and test sets - a large train/test gap
+is the overfitting signal to watch for.
 
---with_embeddings / --with_tfidf: independently toggleable, see
-models/rule_pattern/data.py's module docstring for why they're separate
-flags rather than one combined switch. --with_embeddings coverage is now
-source-dependent: SS7's embeddings.npy is a full-dataset GPU run (all
-2,742,301 rows), so `--with_embeddings --sources SS7` trains on the full
-SS7 rule_evaluated pool - ready to run, just not yet re-trained/logged to
-MLflow as of writing (the one logged rule_pattern_score_with_embeddings
-run still reflects the old ~1%-sample era). SMPP has no embeddings.npy
-yet - still blocked on its own full-dataset run. --with_tfidf IS
-useful today - real standalone signal already measured (PR-AUC 0.934 on
-a text-grouped split, see data.py docstring), no sample-coverage blocker.
+--with_embeddings / --with_tfidf: independent flags (see data.py's module
+docstring). SS7's embeddings.npy is a full-dataset run, so
+`--with_embeddings --sources SS7` is ready to run (not yet re-logged to
+MLflow). SMPP has no embeddings.npy yet. --with_tfidf has measured
+standalone signal (PR-AUC 0.934 on a text-grouped split, see data.py).
 
-Either flag routes the split BEFORE featurization, not after: TF-IDF
-vocabulary and embedding PCA are corpus-dependent, so they must be fit on
-the train fold only (see data.py's train_mask docstring) - fitting on the
-full pool first, THEN splitting, would leak test-set information into
-featurization itself. The plain default path (neither flag set) doesn't
-care about split order since nothing in it is corpus-fit, but the split
-now happens first unconditionally, for one consistent code path rather
-than two.
+Either flag splits before featurization, since TF-IDF vocabulary and
+embedding PCA are corpus-dependent and must fit on the train fold only
+(data.py's train_mask). The plain default path splits first too, for one
+consistent code path.
 
-Any experimental combination of these flags is logged to a SEPARATE
-MLflow experiment (rule_pattern_score_experimental) so an early or
-partial-coverage run never gets mistaken for the real baseline candidate
-in the MLflow UI - same reasoning as
-scripts/check_embedding_dominance.py's separate diagnostics experiment.
-with_embeddings/with_tfidf are logged as params on every run, so runs
-are filterable/comparable within that one experiment rather than
-scattered across per-combination experiment names.
+Any experimental flag combination logs to a separate MLflow experiment
+(rule_pattern_score_experimental) instead of the baseline one, so a
+partial-coverage run is never mistaken for the real candidate.
+with_embeddings/with_tfidf are logged as params on every run either way.
 
 --include_content_labels: expands the training pool with confident
-positives mined from rows the telecom rule engine never evaluated
-(rule_evaluated==False), scored by a LogisticRegression fit on the REAL
-rule_flagged labels (labels/rule_labels.py::fit_content_flag_weights() /
-content_flagged_by_weight()) rather than an unweighted flag count or a
-hand-picked combination - each content flag's weight is its OWN measured
-coefficient toward rule_flagged, printed at run start. Must be fit on
-whichever `sources` pool has both classes present (SMPP alone has zero
-confirmed-clean rule_evaluated rows - CLAUDE.md - so a SMPP-only run
-raises; SS7 alone or SMPP+SS7 combined both work). See
-models/rule_pattern/data.py::label_content_flagged_positives() for why
-these are POSITIVE-only additions, never labelled-clean rows. Adds a
-test-set breakdown BY label_source (telecom_rule_engine vs
-content_static_rules) alongside the existing per-source breakdown, since
-the content_static_rules slice's label is still derived from
-CONTENT_FLAG_COLS, which are also features here - a good score on just
-that slice is expected, not evidence of real generalization on its own.
+positives mined from rule_evaluated==False rows, scored by a
+LogisticRegression fit on real rule_flagged labels
+(labels/rule_labels.py::fit_content_flag_weights()/
+content_flagged_by_weight()) rather than an unweighted flag count. Must
+be fit on a `sources` pool with both classes present (SMPP-only raises).
+Positive-only additions - see
+label_content_flagged_positives()'s docstring. Adds a test-set breakdown
+by label_source, since content_static_rules labels are partly derived
+from features this model also uses (a good score there is expected, not
+evidence of generalization).
 
-COMBINABLE with --with_embeddings/--with_tfidf: content-labelled rows get
-embeddings joined the same way as the base pool
-(models/rule_pattern/data.py::join_embeddings(), since
-features/text_embeddings.py runs over the WHOLE messages_with_behavioral.csv,
-not just rule_evaluated rows - a row without embedding coverage is
-silently dropped from the content-labelled addition, not the whole run).
-TF-IDF needs no such join (fit straight from `text`, works for any row
-regardless of label_source). In practice this still means `--sources SS7`
-for the embeddings combination today - SMPP has no embeddings.npy yet
-(see --with_embeddings note above), independent of content labels.
+Combinable with --with_embeddings: content-labelled rows get embeddings
+joined the same way as the base pool (join_embeddings()); rows without
+coverage are dropped from the addition, not the whole run. --with_tfidf
+needs no such join. In practice this means `--sources SS7` for the
+embeddings combination today.
 """
 
 import argparse
@@ -141,29 +101,17 @@ def train_lightgbm(
 ) -> lgb.LGBMClassifier:
     """
     colsample_bytree/min_child_samples/reg_alpha/reg_lambda default to
-    LightGBM's own library defaults - unless explicitly overridden via
-    train.py's CLI, behavior is unchanged from before these existed.
+    LightGBM's own library defaults - no behavior change unless overridden
+    via CLI.
 
-    These are the real anti-single-feature-dominance knobs, added after a
-    real observation (SS7 --with_tfidf champion, models/rule_pattern/
-    explain.py's SHAP output): tfidf_https alone accounted for a large
-    swing in a live prediction (risk_score 0 -> 96 from adding one token).
-    That may be a genuinely correct learned pattern (this model's scope is
-    known rule-engine patterns, not novel spam - CLAUDE.md), not
-    necessarily a bug to eliminate - but it's also a real production risk
-    (trivially evadable by not using that literal string). Three
-    independent levers, not one, since they attack different mechanisms:
-      - colsample_bytree < 1.0: randomly excludes some features from each
-        tree, so no single feature can be the split at every tree's root.
-      - min_child_samples > 20: requires more rows per leaf, so a leaf
-        specialized around one rare-but-strong token needs more support.
-      - reg_alpha/reg_lambda > 0: L1/L2 penalty on leaf weights directly
-        discourages the large leaf-value swing that produces a near-100
-        risk_score jump from one token flipping.
-    None of these are tuned/validated yet - starting points to experiment
-    with via PR-AUC/log loss (does regularizing hurt the real metric) and
-    re-running explain.py (does it actually reduce tfidf_https's SHAP
-    magnitude), not assumed to be correct as-is.
+    Added after observing (SS7 --with_tfidf champion, explain.py's SHAP
+    output) that a single token (tfidf_https) swung risk_score from 0 to
+    96. May be a correct learned pattern, but also a real evasion risk.
+    Three independent anti-single-feature-dominance levers:
+      - colsample_bytree < 1.0: excludes features per tree
+      - min_child_samples > 20: requires more support per leaf
+      - reg_alpha/reg_lambda > 0: L1/L2 penalty on leaf weights
+    Not tuned/validated yet - starting points only.
     """
     model = lgb.LGBMClassifier(
         n_estimators=n_estimators,
@@ -219,10 +167,7 @@ def run(
     df = pd.concat(frames, ignore_index=True)
 
     if include_content_labels:
-        # Fit on the REAL labelled pool built above (both sources combined
-        # if requested - fit_content_flag_weights() itself refuses a
-        # single-class pool, which a SMPP-only `sources` would be, see
-        # that function's docstring), THEN score each source's own
+        # Fit on the labelled pool built above, then score each source's
         # rule_evaluated==False rows with the fitted weights.
         weight_model = fit_content_flag_weights(df)
         print("Content-flag weights (LogisticRegression fit on real rule_flagged labels):")
@@ -240,11 +185,7 @@ def run(
                 unevaluated, weight_model, threshold=content_flag_weight_threshold
             )
             if with_embeddings:
-                # features/text_embeddings.py runs over the WHOLE
-                # messages_with_behavioral.csv (see join_embeddings()'s
-                # docstring), so these rule_evaluated==False rows can get
-                # real embeddings the same way the base pool does above -
-                # an inner join, silently restricted to whatever coverage
+                # Inner join, silently restricted to whatever coverage
                 # source_dir's embeddings.npy actually has.
                 before = len(content_df)
                 content_df = join_embeddings(content_df, source_dir)
@@ -262,12 +203,8 @@ def run(
 
     y_full = (df["rule_flagged"] == True).astype(int).to_numpy()  # noqa: E712
 
-    # Split BEFORE featurization, not after: with either flag on, TF-IDF
-    # vocabulary / embedding PCA are corpus-dependent transformers that
-    # must never see the test fold during fit (see data.py's train_mask
-    # docstring). Splitting first and passing a train_mask into
-    # build_feature_matrix() is the one code path that's correct for the
-    # default case too (train_mask is a no-op there).
+    # Split before featurization - TF-IDF/embedding PCA must fit on the
+    # train fold only (see data.py's train_mask docstring).
     idx_train, idx_test = train_test_split(
         np.arange(len(df)),
         test_size=test_size,
@@ -332,16 +269,12 @@ def run(
         print(f"  {k}: {v}")
 
     if include_content_labels:
-        # Broken down by label_source too, on top of the per-source
-        # breakdown above - content_static_rules rows' label is partly
-        # reconstructible from CONTENT_FLAG_COLS, which are also features
-        # here (see load_content_labelled_messages()'s docstring), so a
-        # good score on JUST that slice is expected and not by itself
-        # evidence the model generalizes - disclosed explicitly rather
-        # than folded invisibly into one combined number.
+        # content_static_rules rows' label is partly derived from
+        # CONTENT_FLAG_COLS, which are also features - a good score on
+        # that slice alone isn't evidence of generalization.
         print(
             "Test set evaluation by label_source (content_static_rules rows are partly "
-            "self-referential - see load_content_labelled_messages()'s docstring):"
+            "self-referential):"
         )
         label_source_metrics = evaluate_overall_and_per_source(
             df_test, "label_source", y_test, test_score, prefix="test_by_label_source_"
@@ -350,21 +283,15 @@ def run(
             print(f"  {k}: {v}")
         test_metrics.update(label_source_metrics)
 
-    # Any experimental flag routes to a SEPARATE experiment - a plain run
-    # (no flags set) stays the real baseline candidate in
-    # MLFLOW_EXPERIMENT_NAME; with_embeddings/with_tfidf/
-    # include_content_labels are logged as params either way so runs stay
-    # filterable/comparable in one place rather than proliferating one
-    # experiment per combination.
+    # Any experimental flag routes to a separate experiment; a plain run
+    # stays in MLFLOW_EXPERIMENT_NAME. Flags are logged as params either way.
     experiment_name = (
         MLFLOW_EXPERIMENTAL_EXPERIMENT_NAME
         if (with_embeddings or with_tfidf or include_content_labels)
         else MLFLOW_EXPERIMENT_NAME
     )
-    # A source-restricted run (e.g. --sources SMPP alone) gets its own
-    # experiment on top of that, suffixed by source - same reasoning as
-    # models/anomaly/train.py: keeps a source-specific champion/challenger
-    # lineage separate from the combined-sources one.
+    # Source-restricted runs get their own experiment, suffixed by source,
+    # keeping that champion/challenger lineage separate from combined-sources.
     if sorted(sources) != sorted(["SMPP", "SS7"]):
         experiment_name += "_" + "_".join(sources)
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
@@ -416,17 +343,11 @@ def run(
         mlflow.lightgbm.log_model(
             model, name="model", signature=model_signature, input_example=X_train[:5]
         )
-        # Each fitted transformer logged as its OWN artifact, not folded
-        # into one sklearn Pipeline with the LightGBM model: each only
-        # sees its own slice of columns (embedding_cols / text), not the
-        # full feature matrix, so they don't chain the way
-        # models/anomaly/train.py's single combined preprocessor+model
-        # pipeline does. Must be loaded and applied in the same order at
-        # inference time later (train/serve skew otherwise). Signature/
-        # input_example for each are built from its OWN raw input (raw
-        # embedding columns / raw text), matching what serving/scoring.py
-        # actually feeds these transformers live - not X, which is the
-        # already-combined final feature matrix.
+        # Each fitted transformer logged as its own artifact (not folded
+        # into one sklearn Pipeline) since each sees only its own slice of
+        # columns. Must be loaded and applied in the same order at
+        # inference time. Signature/input_example use each transformer's
+        # own raw input, matching what serving/scoring.py feeds it live.
         if "embedding_pca_pipeline" in fitted:
             embedding_cols = [c for c in df.columns if c.startswith("emb_")]
             embedding_sample = (
@@ -471,35 +392,25 @@ def main():
         "--colsample_bytree",
         type=float,
         default=1.0,
-        help="Fraction of features randomly sampled per tree - lower (e.g. 0.7) so no "
-        "single feature (e.g. a highly-discriminative tfidf_* token) can be the split "
-        "at every tree's root. See train_lightgbm()'s docstring.",
+        help="Fraction of features sampled per tree - lower to reduce single-feature "
+        "dominance. See train_lightgbm()'s docstring.",
     )
     parser.add_argument(
         "--min_child_samples",
         type=int,
         default=20,
-        help="Minimum rows per leaf - raise (e.g. 50) to require more support before a "
-        "leaf specializes around one rare-but-strong token.",
+        help="Minimum rows per leaf - raise to require more support per leaf.",
     )
     parser.add_argument(
-        "--reg_alpha",
-        type=float,
-        default=0.0,
-        help="L1 regularization on leaf weights.",
+        "--reg_alpha", type=float, default=0.0, help="L1 regularization on leaf weights."
     )
     parser.add_argument(
-        "--reg_lambda",
-        type=float,
-        default=0.0,
-        help="L2 regularization on leaf weights.",
+        "--reg_lambda", type=float, default=0.0, help="L2 regularization on leaf weights."
     )
     parser.add_argument(
         "--with_embeddings",
         action="store_true",
-        help="Add PCA-reduced text embeddings as features - not useful until "
-        "features/text_embeddings.py's full-dataset run is done (see module docstring). "
-        "Independently combinable with --with_tfidf.",
+        help="Add PCA-reduced text embeddings as features. Combinable with --with_tfidf.",
     )
     parser.add_argument(
         "--n_embedding_components", type=int, default=N_EMBEDDING_COMPONENTS
@@ -507,9 +418,8 @@ def main():
     parser.add_argument(
         "--with_tfidf",
         action="store_true",
-        help="Add TF-IDF n-gram features, fit on the train fold only - real "
-        "standalone signal already measured (see data.py module docstring). "
-        "Independently combinable with --with_embeddings.",
+        help="Add TF-IDF n-gram features, fit on the train fold only. Combinable with "
+        "--with_embeddings.",
     )
     parser.add_argument("--tfidf_max_features", type=int, default=TFIDF_MAX_FEATURES)
     parser.add_argument(
@@ -523,21 +433,16 @@ def main():
     parser.add_argument(
         "--include_content_labels",
         action="store_true",
-        help="Expand the training pool with confident positives from rows the telecom "
-        "rule engine never evaluated (rule_evaluated==False), scored by a LogisticRegression "
-        "fit on the REAL rule_flagged labels (labels/rule_labels.py::fit_content_flag_weights) "
-        "instead of an unweighted flag count - see models/rule_pattern/data.py::"
-        "label_content_flagged_positives()'s docstring. Combinable with --with_embeddings: "
-        "those rows get embeddings joined the same way as the base pool (see "
-        "join_embeddings()'s docstring), silently dropped if a source's embeddings.npy "
-        "doesn't cover them.",
+        help="Expand training with confident positives from rule_evaluated==False rows, "
+        "scored by a LogisticRegression fit on real rule_flagged labels. See "
+        "label_content_flagged_positives()'s docstring.",
     )
     parser.add_argument(
         "--content_flag_weight_threshold",
         type=float,
         default=0.5,
-        help="Minimum fitted-model P(rule_flagged) for a rule_evaluated==False row to count "
-        "as a confident content-flagged positive. Only used with --include_content_labels.",
+        help="Minimum fitted-model P(rule_flagged) to count as a confident content-flagged "
+        "positive. Only used with --include_content_labels.",
     )
     args = parser.parse_args()
     run(

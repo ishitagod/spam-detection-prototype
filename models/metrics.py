@@ -1,23 +1,13 @@
 """
 Evaluation helpers shared across models/anomaly/train.py and
-models/rule_pattern/train.py - both need the same real PR-AUC/log-loss
-computation against rule_evaluated labels (validation-only for the
-unsupervised model, the actual training labels for the supervised one),
-with the same single-class guard: SMPP has zero confirmed-clean labels
-(verified - see README.md's data reality check), so PR-AUC is
-mathematically undefined for SMPP-only slices. Both models hit this
-exact scenario, so the guard lives here once, not duplicated per model.
+models/rule_pattern/train.py - both need the same PR-AUC/log-loss
+computation, with the same single-class guard: SMPP has zero
+confirmed-clean labels, so PR-AUC is undefined for SMPP-only slices.
 
-PRECISION@K, alongside PR-AUC: PR-AUC integrates over EVERY possible
-threshold, most of which this project never operates at in practice -
-only the extreme top of a ranking score ever gets acted on (see
-models/anomaly/cluster_discovery.py's --anomaly_percentile design, or
-docs/sms_spam_technical_architecture_plan.md's "precision at fixed
-recall - the number that actually maps to a business decision" note).
-precision_at_k()/precision_at_k_percentiles() answer the more honest
-operational question: of the top N% ranked by score, what fraction are
-really positive? Same single-class-style guard as pr_auc_and_log_loss()
-below - a K outside [1, n] returns None (skip), not a fabricated number.
+precision_at_k()/precision_at_k_percentiles() answer the more operational
+question PR-AUC doesn't: of the top N% ranked by score, what fraction are
+really positive - since in practice only the extreme top of a ranking
+score gets acted on. Same guard - a K outside [1, n] returns None.
 """
 import numpy as np
 from sklearn.metrics import average_precision_score, log_loss
@@ -25,12 +15,9 @@ from sklearn.metrics import average_precision_score, log_loss
 
 def pr_auc_and_log_loss(y_true: np.ndarray, score: np.ndarray) -> dict | None:
     """
-    `score` can be any real-valued ranking score (probabilities, raw
-    decision-function output, etc.) - average_precision_score only cares
-    about relative order. Returns None (not a fabricated 0.5, not a
-    crash) if only one class is present in `y_true`, so callers can skip
-    that slice explicitly rather than silently logging a meaningless
-    number.
+    `score` can be any real-valued ranking score - average_precision_score
+    only cares about relative order. Returns None if only one class is
+    present in `y_true`, so callers can skip that slice explicitly.
     """
     if len(set(y_true.tolist())) < 2:
         return None
@@ -50,11 +37,9 @@ def pr_auc_and_log_loss(y_true: np.ndarray, score: np.ndarray) -> dict | None:
 def evaluate_overall_and_per_source(df, source_col: str, y_true: np.ndarray, score: np.ndarray, prefix: str = "") -> dict:
     """
     Runs pr_auc_and_log_loss() overall, then once per distinct value in
-    `df[source_col]` (aligned positionally with y_true/score - same
-    length, same row order) - printing a clear skip message instead of
-    a metric for any slice with only one class. `prefix` namespaces the
-    returned metric keys (e.g. "train_", "test_") when a caller needs
-    both without collisions.
+    `df[source_col]` (aligned positionally with y_true/score), printing a
+    skip message for any slice with only one class. `prefix` namespaces
+    the returned metric keys (e.g. "train_", "test_").
     """
     result = {}
     overall = pr_auc_and_log_loss(y_true, score)
@@ -77,11 +62,9 @@ def evaluate_overall_and_per_source(df, source_col: str, y_true: np.ndarray, sco
 
 def precision_at_k(y_true: np.ndarray, score: np.ndarray, k: int) -> dict | None:
     """
-    Precision within the top `k` rows by `score` (descending) - see
-    module docstring for why this, not just PR-AUC. Returns None (not a
-    fabricated number) if k < 1 or k > len(y_true) - same "don't compute
-    a meaningless number silently" guard as pr_auc_and_log_loss(), for
-    the same reason: a K outside the valid range isn't a real cutoff.
+    Precision within the top `k` rows by `score` (descending). Returns
+    None if k < 1 or k > len(y_true) - a K outside the valid range isn't
+    a real cutoff.
     """
     n = len(y_true)
     if k < 1 or k > n:
@@ -101,14 +84,10 @@ def precision_at_k_percentiles(
 ) -> dict:
     """
     precision_at_k() at several top-N% cutoffs - percentile -> k via
-    plain rounding, NOT forced to at least 1: a percentile that rounds to
-    0 on a small pool is genuinely out of range (precision_at_k() itself
-    skips it with a clear message), not silently promoted to "top 1 row"
-    and passed off as a real 0.1%/0.5%/etc. reading. `label` prefixes the
-    printed skip message only (e.g. "overall_", "SS7_") - metric dict
-    keys are always plain precision_at_top_<N>pct_* regardless of label,
-    matching pr_auc_and_log_loss()'s own bare keys before
-    evaluate_overall_and_per_source() namespaces them.
+    plain rounding, not forced to at least 1: a percentile that rounds to
+    0 on a small pool is genuinely out of range, not silently promoted to
+    "top 1 row". `label` prefixes the printed skip message only; metric
+    dict keys are always plain precision_at_top_<N>pct_*.
     """
     result = {}
     n = len(y_true)
@@ -128,10 +107,9 @@ def evaluate_precision_at_k(
     percentiles: tuple[float, ...] = (0.1, 0.5, 1.0, 5.0), prefix: str = "",
 ) -> dict:
     """
-    precision_at_k_percentiles(), overall then per source - same
-    overall-AND-per-source convention as evaluate_overall_and_per_source()
-    above (a shared model can look fine in aggregate while quietly
-    underperforming on one segment) and the same `prefix` namespacing.
+    precision_at_k_percentiles(), overall then per source - a shared
+    model can look fine in aggregate while underperforming on one
+    segment. Same `prefix` namespacing as evaluate_overall_and_per_source().
     """
     result = {}
     result.update({

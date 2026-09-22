@@ -1,23 +1,16 @@
 """
-SHAP explainability for LightGBM. Loads an ALREADY
-TRAINED model from MLflow by run_id.
+SHAP explainability for LightGBM. Loads an already-trained model from
+MLflow by run_id.
 
-WHY THIS LOADS run.data.params, NOT JUST run.data (the actual "how does it
-link to the model" answer): the feature matrix this script builds MUST be
-IDENTICAL in shape/column-order to whatever that specific run was trained
-on, or LightGBM raises a hard shape error (verified: loading SS7-only data
-against a model trained on sources=SMPP,SS7 fails with "8 features vs 9
-expected" - SMPP+SS7 combined gives a `source_SMPP` AND `source_SS7` dummy
-column, SS7-alone collapses to just one). So `sources`, `test_size`, and
-`random_state` are read back from the run's own logged params - never
-re-guessed - and the resulting feature matrix's column names are asserted
-against the run's own logged feature_names.json before anything else runs.
+The rebuilt feature matrix must match the trained run's shape/column
+order exactly, or LightGBM raises a shape error (e.g. SMPP+SS7 combined
+adds a `source_SMPP` and `source_SS7` dummy column; SS7-alone collapses
+to one). So `sources`, `test_size`, and `random_state` are read back from
+the run's own logged params, and the rebuilt feature names are asserted
+against the run's logged feature_names.json.
 
-Uses shap.TreeExplainer, not KernelExplainer/LIME: exact (not sampled) for
-tree ensembles, and LightGBM's Booster is exactly what it's built for - see
-docs/experiments/rule_pattern.md for why this is the right tool for THIS
-model specifically (LIME's approximate, model-agnostic approach is reserved
-for the anomaly model instead, once it has real full-dataset embeddings).
+Uses shap.TreeExplainer (exact for tree ensembles), not KernelExplainer/
+LIME - LIME is reserved for the anomaly model instead.
 
 Run by hand:
     python -m models.rule_pattern.explain
@@ -30,9 +23,7 @@ from pathlib import Path
 
 import matplotlib
 
-matplotlib.use(
-    "Agg"
-)  # headless: this is a script, not a notebook - no display to render to
+matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 import mlflow
 import mlflow.lightgbm
@@ -51,13 +42,10 @@ from models.rule_pattern.train import (
 
 def resolve_run_id(run_id: str | None) -> str:
     """
-    No run_id given -> latest real run, checked across BOTH the real
-    baseline experiment and the experimental one (with_embeddings/
-    with_tfidf runs) - imported directly from models.rule_pattern.train
-    rather than redefined here, so this can never silently drift out of
-    sync with wherever train.py actually logs to (this already happened
-    once: train.py's experiment name changed and this file's own stale
-    copy stopped finding new runs).
+    No run_id given -> latest run, checked across both the baseline and
+    experimental experiments - names imported directly from
+    models.rule_pattern.train so this can't drift out of sync with
+    wherever train.py actually logs to.
     """
     if run_id:
         return run_id
@@ -78,15 +66,11 @@ def resolve_run_id(run_id: str | None) -> str:
 
 def rebuild_test_split(run: mlflow.entities.Run, data_dir: Path):
     """
-    Rebuilds the EXACT held-out test set that run trained/evaluated on, by
+    Rebuilds the exact held-out test set that run trained/evaluated on, by
     reading sources/test_size/random_state/with_embeddings/with_tfidf back
-    from the run's own params - not fresh CLI defaults, which could
-    silently mismatch what the loaded model actually saw. Also rebuilds
-    the same train_mask train.py used, since with_tfidf/with_embeddings
-    runs fit their vectorizer/PCA on the train fold only - passing the
-    wrong mask here would silently score the test set through a
-    differently-fit transformer than the one the model was trained
-    against.
+    from the run's own params rather than fresh CLI defaults. Also
+    rebuilds the same train_mask train.py used, since with_tfidf/
+    with_embeddings runs fit their vectorizer/PCA on the train fold only.
     """
     params = run.data.params
     sources = params["sources"].split(",")
@@ -147,7 +131,7 @@ def main():
         "--n_summary_samples",
         type=int,
         default=5000,
-        help="Rows plotted in the summary plot - TreeExplainer itself is exact/fast on the full test set, this only caps plot rendering cost.",
+        help="Rows plotted in the summary plot - caps rendering cost only.",
     )
     parser.add_argument(
         "--n_local_examples",
@@ -166,9 +150,7 @@ def main():
 
     print(f"Loading model + feature_names.json from run {run_id} ...")
     model = mlflow.lightgbm.load_model(f"runs:/{run_id}/model")
-    booster = (
-        model.booster_
-    )  # TreeExplainer needs the native Booster, not the sklearn wrapper
+    booster = model.booster_  # TreeExplainer needs the native Booster
     logged_feature_names = mlflow.artifacts.load_dict(
         f"runs:/{run_id}/feature_names.json"
     )["feature_names"]
@@ -185,11 +167,8 @@ def main():
 
     explainer = shap.TreeExplainer(booster)
     shap_values = explainer.shap_values(X_test)
-    # LightGBM binary classification via TreeExplainer: shape is either a
-    # single (n, features) array already for the positive class, a
-    # [neg, pos] list, or (n, features, 2) depending on shap/lightgbm
-    # version - normalize to "positive class" contributions once here so
-    # everything below doesn't have to guess.
+    # Shape varies by shap/lightgbm version - normalize to positive-class
+    # contributions once here.
     if isinstance(shap_values, list):
         shap_values = shap_values[1]
     elif shap_values.ndim == 3:
@@ -238,9 +217,8 @@ def main():
                 f"    {feat:35s} value={X_test[i][feature_names.index(feat)]:.3f}  shap={val:+.4f}"
             )
 
-    # Log back to the SAME run, not a new one - ties this explanation to
-    # the specific model version it was computed from (MLflow convention
-    # from docs/ml/modeling.md: champion/challenger tracking is explicit).
+    # Log back to the same run, not a new one - ties this explanation to
+    # the specific model version it was computed from.
     with mlflow.start_run(run_id=run_id):
         mlflow.log_artifact(str(importance_path))
         mlflow.log_artifact(str(summary_plot_path))

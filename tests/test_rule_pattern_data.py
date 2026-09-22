@@ -13,7 +13,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.anomaly.data import BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL
+from models.anomaly.data import (
+    BEHAVIORAL_COLS,
+    CONTENT_FLAG_COLS,
+    IMSI_DISTINCT_ORIG_COL,
+    SENDER_VELOCITY_ZSCORE_COL,
+)
 from models.rule_pattern.data import (
     build_feature_matrix,
     load_labelled_messages,
@@ -22,7 +27,7 @@ from models.rule_pattern.data import (
 
 
 def _sample_df(n=5):
-    return pd.DataFrame({
+    df = pd.DataFrame({
         "source": ["SMPP"] * n,
         "record_id": [str(i) for i in range(n)],
         "text": ["hello world"] * n,
@@ -49,6 +54,9 @@ def _sample_df(n=5):
         "rule_evaluated": [True, True, True, False, False],
         "rule_flagged": [True, False, True, None, None],
     })
+    for col in CONTENT_FLAG_COLS:
+        df[col] = [0, 0, 1, 0, 1]
+    return df
 
 
 def test_load_labelled_messages_keeps_only_rule_evaluated_rows(tmp_path):
@@ -191,6 +199,7 @@ def test_build_feature_matrix_with_embeddings_reduces_to_pca_components():
         "source": ["SMPP"] * 5, "record_id": [str(i) for i in range(5)],
         "text": ["hi"] * 5, "dcs": [0.0] * 5, "text_decode_failed": [False] * 5,
         **{c: [0] * 5 for c in BEHAVIORAL_COLS},
+        **{c: [0] * 5 for c in CONTENT_FLAG_COLS},
         "rule_flagged": [True, False, True, False, True],
         **{col: np.random.RandomState(i).randn(5) for i, col in enumerate(source_dir_cols)},
     })
@@ -209,6 +218,7 @@ def test_build_feature_matrix_with_embeddings_base_features_stay_unscaled():
         **{c: [0] * 5 for c in BEHAVIORAL_COLS},
         "sender_msgs_last_5min": [0, 1, 2, 3, 4], "sender_msgs_last_1hr": [0, 10, 100, 1000, 16971],
         "sender_unique_destinations_1hr": [0] * 5, "sender_repeat_content_ratio_1hr": [0.0] * 5,
+        **{c: [0] * 5 for c in CONTENT_FLAG_COLS},
         "rule_flagged": [True, False, True, False, True],
         **{f"emb_{i}": np.random.RandomState(i).randn(5) for i in range(4)},
     })
@@ -227,6 +237,7 @@ def test_embedding_pca_fit_only_on_train_mask():
         "source": ["SMPP"] * n, "record_id": [str(i) for i in range(n)],
         "text": ["hi"] * n, "dcs": [0.0] * n, "text_decode_failed": [False] * n,
         **{c: [0] * n for c in BEHAVIORAL_COLS},
+        **{c: [0] * n for c in CONTENT_FLAG_COLS},
         "rule_flagged": [True, False] * (n // 2),
         **{f"emb_{i}": rng.randn(n) for i in range(4)},
     })
@@ -251,6 +262,7 @@ def test_build_feature_matrix_with_tfidf_adds_ngram_columns():
                  "hello how are you today", "hello how are you today", "meeting at noon tomorrow"],
         "dcs": [0.0] * 6, "text_decode_failed": [False] * 6,
         **{c: [0] * 6 for c in BEHAVIORAL_COLS},
+        **{c: [0] * 6 for c in CONTENT_FLAG_COLS},
         "rule_flagged": [True, True, True, False, False, False],
     })
     X, y, feature_names, fitted = build_feature_matrix(
@@ -272,6 +284,7 @@ def test_tfidf_vocabulary_fit_only_on_train_mask():
         "text": ["alpha beta", "alpha beta", "alpha beta", "onlyintestrow uniqueword"],
         "dcs": [0.0] * 4, "text_decode_failed": [False] * 4,
         **{c: [0] * 4 for c in BEHAVIORAL_COLS},
+        **{c: [0] * 4 for c in CONTENT_FLAG_COLS},
         "rule_flagged": [True, True, False, False],
     })
     train_mask = np.array([True, True, True, False])  # row 3 (the unique-vocab row) is test-only

@@ -222,6 +222,21 @@ def _load_corpus(source: str, data_dir: Path) -> _LoadedCorpus:
     return loaded
 
 
+def preload(data_dir: Path = DEFAULT_DATA_DIR) -> None:
+    """Warms _cached_model and _cached_corpus for every known source at
+    process startup - the corpus load is the expensive part (np.load of
+    the full embeddings.npy plus building the IVF-PQ FAISS index over it,
+    e.g. SS7's 2.74M vectors), so doing it here moves that cost to boot
+    time instead of onto whichever request hits a cold cache first.
+    Best-effort per source, same reasoning as serving.scoring.preload()."""
+    for source in KNOWN_SOURCES:
+        try:
+            _load_champion(source)
+            _load_corpus(source, data_dir)
+        except (ChampionUnavailableError, CorpusUnavailableError) as e:
+            logger.warning("preload: anomaly_score unavailable for source=%s: %s", source, e)
+
+
 def reset_cache() -> None:
     """Test hook - forces the next score_anomaly() call to reload the
     champion and rebuild every source's corpus index instead of reusing

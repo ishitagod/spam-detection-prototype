@@ -7,7 +7,7 @@ milliseconds regardless of whether the real CDR files are present.
 Run:
     pytest tests/test_smpp_ingestion.py -v
     pytest tests/ -v                        # whole test suite
-    pytest tests/test_smpp_ingestion.py::test_keeps_only_op4_rows   # one test
+    pytest tests/test_smpp_ingestion.py::test_keeps_op4_and_op5_non_receipt_rows   # one test
 """
 import sys
 from pathlib import Path
@@ -98,6 +98,19 @@ def raw_rows() -> pd.DataFrame:
             oa="SPX003", da="9198765003",
             content="not-valid-hex", decoded_content=None,
         ),
+        row(  # op-5 (deliver_sm), esme_class != 4 - a genuine
+              # inbound/forwarded message, must be kept
+            index=5, smpp_operation=5, esme_class=0,
+            virtual_gt="vgt4", sequence_no=103,
+            oa="SPX004", da="9198765004",
+            content="48656c6c6f20576f726c64", decoded_content="Hello World",
+        ),
+        row(  # op-5, esme_class == 4 - a delivery receipt, must be dropped
+            index=6, smpp_operation=5, esme_class=4,
+            virtual_gt="vgt5", sequence_no=104,
+            oa="SPX005", da="9198765005",
+            content="48656c6c6f20576f726c64", decoded_content="Hello World",
+        ),
     ])
 
 
@@ -125,9 +138,12 @@ def labels(mapped) -> pd.DataFrame:
 # clean()
 # ---------------------------------------------------------------------------
 
-def test_keeps_only_op4_rows(cleaned):
-    """Ack PDUs (op 80000004/5) carry no content or decision - not signal, dropped."""
-    assert len(cleaned) == 3
+def test_keeps_op4_and_op5_non_receipt_rows(cleaned):
+    """Ack PDUs (op 80000004/5) and op-5 delivery receipts (esme_class==4)
+    carry no spam-relevant content - dropped. op-4 and non-receipt op-5
+    rows are kept."""
+    assert len(cleaned) == 4
+    assert set(cleaned["index"]) == {1, 3, 4, 5}
 
 
 def test_strips_udh_header_from_text(cleaned):
