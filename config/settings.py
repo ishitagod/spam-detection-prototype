@@ -46,13 +46,7 @@ BEHAVIORAL_LONG_WINDOW = "1h"  # sender_msgs_last_1hr, sender_unique_destination
 # --- Content-rule flags (features/content_flags.py) ---------------------
 # Named regex registry - one binary column per entry, computed from `text`
 # alone (no behavioral/history dependency, unlike features/behavioral.py).
-# These are ML FEATURES, not Rule Engine gates - the upstream telecom Rule
-# Engine (labels/rule_labels.py's SW_/SR_ prefixes) has zero content/regex
-# matching of its own, confirmed against real data this session; these
-# flags are this codebase's own, independent, second signal source, fed to
-# BOTH LightGBM and Isolation Forest as base features (see the architecture
-# plan's Section 1 - cheap, deterministic, always-available, same category
-# as behavioral/near-dup, not corpus-fit like TF-IDF/embeddings).
+# These are ML FEATURES, not Rule Engine gates.
 #
 # English-language keyword lists are a starting point, not a calibrated or
 # complete set - this system scores multilingual text (paraphrase-
@@ -66,12 +60,7 @@ CONTENT_FLAG_PATTERNS = {
     "has_currency_symbol": r"[$€£₹¥₩₦]|\b(?:usd|inr|eur|gbp|jpy|krw|ngn)\b",
     # English + Spanish/Portuguese/French/Hindi(Latin-script)/Indonesian/
     # Malay urgency phrasing, plus a SEPARATE no-\b alternation for
-    # CJK/Tamil/Malayalam script terms - \b relies on Unicode word-char
-    # transitions, and CJK/Indic text is often unspaced, so a \b-wrapped
-    # Chinese/Tamil/Malayalam term embedded mid-run would fail to match;
-    # those terms are plain substring alternatives instead. Non-English
-    # entries are a best-effort starting list, NOT native-speaker-vetted -
-    # same caveat as the English list above, treat as a starting point.
+    # CJK/Tamil/Malayalam script terms.
     "has_urgency_keyword": (
         r"\b(?:urgent|immediately|act now|expires?|last chance|final notice|limited time"
         r"|urgente|inmediatamente|ahora mismo|expira|ultima chance|urgent(?:e)?|immediatement"

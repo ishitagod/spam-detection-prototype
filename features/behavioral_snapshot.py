@@ -375,7 +375,36 @@ def run_imsi_snapshot(
     messages_path: Path, out_path: Path, now: pd.Timestamp | None = None
 ) -> pd.DataFrame:
     """SS7-only counterpart to run_behavioral_snapshot() above - one
-    messages file in, one imsi-keyed snapshot parquet out."""
+    messages file in, one imsi-keyed snapshot parquet out.
+
+    UNLIKE run_behavioral_snapshot() above, this drops zero-value rows
+    before writing - deliberately NOT "every known entity gets a row"
+    here, even though compute_imsi_snapshots() itself still guarantees
+    that (see its own tests). Checked against the real full-corpus
+    snapshot (SS7, 882,957 distinct imsis) before making this change:
+    865,409 of them (98.0%) come back 0 - no distinct-originator activity
+    in the trailing 1hr as of this snapshot's `now` - and only 31 are
+    actually elevated (>=2). Writing all 882,957 rows to the online store
+    was the direct cause of a `feast materialize` hang/OOM-adjacent stall
+    on this machine (2.8GB+ resident, no progress) for close to zero
+    informational gain: `serving/feature_lookup.py::get_imsi_features()`
+    already returns None for any imsi Feast can't find, and every
+    downstream consumer (models/anomaly/data.py's IMSI_DISTINCT_ORIG_COL
+    handling) already treats that None/NaN identically to a confirmed 0
+    (fillna(0)) - so a 0-valued row and a missing row are indistinguishable
+    to everything that reads this feature. Dropping them is lossless for
+    the model, not an approximation.
+    One real, disclosed tradeoff: IMSI_DISTINCT_ORIG_KNOWN_COL's "known"
+    bit is meant to separate "confirmed 0" from "genuinely never seen" -
+    pruning here means a pruned-zero imsi now serves as "unknown" (known=0)
+    rather than "known, zero" (known=1) at INFERENCE time only; training
+    still computes the real per-row value from the full CSV directly via
+    features/behavioral.py, unaffected by this snapshot-side pruning.
+    Given 98% of the table would otherwise carry that same known=1/value=0
+    combination, this is treated as an acceptable, documented loss, not a
+    silent one - revisit if the known/unknown distinction turns out to
+    matter for this specific column.
+    """
     now = now if now is not None else pd.Timestamp.now()
 
     messages_path = Path(messages_path)
@@ -391,6 +420,9 @@ def run_imsi_snapshot(
     print(f"Computing IMSI snapshots for {len(messages)} row(s) as of {now} ...")
     snapshot = compute_imsi_snapshots(messages, now=now)
     print(f"  {len(snapshot)} distinct imsi(s)")
+
+    snapshot = snapshot[snapshot[COL_IMSI_DISTINCT_ORIG_LONG] > 0]
+    print(f"  {len(snapshot)} with nonzero activity - only these get a row (see docstring)")
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

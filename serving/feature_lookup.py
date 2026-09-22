@@ -91,6 +91,14 @@ def get_imsi_features(imsi: str | None, store: FeatureStore | None = None) -> di
     "honest unknown, not a fabricated 0" result an unrecognized imsi would
     get back from Feast anyway, without paying for a lookup Feast can
     never answer (there is no None entity to look up).
+
+    A None back from Feast for a KNOWN imsi doesn't only mean "never
+    seen" - features/behavioral_snapshot.py::run_imsi_snapshot() also
+    prunes any imsi whose own snapshot value is 0 before writing (98% of
+    real imsis, checked - see that function's docstring), so "not found"
+    covers both "genuinely unseen" and "seen, confirmed 0". Both cases
+    get the exact same downstream treatment (fillna(0)) either way, so
+    this is a distinction without a difference for scoring.
     """
     if imsi is None:
         return {"imsi_distinct_originators_1hr": None}
