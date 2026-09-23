@@ -9,12 +9,21 @@ Run manually:
     python -m models.rule_pattern.train
     python -m models.rule_pattern.train --n_estimators 200 --learning_rate 0.05
 
-Label composition: SMPP has 2,693 rule_evaluated rows, all flagged (zero
-confirmed-clean, so SMPP-only PR-AUC is undefined and skipped - see
-models/metrics.py). SS7 has 349,962 rows, 284,073 flagged / 65,889 clean.
-Spam is the majority of this pool overall (~85%) because of which messages
-the rule engine evaluates, not the true traffic-wide rate - no class
-weighting applied.
+Label composition (measured 2026-09-23, after ingestion/smpp.py's clean()
+was widened to also keep non-receipt deliver_sm/op-5 rows, not just
+submit_sm/op-4 - see that module's history): SMPP now has 139,546
+rule_evaluated rows, 2,692 flagged / 136,854 clean (1.9% positive) - the
+OLD "SMPP has zero confirmed-clean rows, so SMPP-only PR-AUC is undefined
+and skipped" claim this docstring used to make no longer holds: real SMPP
+clean rows now exist, and models/metrics.py::evaluate_overall_and_per_source()'s
+per-source skip is a runtime "only one class present" check, not a
+hardcoded exclusion - so an SMPP-only PR-AUC will actually get computed on
+the next run instead of skipped. SS7 has
+2,654,369 rows, 284,073 flagged / 2,370,296 clean (10.7% positive).
+Combined positive rate is ~10.3% (minority class, not the "~85% majority"
+this docstring used to claim - that was specific to the old, narrower SMPP
+row set) - no class weighting applied regardless, but re-evaluate whether
+that's still the right call given the composition changed this much.
 
 Evaluation: stratified train/test split, PR-AUC + log loss via
 models/metrics.py, on both train and test sets - a large train/test gap
