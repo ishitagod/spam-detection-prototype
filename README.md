@@ -1,572 +1,348 @@
-# SMS Spam Detection — Prototype
+# SMS Spam Detection
 
-A dual-source (SMPP + SS7) SMS spam detector that sits **downstream of an
-existing rule engine**, not in place of it. Its job is narrow and specific:
-score the traffic the rule engine couldn't already confidently decide on,
-using two independent ML layers that answer two different questions —
-*"does this look like a pattern we already know?"* and *"does this look
-wrong even though we've never seen it before?"*
+A dual-source (SMPP + SS7) SMS fraud detection system that sits
+**downstream of an existing rule engine**, not in place of it. It scores
+the traffic the rule engine couldn't already confidently decide on, using
+layered ML: a supervised pattern model, an unsupervised anomaly model, a
+trained fusion model that combines them into the live decision, and a
+downstream fraud-type classifier that labels what kind of fraud a
+FRAUD-flagged message is.
 
-This is a prototype/demo build, not production-grade — see
-[`CLAUDE.md`](CLAUDE.md) for the architectural decisions this codebase
-deliberately does and doesn't make, and
+See [`CLAUDE.md`](CLAUDE.md) for the full architectural rules this
+codebase follows, and
 [`docs/sms_spam_technical_architecture_plan.md`](docs/sms_spam_technical_architecture_plan.md)
-for the full production-scale design this prototype is a smaller slice of.
+for the target production design.
 
 ---
 
-## The problem, precisely
-
-Every inbound SMS (from either source) has already been through an
-upstream rule engine before this project ever sees it. That rule engine
-leaves each message in one of **three** states, and the three states need
-three different treatments — conflating them is the single easiest way to
-build a broken training set:
-
-| Rule engine outcome | What actually happened | What it's worth for ML |
-|---|---|---|
-| **Flagged** (`decision=1`, `rule_flagged=True`) | A real spam-pattern rule matched the content and fired | A trustworthy **positive** label |
-| **Evaluated, not flagged** (`decision=0` from a *real* content rule, `rule_evaluated=True`) | A spam-pattern rule actually scored the content and explicitly decided "allow" | A trustworthy **negative** label — `decision=0` on its own genuinely does mean confirmed-clean, *when it comes from a rule that looked at the content* |
-| **Whitelisted** (`decision=0` via `SW_*`) | Sender/route ID hit a pre-check allowlist **before** content was ever evaluated — a business exception (client-requested), not a content verdict. The message could still be spam; the rule engine just never checked | **Not a label** — unlabelled, same as blank |
-| **Never touched** (`decision` blank/no rule at all) | Nothing about this message matched any rule, allow or deny | **Not a label** — unlabelled, same as blank |
-
-The middle two rows both surface as `decision=0`, and the distinction
-between them is the entire point: `decision=0` from a rule that actually
-evaluated the content **is** a confirmed negative — but `decision=0` via
-`SW_*` is a bypass, not a verdict, and has to be treated as unlabelled
-right alongside the truly-untouched rows, not folded into the
-confirmed-negative bucket just because both happen to show `decision=0`.
-This is exactly what
-[`labels/rule_labels.py`](labels/rule_labels.py)'s `is_rule_evaluated()`
-already does: it requires a real (non-`SW_*`) rule to have fired — decision
-0 or 1, either way — before a row counts as labelled at all; `SW_*` hits
-and genuinely untouched rows are both excluded, never silently assigned
-`rule_flagged=False`.
-
-**What the real data shows:** as of the currently ingested SMPP files,
-this distinction exists in the code but not yet in practice — every real
-`decision=0` row checked so far is a `SW_*` bypass or fully untouched;
-none come from a content rule that actually ran and said "allow" (see the
-[data reality check](#data-reality-check-what-the-real-data-actually-looks-like)
-below for the exact counts). So SMPP's confirmed-negative pool is
-currently empty not because the code miscategorizes real negatives, but
-because the rule engine hasn't produced any yet in this dataset.
-
-**This is why the project needs two different kinds of ML, not one:**
-
-- The **labelled pool** (`rule_evaluated == True`) is small, known-pattern,
-  and — see [Data reality check](#data-reality-check-what-the-real-data-actually-looks-like) below —
-  can be *extremely* imbalanced. It's enough to train a **supervised**
-  model, but that model can only ever learn to re-recognize patterns the
-  rule engine already encodes. It cannot, by definition, generalize to
-  spam the rules have never seen.
-- The **unlabelled pool** (`rule_evaluated == False`) is nearly all of the
-  traffic, and it's exactly where genuinely novel spam — new campaigns,
-  new templates, spam from a sender that just cleared the whitelist gate —
-  would be hiding undetected. There are no labels to supervise on here, so
-  this pool needs an **unsupervised** approach: does this message's
-  content and behavior look anomalous relative to normal traffic, on its
-  own terms, without ever being told what "spam" means?
-
-**Training breadth and inference-time scope are two different questions,
-and it's worth being precise about which is which:**
-
-- **Training**: the supervised model trains only on `rule_evaluated ==
-  True` rows; the unsupervised model trains on the **full** traffic
-  stream, `rule_evaluated` status included — it needs to see what
-  confidently-normal traffic looks like too, or its idea of "normal"
-  ends up skewed toward only the ambiguous cases.
-- **Inference (real-time, per live message)**: a message that the rule
-  engine already confidently resolved — genuinely flagged, or genuinely
-  evaluated-clean — does **not** get sent to either ML model. Its verdict
-  is already final; there's no reason to spend a real-time scoring call
-  on a decision that's already made. Both models only run at inference
-  time on the traffic that reaches them **because** the rule engine
-  didn't confidently resolve it: `SW_*` whitelist bypasses and genuinely
-  untouched messages. That's the entire point of this system — it exists
-  to score what the rule engine left unresolved, not to re-score what it
-  already decided.
-
-### The two scores, kept separate on purpose
+## Architecture
 
 ```
-                    incoming SMS (SMPP or SS7)
-                              │
-                       rule engine decision
-                              │
-        ┌─────────────────────┴─────────────────────────┐
-        ▼                                                ▼
-  rule_evaluated == True                        NOT rule_evaluated
-  (real content rule fired -                    (SW_* whitelist bypass,
-   decision=1 flagged, OR                        or genuinely untouched -
-   decision=0 confirmed-clean)                   the unresolved majority)
-        │                                                │
-        ▼                                                ▼
-  Verdict is already final.                   canonical feature contract
-  NO ML SCORING at inference -                        (see Data below)
-  nothing left to add. (This                            │
-  traffic still feeds TRAINING -              ┌──────────┴──────────┐
-  see the note above this diagram.)           ▼                     ▼
-                                    rule_pattern_score          anomaly_score
-                                    supervised (LightGBM /       unsupervised (Isolation
-                                    CatBoost / XGBoost),         Forest + FAISS near-dup
-                                    trained on rule_evaluated    match on MiniLM/DistilBERT
-                                    ==True rows. A faster,       embeddings), trained with
-                                    cheaper re-implementation    ZERO labels on the FULL
-                                    of rules the rule engine     traffic stream (training
-                                    already knows. Do NOT        breadth, not inference
-                                    claim this generalizes       scope - see note above).
-                                    to novel spam.               Catches spam the rule
-                                                                  engine has never encoded.
-                                              │                          │
-                                              └────────────┬────────────┘
-                                                            ▼
-                                    BOTH scores returned, never averaged.
-                              agreement="match" | "disagree" is itself a signal:
-                           low rule_pattern_score + high anomaly_score = the highest-
-                           value output of the whole system — a candidate NOVEL spam
-                                    pattern the rule engine has never seen.
-                                                            │
-                                                            ▼
-                                    confidence-gated decision: block only above a high-
-                                   confidence threshold; anything else routes to human/
-                                              rule-engine-team review
+                              Incoming message (SMPP or SS7)
+                                        │
+                                 Rule engine (external)
+                                        │
+                ┌───────────────────────┴───────────────────────┐
+                ▼                                                ▼
+      rule_evaluated == True                              NOT rule_evaluated
+   (real content rule fired -                          (SW_* whitelist bypass,
+    decision already final)                              or genuinely untouched)
+                │                                                │
+        No ML scoring at                              Shared feature computation
+        inference - verdict                          behavioral + content-rule flags
+        already final. (Still                              + MiniLM embedding
+        used for TRAINING both                                    │
+        models below.)                          ┌──────────────────┴───────────────────┐
+                                                  ▼                                       ▼
+                                       FAISS near-dup search                    (features feed both
+                                       (1hr/24hr windows)                        models below directly)
+                                                  │                                       │
+                                                  └───────────────────┬───────────────────┘
+                                                                      ▼
+                                          ┌───────────────────────────────────────────┐
+                                          ▼                                             ▼
+                                ┌──────────────────┐                        ┌───────────────────────┐
+                                │     LightGBM       │                        │    Isolation Forest     │
+                                │  rule_pattern_score │                        │     anomaly_score        │
+                                │  supervised, trains  │                        │  unsupervised, trains    │
+                                │  on rule_evaluated    │                        │  on the FULL traffic      │
+                                │  == True only          │                        │  stream, zero labels       │
+                                └──────────┬────────────┘                        └────────────┬────────────┘
+                                           │                                                    │
+                                           └───────────────────────┬────────────────────────────┘
+                                                                    ▼
+                                                    Decision Fusion (trained meta-model)
+                                                       LogisticRegression([rule_pattern_score,
+                                                                            anomaly_score])
+                                                                fusion_score
+                                                                    │
+                                                                    ▼
+                                                    prediction: FRAUD / NOT_FRAUD
+                                                    recommended_action: BLOCK / PASS
+                                                                    │
+                                                          (only when FRAUD)
+                                                                    ▼
+                                                        Fraud Type Classifier
+                                                     multiclass LightGBM, trained on
+                                                    hand-confirmed DBSCAN cluster labels
+                                                          fraud_subtype (label only,
+                                                        never influences the decision)
 ```
 
-This mirrors the response contract in
-[`docs/prototype_plan.md`](docs/prototype_plan.md#4-score-outputs):
+**Both raw scores are always returned, never averaged** — disagreement
+between them is itself a signal (low `rule_pattern_score` + high
+`anomaly_score` is the highest-value output of the whole system: a
+candidate novel fraud pattern the rule engine has never seen).
+`fusion_score` is what actually drives `prediction`/`recommended_action`
+when a fusion champion exists for the request's source; it falls back to
+`rule_pattern_score` alone otherwise. `fraud_subtype` never gates the
+decision — it's a downstream label computed only after fusion has already
+said FRAUD, using a classifier trained exclusively on confirmed-fraud
+cluster labels (not-fraud-confirmed clusters are explicitly excluded from
+its training pool — see [`labels/cluster_labels.py`](labels/cluster_labels.py)).
 
-```json
-{
-  "rule_pattern_score": 0.91,
-  "anomaly_score": 0.34,
-  "agreement": "match | disagree",
-  "confidence": 0.8,
-  "reason_codes": ["near_duplicate_burst", "matches_known_pattern"]
-}
-```
+### Why four models, not one
 
-`confidence` is a distinct field from either score — it reflects how much
-behavioral history exists for this sender (a brand-new sender's first
-message is structurally low-confidence, not falsely certain either way)
-and how close the message sits to a known cluster. **Blocking only happens
-above a high-confidence threshold**; low-confidence outputs — regardless
-of how high the raw score is — route to human/rule-engine review instead
-of an automatic block. See
-[`docs/sms_spam_technical_architecture_plan.md`, §5](docs/sms_spam_technical_architecture_plan.md#5-real-time-inference-contract)
-for the full reasoning (cold-start disclosure, probability-vs-confidence
-split).
+- **LightGBM** can only ever re-recognize patterns the rule engine already
+  encodes — it's a faster, cheaper reconstruction of known rules, not a
+  novel-spam detector.
+- **Isolation Forest** trains with zero labels on the full traffic stream
+  — it's the layer meant to catch fraud the rules have never seen, at the
+  cost of being noisier and less explainable per-request.
+- **Decision Fusion** exists because "which of the two scores wins" is
+  itself a learnable question, not a fixed threshold — a small, fully
+  inspectable (2 coefficients + intercept) LogisticRegression beats a
+  hand-picked rule for combining them.
+- **Fraud Type Classifier** exists because "is this fraud" and "what kind
+  of fraud" are different questions with different label sources (rule
+  engine vs. hand-confirmed DBSCAN clusters) and different failure modes
+  if conflated — see [`labels/rule_labels.py`](labels/rule_labels.py) and
+  [`labels/cluster_labels.py`](labels/cluster_labels.py).
 
 ---
 
 ## Data: two protocols, one contract
 
-SMS reaches this pipeline from two structurally different sources that
-happen to carry the same kind of abuse:
+- **SMPP** — Application-to-Person (A2P), business sender IDs, bulk/
+  campaign traffic. Ingested from `op-4` (`submit_sm`) PDUs only.
+- **SS7** — Person-to-Person (P2P), real MSISDNs on both ends, MO/
+  MT_request rows only — see [`ingestion/ss7.py`](ingestion/ss7.py).
 
-- **SMPP** — Application-to-Person (A2P). Business sender IDs, bulk/
-  campaign traffic, submitted via an SMPP bind. Ingested from `op-4`
-  (`submit_sm`) PDUs only — other operation types (delivery acks, etc.)
-  carry no message content and are dropped.
-- **SS7** — Person-to-Person (P2P). Real MSISDNs on both ends, signalled
-  through the SS7 MAP protocol's MT (mobile-terminated, 4-message-type
-  handshake) and MO (mobile-originated, single message) flows. Only `MO`
-  and `MT_request` rows carry real content; the SRI query/response and
-  delivery-ack rows are dropped or merged in as auxiliary signal (routing/
-  VLR address) — see [`ingestion/ss7.py`](ingestion/ss7.py)'s docstring for
-  the full row-filtering rationale, verified against real data.
+Both map into one canonical schema ([`common/schemas.py`](common/schemas.py))
+before anything touches a model. `source` ("SMPP"/"SS7") is a shared
+feature, not a routing key — models are trained per-source
+(`--sources SMPP` / `--sources SS7`, see `CLAUDE.md`'s source-split rule)
+because inference is expected to diverge, evaluated against a shared
+baseline via [`scripts/check_source_split_justified.py`](scripts/check_source_split_justified.py).
 
-SMPP and SS7 expose **different raw fields** (business sender-ID metadata
-vs. real subscriber/roaming metadata) — that's expected and fine. What's
-not allowed to differ is what a model actually consumes: both sources are
-mapped into the same canonical feature contract
-([`common/schemas.py`](common/schemas.py)) before anything touches a
-model — `source`, `originator`, `destination`, `text`, `timestamp`, `dcs`,
-`text_decode_failed`, plus each source's own extra columns carried through
-unchanged. `source` ("SMPP"/"SS7") is passed to the model **as a feature**,
-not used to route to two separate models — see
-[`docs/sms_spam_technical_architecture_plan.md`, §2.5](docs/sms_spam_technical_architecture_plan.md#25-model-strategy-one-model-first-split-only-with-evidence)
-for why: start with one shared model, evaluate SMPP-only / SS7-only
-segments separately, and only split into per-source models if that
-evaluation proves the shared model is underperforming on one side.
+**Point-in-time discipline**: every feature must be knowable at the
+moment inference actually happens. Fields that only resolve once a
+transaction/campaign is complete are offline-analysis-only, never
+training features.
 
-**Point-in-time discipline:** every canonical/behavioral feature has to
-pass "would this have been knowable at the moment inference actually
-happens" before it's allowed in — see `CLAUDE.md`. Fields that only
-resolve once a transaction/campaign is complete (final delivery status,
-final campaign size) are offline-analysis-only, never training features.
-This is a real, previously-hit bug class in the fraud-detection project
-this pipeline's tooling was carried over from — worth restating every time
-a new feature is added.
+### Real label composition (SMPP vs SS7, full ingestion)
 
-### Data reality check: what the real data actually looks like
+| Source | `rule_evaluated` rows | Flagged (spam) | Confirmed-clean |
+|---|---:|---:|---:|
+| SMPP | 139,546 | 2,692 (1.9%) | 136,854 (98.1%) |
+| SS7  | 2,654,369 | 284,073 (10.7%) | 2,370,296 (89.3%) |
 
-The ingested dataset (48 hourly CDR files per source, `2026-08-02` –
-`2026-08-03`) is real production-shaped traffic, not synthetic. Numbers
-below are from the current `data/processed/` output
-(`ingestion_manifest.csv`, post row-cleaning, pre-reassembly):
-
-| Source | Raw rows | Kept (real content) | Rule-evaluated (labelled) | Rule-flagged (spam) |
-|---|---:|---:|---:|---:|
-| SMPP | 14,101,168 | 6,045,250 | 3,177 (0.05%) | 3,177 (**100%** of evaluated) |
-| SS7  | 14,685,436 | 3,417,425 | 435,233 (12.7%) | 363,205 (83.5% of evaluated) |
-
-After multipart message reassembly (SMPP: 5,505,921 logical messages; SS7:
-2,742,301 — both stages done, see [Repo layout & current build status](#repo-layout--current-build-status)),
-the SMPP numbers hold: **2,693 rule-evaluated messages, all 2,693 flagged
-spam.** This is a genuine, load-bearing finding, not a rounding artifact —
-confirmed by breaking `decision==0` itself down (sampled across 6 SMPP
-files, 178,868 `decision==0` rows):
-
-| `decision==0` rows | count | share | labelled? |
-|---|---:|---:|---|
-| `SW_*` whitelist bypass | 168,021 | 94.0% | No — business exception, content never scored |
-| No rule at all (`rule`/`rule_name` both null) | 10,847 | 6.0% | No — untouched |
-| Real content rule, explicitly decided "allow" | **0** | 0.0% | Would be **yes**, if any existed |
-
-`decision==0` genuinely is a confirmed-negative label **when it comes from
-a rule that actually evaluated the content** — but in the SMPP data ingested
-so far, that case doesn't occur at all: every `decision==0` row is either a
-`SW_*` bypass or was never touched by any rule. So **on the data ingested
-so far, SMPP has zero confirmed-clean labels from real rule-content
-evaluation** — not because the label logic is discarding real negatives,
-but because the rule engine hasn't produced any in this dataset yet. Every
-SMPP message that a spam-pattern rule actually scored was, in fact, spam.
-
-Consequences this shapes for the modeling plan:
-
-- The supervised `rule_pattern_score` model's labelled training set is
-  **almost entirely SS7-sourced** — SS7 supplies both a much larger
-  labelled pool and, critically, real confirmed-negative examples that
-  SMPP currently doesn't have at all. Per-segment (SMPP-only vs SS7-only)
-  PR-AUC has to be evaluated separately regardless, but for SMPP
-  specifically, watch for the supervised model effectively learning "spam
-  vs. everything-else" from an SS7-shaped decision boundary and needing an
-  explicit precision check once real SMPP negatives (if any exist) surface.
-- The unsupervised `anomaly_score` layer is doing **almost all of the real
-  detection work on SMPP** — with no confirmed-clean supervised signal on
-  that side, catching spam the rule engine hasn't already flagged is
-  squarely the anomaly/near-duplicate layer's job, not the supervised
-  layer's. This directly reinforces the architectural split above, not
-  just as a design preference but as what the actual data forces.
-- `SW_*` whitelist hits still vastly outnumber real rule verdicts on SMPP
-  (~1000:1, per `CLAUDE.md`) — confirming that the unlabelled pool isn't a
-  small edge case to clean up later, it's the bulk of the traffic and the
-  primary product of this whole prototype.
+Both sources are genuinely imbalanced toward confirmed-clean — the
+supervised model has to be read with that in mind (PR-AUC/precision@K
+over raw accuracy, see [Evaluation](#evaluation) below).
 
 ---
 
-## Repo layout & current build status
+## Content-rule flags
+
+20 deterministic regex features computed from `text` alone
+([`config/settings.py::CONTENT_FLAG_PATTERNS`](config/settings.py),
+[`features/content_flags.py`](features/content_flags.py)) — `has_url`,
+`has_gambling_keyword`, `has_otp_keyword`, `has_brand_impersonation_keyword`,
+`has_known_malicious_domain`, etc., multilingual (English + Malay/
+Manglish + regional scam vocabulary). Base features for **both** LightGBM
+and Isolation Forest, same treatment as behavioral features — not
+ablation-gated like TF-IDF/embeddings.
+
+Three ways to turn these into a label, kept strictly separate from the
+rule engine's own `rule_flagged` (which has zero content/regex matching
+of its own — see [`labels/rule_labels.py`](labels/rule_labels.py)):
+- `content_flagged()` — a fixed high-confidence combination list (8
+  combinations, e.g. `has_gambling_keyword` alone, or
+  `has_url + has_urgency_keyword` together).
+- `content_flagged_by_count()` — "at least N of 20 flags fired," a
+  simpler but more arbitrary alternative.
+- `fit_content_flag_weights()` / `content_flagged_by_weight()` — fits a
+  `LogisticRegression(flags -> rule_flagged)` on the real labelled pool,
+  so each flag's weight is a measured coefficient, not a guess. Used by
+  `models/rule_pattern/train.py --include_content_labels` to add
+  confident positives from unlabelled traffic into LightGBM's training
+  pool, tagged with a distinct `label_source` and evaluated as its own
+  breakdown — never silently merged into the telecom-derived rows.
+
+---
+
+## Metrics (current, real runs)
+
+### LightGBM — `rule_pattern_score`
+- **SS7/overall**: test PR-AUC **0.999** — expected, not remarkable: it's
+  reconstructing the rule engine's own decision boundary from the same
+  signal the rules use, not evidence of generalizing to novel fraud.
+- **SMPP-only**: real confirmed-clean population now exists (98.1% of
+  139,546 rows) so a real SMPP-only PR-AUC is computable, but the retrain
+  to produce that number hasn't been run yet — see
+  [`docs/experiments/rule_pattern.md`](docs/experiments/rule_pattern.md).
+- `--with_embeddings --sources SS7`: full SS7 embedding corpus
+  (2,742,301 rows) is ready and covers 100% of SS7's `rule_evaluated`
+  pool, but the retrain comparing it against the no-embeddings baseline
+  (test PR-AUC 0.866) hasn't been logged yet.
+
+### Isolation Forest — `anomaly_score`
+- **SS7** (full 2,742,301-row corpus): PR-AUC **0.164** against a naive
+  baseline of ~0.107 (SS7's real positive rate) — a real but modest
+  ~1.5x lift; PR-AUC alone understates this layer's value (see
+  [`docs/experiments/anomaly.md`](docs/experiments/anomaly.md)).
+- **Precision@top-0.1%** (the operationally relevant cutoff): **0.204**,
+  a ~1.9x lift over the naive baseline, after two measured
+  feature-encoding fixes (`sender_age_days` bucketing,
+  `sender_recipient_diversity_ratio` small-sample gating).
+- **SMPP**: PR-AUC **0.074** against a ~0.019 baseline (~3.8x lift);
+  precision@top-0.1% **0.057**.
+- Validated against real `rule_flagged` labels purely as a floor-level
+  sanity check — this layer's real purpose (catching fraud the rules
+  can't see) has no labels to formally evaluate against by definition.
+
+### Decision Fusion — `fusion_score`
+Trained `LogisticRegression([rule_pattern_score, anomaly_score])`, both
+sources promoted (`decision_fusion_model_SMPP` / `_SS7`, alias
+`champion`):
+- **SMPP**: 139,546-row pool, test PR-AUC **0.9954**.
+- **SS7**: full 2,654,369-row pool (100% `anomaly_score` coverage), test
+  PR-AUC **0.9735**.
+
+### Fraud Type Classifier — `fraud_subtype`
+**Experimental, not yet a real candidate.** Zero DBSCAN clusters have
+been hand-confirmed yet (`docs/experiments/anomaly_clustering.md` step 4
+is still outstanding), so no `--label_source confirmed` model has ever
+been trained. `--label_source suggested` (unconfirmed heuristic guesses)
+runs today but logs to a separate `_suggested_labels` MLflow experiment
+and must never be promoted. At serving time
+([`serving/fraud_type_scoring.py`](serving/fraud_type_scoring.py)), this
+means `fraud_subtype` legitimately comes back `None` for every request
+right now — expected, not a bug, handled the same best-effort way as a
+missing `fusion_score` champion.
+
+### FAISS near-duplicate matching
+Two windows (1hr + 24hr) because a paced-out campaign (a few near-dup
+sends every couple hours) evades a single short window — verified on
+real SMPP sample data, 17.3% of messages show zero 1hr matches but real
+24hr matches. `near_dup_distinct_senders` is the key disambiguator
+between a coordinated blast and one legitimate sender's bulk template.
+
+**Evaluation convention**: PR-AUC and log loss are primary, not accuracy
+— fraud is a minority class on both sources. Track precision at a fixed
+recall/rank cutoff (`models/metrics.py`'s `precision_at_k`) as the number
+that actually maps to a block/allow decision. Every model is evaluated
+three ways: overall, SMPP-only, SS7-only.
+
+---
+
+## Serving
+
+[`serving/app.py`](serving/app.py) — FastAPI service, one `/v1/score`
+call per message:
+1. Rule-resolved traffic (`rule_evaluated == True`) is never scored —
+   its verdict is already final.
+2. `score_rule_pattern()` computes `rule_pattern_score` (always).
+3. `score_anomaly()` computes `anomaly_score` — best-effort, degrades to
+   `None` if no champion/corpus exists for that source, never fails the
+   request.
+4. `score_fusion()` computes `fusion_score` from both — best-effort, same
+   degradation; `decision_score` falls back to `rule_pattern_score` alone
+   if fusion is unavailable.
+5. `explain_rule_pattern()` (real-time SHAP, `shap.TreeExplainer`, cached
+   per source) runs only on FRAUD predictions (cost control) and drives
+   `reason_codes` + `feature_contributions` from real per-request
+   contributions, not fixed thresholds.
+6. `score_fraud_type()` runs only on FRAUD predictions, alongside SHAP —
+   best-effort, populates `fraud_subtype`/`fraud_subtype_confidence` or
+   degrades to `None`.
+
+Every per-source model cache (`scoring`, `anomaly_scoring`,
+`fusion_scoring`, `fraud_type_scoring`) is warmed at process startup
+(`lifespan()`), independently best-effort — a source with no promoted
+champion for one model never blocks startup for the others.
+
+---
+
+## Repo layout
 
 ```
 spam-detection-prototype/
-├── common/schemas.py            # canonical column/dtype contract — DONE
-├── config/settings.py           # tunables (whitelist prefix, op-4 filter, window sizes)
-├── ingestion/
-│   ├── base.py                  # SourceHandlers(clean, map_to_canonical) contract
-│   ├── dcs_codecs.py            # DCS→text codec dispatch, shared SMPP/SS7
-│   ├── smpp.py                  # SMPP: op-4 filter, UDH strip, DCS decode  — DONE
-│   ├── ss7.py                   # SS7: MO/MT_request filter, SRI merge     — DONE
-│   └── run_ingest.py            # file-by-file driver, SOURCES registry
-├── labels/rule_labels.py        # rule_evaluated / rule_flagged derivation — DONE
+├── common/schemas.py               # canonical column/dtype contract
+├── config/settings.py              # tunables, CONTENT_FLAG_PATTERNS registry
+├── ingestion/                      # SMPP/SS7 ingestion + canonical mapping
+├── labels/
+│   ├── rule_labels.py              # rule_evaluated/rule_flagged/content_flagged derivation
+│   └── cluster_labels.py           # DBSCAN-confirmed cluster label derivation
 ├── features/
-│   ├── message_reassembly.py    # multipart parts → one row/message           — DONE
-│   ├── behavioral.py            # per-MESSAGE point-in-time velocity/repeat   — DONE
-│   │                             # features, for supervised/unsupervised training
-│   └── behavioral_snapshot.py   # per-SENDER current-state snapshot,          — DONE
-│                                 # feeds the Feast online store (see below)
-├── feature_repo/
-│   ├── feature_store.yaml       # Feast config — local SQLite registry + online store
-│   └── definitions.py           # entity, FeatureView, on-demand feature view — DONE
-├── scripts/refresh_feast.py     # snapshot → feast apply → feast materialize — DONE
+│   ├── content_flags.py            # deterministic regex features
+│   ├── message_reassembly.py       # multipart parts → one row/message
+│   ├── behavioral.py               # per-message point-in-time features
+│   ├── behavioral_snapshot.py      # per-sender snapshot, feeds Feast
+│   ├── text_embeddings.py          # MiniLM embeddings
+│   └── faiss_index.py              # near-duplicate matching
+├── feature_repo/                   # Feast (Postgres registry, Redis online store)
 ├── models/
-│   ├── anomaly/                 # Isolation Forest + FAISS near-dup        — NOT YET BUILT
-│   └── rule_pattern/            # LightGBM/CatBoost/XGBoost supervised     — NOT YET BUILT
+│   ├── anomaly/                    # Isolation Forest + DBSCAN cluster discovery
+│   ├── rule_pattern/                # LightGBM supervised model
+│   ├── decision_fusion/            # fusion meta-model
+│   ├── fraud_type_classifier/      # experimental multiclass fraud-type model
+│   └── compare_versions.py         # champion/challenger promotion
 ├── serving/
-│   └── feature_lookup.py        # manual online-lookup test script          — DONE
-│                                 # (predict.py-style; no FastAPI service yet)
-├── pipeline.py                  # orchestrator: ingestion → reassembly → behavioral (per source)
-├── tests/                       # pytest, one file per module above
-├── notebooks/                   # ad-hoc real-data exploration
-├── docs/
-│   ├── prototype_plan.md                        # this project's scope
-│   ├── sms_spam_technical_architecture_plan.md  # full production design
-│   └── feature_catalog.md                       # what's servable from Feast, feature by feature
-└── data/                        # gitignored — raw/ (real CDRs) + processed/
-                                  # (including processed/feast_sources/, the snapshot parquet)
+│   ├── app.py                      # FastAPI /v1/score
+│   ├── scoring.py                  # rule_pattern_score + real-time SHAP
+│   ├── anomaly_scoring.py          # anomaly_score
+│   ├── fusion_scoring.py           # fusion_score
+│   └── fraud_type_scoring.py       # fraud_subtype
+├── pipeline.py                     # ingestion → reassembly → behavioral → embeddings → FAISS
+├── scripts/                        # operational scripts (Feast refresh, split-justification check, etc.)
+├── tests/                          # pytest, one file per module
+└── docs/                           # architecture, feature catalog, experiment results
 ```
-
-Run the pipeline so far:
-
-```bash
-python pipeline.py                                  # default: data/raw -> data/processed
-python pipeline.py --raw_dir data/raw --out_dir data/processed
-python -m ingestion.run_ingest --source SMPP         # one source only
-python -m features.message_reassembly \
-    --features_dir data/processed/SS7/features \
-    --labels_dir   data/processed/SS7/labels \
-    --out_path     data/processed/SS7/messages.csv
-python scripts/refresh_feast.py                      # rebuild sender snapshot + Feast online store
-python serving/feature_lookup.py \
-    --sender_id "SMPP|66688" --candidate_text "WIN A PRIZE NOW"
-```
-
-`pipeline.py` runs three stages per source: **ingestion** (raw CDR →
-canonical features + labels, two separate CSVs per input file — see
-[`ingestion/run_ingest.py`](ingestion/run_ingest.py)'s docstring for why
-features and label-source columns are physically kept in separate files),
-**message reassembly** (multipart SMS parts → one row per logical message
-— has to run as a global pass across all hourly files, not per-file,
-since a message's parts can straddle an hour boundary), and **behavioral
-features** (sender velocity/repeat-content, point-in-time correct — see
-[`features/behavioral.py`](features/behavioral.py)). `scripts/
-refresh_feast.py` is a separate, explicit step (not part of `pipeline.py`)
-since it serves a different purpose: `pipeline.py` produces *training*
-data, `refresh_feast.py` refreshes the *online-serving* snapshot — see
-[Feature serving](#feature-serving-feast) below. Both models and the
-FastAPI service are next — see [Roadmap](#roadmap) below.
-
-### Feature serving (Feast)
-
-See [`docs/feature_catalog.md`](docs/feature_catalog.md) for the full
-name/type/meaning table of every feature currently servable from the
-store — this section is the how, that doc is the what.
-
-The behavioral features above answer "what does this sender's history
-look like as of this training row" — useful for training, useless for a
-live inference request, which needs an answer in milliseconds, not a
-full-history rescan. Feast closes that gap:
-
-- [`features/behavioral_snapshot.py`](features/behavioral_snapshot.py)
-  computes a **per-sender current-state snapshot** (as of "now", not
-  per-message) — a genuinely different, simpler computation than
-  `behavioral.py`'s per-row training features, not a repackaging of the
-  same output.
-- [`feature_repo/definitions.py`](feature_repo/definitions.py) declares
-  one Feast entity (`sender_id` = `source|originator`), one `FeatureView`
-  for the three features that are pure sender-state, and one **on-demand
-  feature view** for the fourth (`sender_repeat_content_ratio_1hr`) —
-  that one needs the *incoming* message's own text, which doesn't exist
-  until the actual request, so it can't be precomputed like the other
-  three; Feast combines a stored top-K recent-text-frequency feature with
-  the request's `candidate_text` at lookup time.
-- [`scripts/refresh_feast.py`](scripts/refresh_feast.py) runs
-  snapshot → `feast apply` → `feast materialize` as one command.
-- [`serving/feature_lookup.py`](serving/feature_lookup.py) is the manual
-  test entry point — the same call a future FastAPI endpoint will make
-  per request.
-
-**Freshness is bounded by refresh cadence, not by any Feast TTL enforced
-at read time** — the online store always serves whatever was last
-materialized; re-run `refresh_feast.py` on whatever cadence the target
-staleness tolerance requires (matches `CLAUDE.md`'s "batch/synchronous,
-not streaming" design for this prototype).
-
----
-
-## Modeling plan
-
-### Text embeddings
-| Model | Role |
-|---|---|
-| `paraphrase-multilingual-MiniLM-L12-v2` (sentence-transformers) | **Prototype default**, switched from `all-MiniLM-L6-v2` after checking the real data: a Malay-marker heuristic over 5,000 sampled messages per source found ~10-11% genuine Bahasa Malaysia/mixed content (this is Malaysian-market SMS — CIMB/OCBC/UOB/AirAsia, etc.) that an English-only model would embed poorly. Purpose-built for sentence similarity (same training objective as the model it replaces, just multilingual), ~2x the CPU cost of `all-MiniLM-L6-v2` — verified working with a real EN/Malay-paraphrase similarity check (0.93 similarity for a true paraphrase pair vs. 0.11 for an unrelated message) before committing to the swap. |
-| `all-MiniLM-L6-v2` | Original prototype pick — smallest footprint/lowest latency of the candidates, but English-only; superseded once the real language mix was checked. |
-| Distil-mBERT (raw `distilbert-base-multilingual-cased`) | **Not recommended without extra work.** Trained for masked-word prediction, not sentence similarity — using it directly for embeddings tends to underperform a purpose-built model like the one above; would need fine-tuning on a similarity objective first. `distiluse-base-multilingual-cased-v2` (same base, already sentence-transformers-tuned) is the fairer version of this candidate if multilingual DistilBERT coverage is wanted later. |
-| XLM-R | Best multilingual coverage of the four, but needs more infra than a prototype warrants — later-phase candidate only. |
-
-**Built:** [`features/text_embeddings.py`](features/text_embeddings.py)
-— dedup-before-encode (real spam is repetitive; one busy sender alone
-repeats a single text hundreds of times per hour, per
-[`docs/feature_catalog.md`](docs/feature_catalog.md) — encoding once per
-*distinct* text rather than once per row is a large, real speedup, not a
-micro-optimization) plus a `--sample_n` flag for prototype-scale runs —
-see below for why the full dataset isn't embedded outright. The earlier
-`huggingface.co`-unreachable blocker noted in `CLAUDE.md` no longer
-applies as of 2026-08-24 — verified live, weights download and encode
-correctly in this environment now.
-
-**A real cost, not a theoretical one — paid off, not just theorized:**
-encoding is a transformer forward pass per distinct text (~14ms/text on
-this CPU for the original English-only model, measured), not the
-microseconds-per-row cost of every earlier pipeline stage. At the real
-dedup ratio (74.2% of SMPP's 5.5M rows and 51.3% of SS7's 2.7M rows are
-actually distinct — spam templates vary by embedded OTP/amount/
-reference-number even when otherwise identical, so exact-match dedup
-alone doesn't collapse the corpus much), a full-dataset run was estimated
-at ~21hr. That run has since completed — both FAISS and Isolation Forest
-now train on the full corpus, not a sample (see
-`docs/experiments/anomaly.md`'s "Current scale"). `--sample_n` (seeded
-for reproducibility) remains available for fast local iteration, but is
-opt-in now, not the default path.
-
-### Supervised — `rule_pattern_score`
-| Model | Role |
-|---|---|
-| **LightGBM** | **Prototype default.** Already proven end-to-end in the reference fraud-detection build this project's tooling is carried over from (`train.py` CLI pattern, MLflow tracking, `compare_versions.py` champion/challenger). |
-| XGBoost, CatBoost | Champion/challenger benchmarks once LightGBM is working — not a day-one requirement. CatBoost is worth prioritizing over XGBoost here specifically because of native categorical handling for high-cardinality fields like `originator`/`system_id`/`virtual_gt` without manual encoding. |
-
-Trained **only** on `rule_evaluated == True` rows, labelled via
-`rule_flagged` (`fraud_type == "spam"` specifically, not generic
-`decision == 1` — see [`labels/rule_labels.py`](labels/rule_labels.py) for
-why that distinction matters on real SS7 data, where ~7.5% of
-`decision==1` rows are non-spam fraud types). Features: canonical schema
-fields + behavioral features + `source` — deliberately **not**
-embeddings (tree splits don't use dense 384-dim vectors well; that's
-Isolation Forest's job), which also means this model isn't bottlenecked
-by the embedding sample the way Isolation Forest is.
-
-**Built:** [`models/rule_pattern/train.py`](models/rule_pattern/train.py)
-(+ [`data.py`](models/rule_pattern/data.py)). Trains on the full real
-`rule_evaluated` pool (352,655 rows — 2,693 SMPP + 349,962 SS7), not
-sample-restricted. Test PR-AUC 0.999 (SS7/overall; SMPP skipped, zero
-confirmed-clean labels) — expected, not a strong claim: it's
-reconstructing the rule engine's own decision boundary from the same
-signal the rules use, reported honestly as a known-pattern detector,
-not novel-spam detection.
-
-### Unsupervised — `anomaly_score`
-| Component | Role |
-|---|---|
-| **Isolation Forest** (scikit-learn) | Anomaly scoring over [MiniLM embedding + behavioral features] jointly — catches structurally similar-but-varied spam (e.g. templated phishing with randomized tokens), not just exact repeats. Real-time-viable, zero labels needed. |
-| **FAISS** near-duplicate index | Rolling, point-in-time-correct similarity search over recent message embeddings, with zero ML required to compute the match itself. |
-
-Trained with **zero labels**, on the **full** traffic stream (not just
-`rule_evaluated == False` rows — the model needs to learn what normal
-traffic looks like broadly, then score everything, including the labelled
-pool, for the disagreement signal described above to mean anything).
-
-**Built:** [`features/faiss_index.py`](features/faiss_index.py) — consumes
-`text_embeddings.py`'s output directly, no new embedding work. Produces
-**three features × two windows**, not one flat count, because a raw
-match count alone can't tell a coordinated spam blast from a bank
-sending one OTP template to thousands of real customers in an hour —
-both produce a high count: `near_dup_match_count` (raw count, point-in-time
-correct — only matches strictly *before* the message being scored count)
-and `near_dup_distinct_senders` (how many *different* sender IDs are
-behind those matches — the actual disambiguator: one sender repeating
-itself vs. the same template spread across many sender IDs), plus
-`near_dup_max_similarity`. **Two windows** (1hr + 24hr), because a
-paced-out campaign — a few near-dup sends every couple of hours, never
-clustering within one hour — evades a single short window entirely:
-verified on real SMPP sample data, 17.3% of messages (6,907/40,000) show
-zero 1hr matches but real 24hr matches. Neither window is a complete
-defense against an arbitrarily patient adversary; this feature also
-never has to work alone — Isolation Forest sees it jointly with
-embeddings and behavioral history.
-
-Also verified: the highest-match-count message (362 matches in one hour)
-came from a single sender ID (a legit bank promo blast, correctly not
-flagged as coordinated); the highest-distinct-senders message (4
-different sender IDs, same OTP template) is the kind of pattern worth a
-human look, not an automatic verdict — this feature surfaces signal, it
-doesn't decide.
-
-**Scales independently of total corpus size** via
-`compute_near_dup_features_chunked()` — processes bounded, sequential
-time-chunks (each with a correctly-sized lookback buffer, so no message
-loses accuracy near a chunk boundary) rather than holding a growing
-historical corpus in one FAISS index at once; verified identical to the
-unchunked result in tests. Kept the index type as exact `IndexFlatIP`
-deliberately, not IVF — chunking already keeps each index small, which
-shrinks IVF's speed benefit below its recall cost at this scale.
-
-**Deferred, not forgotten:** SIM-farming (one physical SIM/IMSI cycling
-through many apparent phone numbers) is a *different* signal from
-near-duplicate content matching — an identity-linkage problem, not a
-text-similarity one — and doesn't belong in this module. Confirmed
-present in real SS7 data (1,541 IMSIs already show more than one
-distinct originator). Belongs as a new SS7-only behavioral feature keyed
-by `imsi`, not yet built.
-
-### Explainability
-- **LIME** — both model types. For Isolation Forest, treat the anomaly
-  score itself as the "prediction" being explained — same technique,
-  applied to a different model type, no separate tooling needed.
-- **SHAP** — added alongside LIME; not yet decided which is primary vs.
-  supplementary for this project, revisit once both are wired in.
-- Native LightGBM feature contributions are the **real-time** explanation
-  path (`reason_codes`, cheap enough for the inline serving path); LIME/
-  SHAP are for offline/analyst deep-dives, not the latency-critical path.
-
-### Evaluation
-**PR-AUC and log loss are primary, not accuracy/ROC-AUC** — spam is a
-minority class on both sources (see the imbalance numbers above), and even
-more so once behavioral negatives are added. Track **precision at a fixed
-recall** (e.g. "at 90% recall, what's precision") as the number that
-actually maps to a block/allow business decision. **Evaluate three ways
-every time: overall, SMPP-only, SS7-only** — an aggregate metric can hide
-one source-segment performing badly, especially given how differently
-SMPP and SS7's labelled pools look today (see
-[Data reality check](#data-reality-check-what-the-real-data-actually-looks-like)).
 
 ---
 
 ## Tech stack
 
-| Layer | Choice |
-|---|---|
-| Data manipulation | pandas, numpy |
-| Text embedding | sentence-transformers, `all-MiniLM-L6-v2` |
-| Near-duplicate index | FAISS |
-| Anomaly detection | scikit-learn Isolation Forest |
-| Supervised classifier | LightGBM (XGBoost/CatBoost as challengers) |
-| Experiment tracking / registry | MLflow, SQLite backend (`sqlite:///mlflow.db`) |
-| Explainability | LIME, SHAP |
-| Inference service | FastAPI (not yet built) |
-| Feature store | Feast, local SQLite registry + online store (`feature_repo/`) — wired in for the sender-behavioral features (see [Feature serving](#feature-serving-feast) above). Deliberately a separate refresh path (`scripts/refresh_feast.py`) from `pipeline.py`, not merged into it — training data and the online-serving snapshot are different computations, not the same output reused. |
+- Python, FastAPI
+- Feast — Postgres SQL registry, Redis online store (`docker-compose.yml`)
+- Postgres — also hosts the MLflow tracking store (separate `mlflow`
+  database, `scripts/postgres_init/`)
+- Kafka — production target for streaming ingestion and real-time
+  campaign discovery, not yet integrated
+- LightGBM, scikit-learn, sentence-transformers (MiniLM), FAISS (exact
+  `IndexFlatIP` batch/training, IVF-PQ serving-time)
+- MLflow (experiment tracking + model registry, champion/challenger
+  promotion via `models/compare_versions.py`)
+- LIME + SHAP (SHAP wired into real-time `/v1/score`; LIME stays
+  offline-only, too expensive per-request)
 
-Offline and online ML platform are **the same environment** in this
-prototype (one process, no separate training/serving infra split) — a
-deliberate simplification for iteration speed, not the target production
-design. No Kafka, no Redis — batch/synchronous feature computation, local
-SQLite, matches prototype scale (not the 3,000 TPS production target,
-which this phase explicitly doesn't need to hit).
+Local infra: Postgres + Redis run via Docker Desktop
+(`docker-compose.yml`), host Postgres remapped to port 5433.
 
 ---
 
 ## Setup
 
 ```bash
-pip install --no-cache-dir -r requirements.txt   # disk space has been tight in
-                                                   # this sandbox before — avoid
-                                                   # re-triggering large caches
-pytest                                            # run the test suite
-python pipeline.py                                # ingest + reassemble real CDRs
+pip install --no-cache-dir -r requirements.txt
+docker compose up -d                                 # Postgres + Redis
+pytest                                                # run the test suite
+python pipeline.py                                    # ingest + reassemble real CDRs
+uvicorn serving.app:app --reload                       # start the scoring API
 ```
 
-Real raw/processed CDR data lives under `data/` and is gitignored (large,
-real traffic — never committed).
+Real raw/processed CDR data lives under `data/` and is gitignored.
 
 ---
 
 ## Roadmap
 
-In order (per `CLAUDE.md`):
+In order (per `CLAUDE.md`'s "Next"):
 
-1. **MiniLM text embeddings** — a shared upstream dependency for steps 2
-   and 3, not part of either one specifically. FAISS has no language
-   understanding on its own — it's nearest-neighbor search over vectors,
-   nothing more; the vectors have to come from somewhere, and that's this
-   step. Isolation Forest also needs it, per the
-   [modeling plan](#unsupervised--anomaly_score) above (`[MiniLM
-   embedding + behavioral features]`, jointly). Build once, consume twice.
-2. FAISS near-duplicate index (consumes step 1's embeddings)
-3. Isolation Forest training script (unsupervised layer; consumes step
-   1's embeddings + the behavioral features already built)
-4. LightGBM training script (supervised layer, rule-labelled data)
-5. FastAPI service combining both, dual-score response shape
-6. LIME wiring for both model types
-
-Behavioral features (training) and the Feast online store (serving) are
-both done — see [Feature serving](#feature-serving-feast) above. FastAPI
-(step 5) is what will actually call `serving/feature_lookup.py`'s
-`get_sender_features()` per request instead of it being a manual test
-script.
-
-## Known blockers
-
-- ~~`huggingface.co` unreachable from this sandbox~~ — resolved as of
-  2026-08-24, verified live (see `CLAUDE.md`'s "Known blockers" for
-  detail).
-- Disk space has been tight in this sandbox before — use
-  `pip install --no-cache-dir`, avoid re-triggering large caches.
+1. **Kafka-fed streaming ingestion** — replaces scheduled-batch
+   behavioral feature refresh and DBSCAN cluster discovery with
+   continuous, real-time paths. Last piece of the production infra
+   migration, not started.
+2. **Full SMPP text-embeddings run** — SS7's is done (GPU, full corpus);
+   SMPP's unblocks `rule_pattern_score --with_embeddings --sources SMPP`.
+3. **Hand-confirm DBSCAN clusters** → train
+   `fraud_type_classifier --label_source confirmed` → promote a real
+   champion. Currently zero clusters confirmed, so `fraud_subtype` is
+   `None` on every live request.
+4. **`rule_pattern_score --with_embeddings --sources SS7`** — corpus is
+   ready (100% `rule_evaluated` coverage), retrain not yet run/logged.
+5. **Live confirmed-campaign lookup** — join a live message's FAISS
+   near-dup match against `cluster_labels.parquet` directly, not just via
+   the trained classifier's generalization. Not yet built.
