@@ -157,6 +157,13 @@ class FraudPredictionResult(BaseModel):
     # the top-K by |contribution| (serving/app.py's _TOP_K), not every
     # feature the model used.
     feature_contributions: list[FeatureContribution] = Field(default_factory=list)
+    # ADDITIVE field, same status as feature_contributions above -
+    # serving/fraud_type_scoring.py's multiclass output (what TYPE of
+    # fraud, e.g. "gambling_promo"), not this field's is-it-fraud
+    # prediction. None until a source has a promoted fraud_type_classifier
+    # champion (see that module's ChampionUnavailableError).
+    fraud_subtype: str | None = None
+    fraud_subtype_confidence: float | None = None
 
 
 class ScoreResponse(BaseModel):

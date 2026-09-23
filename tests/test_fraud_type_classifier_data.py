@@ -92,6 +92,33 @@ def test_load_cluster_labeled_messages_suggested_source_joins_correctly(tmp_path
     }
 
 
+def test_load_cluster_labeled_messages_excludes_not_fraud_rows(tmp_path):
+    source_dir = tmp_path / "SMPP"
+    source_dir.mkdir()
+
+    pd.DataFrame({
+        "message_key": ["SMPP|1", "SMPP|2", "SMPP|3"],
+        "cluster_label": [0, 1, 2],
+    }).to_parquet(source_dir / "fraud_type_clusters.parquet")
+
+    pd.DataFrame({
+        "cluster_label": [0, 1, 2],
+        "suggested_fraud_type_label": ["flooding_burst", "not_fraud", " Not_Fraud "],
+    }).to_csv(source_dir / "cluster_labels_suggested.csv", index=False)
+
+    pd.DataFrame({
+        "record_id": ["1", "2", "3"],
+        "source": ["SMPP"] * 3,
+        "text": ["a", "b", "c"],
+        "dcs": [0.0] * 3,
+        "text_decode_failed": [False] * 3,
+        **{c: [0] * 3 for c in BEHAVIORAL_COLS},
+    }).to_csv(source_dir / "messages_with_behavioral.csv", index=False)
+
+    df = load_cluster_labeled_messages("SMPP", tmp_path, label_source="suggested")
+    assert set(df["record_id"]) == {"1"}
+
+
 def test_load_cluster_labeled_messages_raises_clear_error_when_missing(tmp_path):
     (tmp_path / "SMPP").mkdir()
     with pytest.raises(FileNotFoundError):

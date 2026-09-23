@@ -78,6 +78,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 import serving.anomaly_scoring as anomaly_scoring
+import serving.fraud_type_scoring as fraud_type_scoring
 import serving.fusion_scoring as fusion_scoring
 import serving.scoring as scoring
 from serving.anomaly_scoring import score_anomaly
@@ -85,6 +86,8 @@ from serving.anomaly_scoring import ChampionUnavailableError as AnomalyChampionU
 from serving.anomaly_scoring import CorpusUnavailableError
 from serving.canonical import CanonicalRow, map_smpp_transaction, map_ss7_transaction
 from serving.feature_lookup import get_imsi_features, get_sender_features
+from serving.fraud_type_scoring import score_fraud_type
+from serving.fraud_type_scoring import ChampionUnavailableError as FraudTypeChampionUnavailableError
 from serving.fusion_scoring import score_fusion
 from serving.fusion_scoring import ChampionUnavailableError as FusionChampionUnavailableError
 from serving.schemas import (
@@ -127,6 +130,7 @@ async def lifespan(app: FastAPI):
     scoring.preload()
     anomaly_scoring.preload()
     fusion_scoring.preload()
+    fraud_type_scoring.preload()
     logger.info("preload done in %dms", int((time.perf_counter() - load_start) * 1000))
     yield
 
@@ -332,6 +336,8 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
 
             reason_codes: list[str] = []
             feature_contributions: list[FeatureContribution] = []
+            fraud_subtype: str | None = None
+            fraud_subtype_confidence: float | None = None
             if prediction == "FRAUD":
                 # Best-effort, same convention as anomaly_score below: a
                 # missing champion/explainer degrades explainability, it
@@ -357,6 +363,19 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
                     for f, v, c in contributions[:_TOP_K_CONTRIBUTIONS]
                 ]
 
+                subtype_start = time.perf_counter()
+                try:
+                    fraud_subtype, fraud_subtype_confidence, subtype_version = score_fraud_type(canonical.source, row)
+                    logger.info(
+                        "[%s] fraud_subtype (fraud_type_classifier v%s) = %s (%.4f) in %dms",
+                        reference, subtype_version, fraud_subtype, fraud_subtype_confidence,
+                        int((time.perf_counter() - subtype_start) * 1000),
+                    )
+                except FraudTypeChampionUnavailableError as e:
+                    logger.info("[%s] fraud_subtype unavailable: %s", reference, e)
+                except Exception as e:
+                    logger.warning("[%s] fraud_subtype failed: %s", reference, e)
+
             fraud_results.append(
                 FraudPredictionResult(
                     fraud_type="SPAM_SMS",
@@ -365,6 +384,8 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
                     confidence=_confidence(cold_start, canonical.text_decode_failed),
                     reason_codes=reason_codes,
                     feature_contributions=feature_contributions,
+                    fraud_subtype=fraud_subtype,
+                    fraud_subtype_confidence=fraud_subtype_confidence,
                 )
             )
         if not request.deep_scan and fraud_results and fraud_results[-1].prediction == "FRAUD":

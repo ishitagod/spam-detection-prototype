@@ -36,6 +36,16 @@ nobody actually confirmed.
 """
 import pandas as pd
 
+# The one reserved fraud_type_label value meaning "a human reviewed this
+# anomalous cluster and confirmed it's NOT fraud" (e.g. a legitimate
+# bulk-OTP sender that just looks unusual). Distinct from a blank label
+# (not reviewed / not confident) - see is_cluster_confirmed(). Case/
+# whitespace-insensitive on comparison; models/fraud_type_classifier/
+# data.py excludes rows carrying this label from classifier training
+# (fraud_type_classifier answers "what kind of fraud", not "is this
+# fraud" - see that module's docstring).
+NOT_FRAUD_LABEL = "not_fraud"
+
 
 def is_cluster_confirmed(template_df: pd.DataFrame, label_col: str = "fraud_type_label") -> pd.Series:
     """

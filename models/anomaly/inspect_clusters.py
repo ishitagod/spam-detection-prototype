@@ -145,7 +145,10 @@ def run(source: str, data_dir: Path, n_samples: int) -> None:
     print(
         "Open it, fill in fraud_type_label per row using the samples printed above "
         "(or the sample_texts column itself) and save - see "
-        "docs/experiments/anomaly_clustering.md's step 4/5."
+        "docs/experiments/anomaly_clustering.md's step 4/5. If a cluster is "
+        "confirmed NOT fraud, label it 'not_fraud' (labels/cluster_labels.py's "
+        "NOT_FRAUD_LABEL) rather than leaving it blank - blank means "
+        "unreviewed, 'not_fraud' means reviewed and ruled out."
     )
 
 

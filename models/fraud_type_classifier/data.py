@@ -41,6 +41,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from labels.cluster_labels import NOT_FRAUD_LABEL
 from models.anomaly.data import BEHAVIORAL_COLS, IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL
 
 CANONICAL_COLS = ["dcs", "text_decode_failed"]
@@ -90,6 +91,13 @@ def load_cluster_labeled_messages(
         labels = pd.read_parquet(labels_path).rename(columns={"cluster_fraud_type_label": LABEL_COL})
     else:
         raise ValueError(f"label_source must be 'suggested' or 'confirmed', got {label_source!r}")
+
+    # fraud_type_classifier answers "what kind of fraud", not "is this
+    # fraud" - a not_fraud-confirmed cluster is real, useful information
+    # but not a class this classifier should learn (see labels/
+    # cluster_labels.py's NOT_FRAUD_LABEL docstring).
+    is_not_fraud = labels[LABEL_COL].astype("string").str.strip().str.lower() == NOT_FRAUD_LABEL
+    labels = labels[~is_not_fraud]
 
     labels["record_id"] = labels["message_key"].str.split("|", n=1).str[1]
 
