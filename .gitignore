@@ -1,7 +1,16 @@
 # Raw and processed CDR data - real traffic data, large files, never git.
 # See data/raw/**/SOURCE.md (once added) for where each source came from.
 data/raw/
-data/processed/
+data/processed/*
+!data/processed/*/
+data/processed/*/*
+# EXCEPTION: cluster_labels_template.csv is hand-authored human labeling
+# work (docs/experiments/anomaly_clustering.md's step 4),
+#Tracked so every contributor labels against the same file
+# instead of starting from scratch. The confirmed cluster_labels.parquet
+# it feeds (via models/anomaly/ingest_cluster_labels.py) stays untracked -
+# that's mechanically regenerable from this CSV in one command.
+!data/processed/*/cluster_labels_template.csv
 
 # MLflow local tracking store + artifacts
 mlflow.db

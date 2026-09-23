@@ -27,15 +27,18 @@ techniques for the same job — don't try to make Isolation Forest do both.
 This isn't something to build — it's built. Read its module docstring for
 the full reasoning; the summary:
 
-- Takes the **top N% by `anomaly_score`** (default 10%) from
-  `models/anomaly/train.py`'s already-written `anomaly_scores.parquet` —
-  it does not re-score, and it does not cluster the full traffic stream
-  (that would spend all its effort characterizing *normal* messages).
-- Runs **DBSCAN** in the **same PCA/scaled feature space** Isolation
-  Forest itself trained in (fit on the full candidate pool, then sliced
-  to the anomalous subset — never refit on the subset alone, which would
-  silently change the basis and make the two techniques describe
-  different spaces).
+- Takes the **top N% by `anomaly_score`** (default top 0.5%,
+  `--anomaly_percentile 99.5`) from `models/anomaly/train.py`'s
+  already-written `anomaly_scores.parquet` — it does not re-score, and it
+  does not cluster the full traffic stream (that would spend all its
+  effort characterizing *normal* messages).
+- Runs **HDBSCAN by default** (`--algorithm dbscan` also available) on a
+  **content-similarity-only slice** of the same PCA/scaled feature space
+  Isolation Forest itself trained in (fit on the full candidate pool, then
+  sliced to the anomalous subset — never refit on the subset alone, which
+  would silently change the basis and make the two techniques describe
+  different spaces) — see `select_clustering_features()` for exactly which
+  columns and why.
 - Label `-1` ("noise") is a real, meaningful output — a message that
   doesn't resemble any other flagged case densely enough to group. Don't
   treat it as a failure; a genuine one-off is a different finding from a
@@ -47,8 +50,9 @@ the full reasoning; the summary:
 - Logs params/metrics/the cluster summary to its own MLflow experiment
   (`fraud_type_cluster_discovery`) — separate from `anomaly_score`, so a
   discovery run is never mistaken for a real candidate model.
-- **Deliberately logs no model artifact.** DBSCAN has no `.predict()` for
-  new data — nothing here generalizes to the next incoming message. This
+- **Deliberately logs no model artifact.** Neither DBSCAN nor HDBSCAN has
+  a `.predict()` for new data — nothing here generalizes to the next
+  incoming message. This
   is a periodic, offline, human-in-the-loop tool, not a deployable stage
   of the pipeline (it's not in `pipeline.py`, on purpose, same as
   `train.py`).
@@ -68,29 +72,61 @@ clusters built on outdated scores.
 ```
 python -m models.anomaly.cluster_discovery
 ```
-At sample scale, the defaults (`--anomaly_percentile 90`, auto-suggested
-`eps`, `--min_samples 5`) are fine. **At full dataset scale, start tighter
-— `--anomaly_percentile 99` or `99.5`** — see the scale caveat below before
-running the plain default; the tool will refuse (not silently hang or
-crash) past `MAX_RECOMMENDED_CANDIDATES` candidate rows, but getting there
-still means throwing away a run. Read the printed `eps` suggestion and
-cluster count.
+The default algorithm is now **HDBSCAN**, not DBSCAN — `--algorithm
+hdbscan` (default) vs. `--algorithm dbscan` (kept for comparison/
+rollback). HDBSCAN has **no single global `eps` to pick at all**: it
+builds a cluster hierarchy across a range of density thresholds and
+extracts whichever groupings are stable across the widest range, so a
+tight near-duplicate burst and a much looser, more-varied campaign can
+both be found correctly at their own natural density in the same run —
+see `run_hdbscan()`'s docstring. The one knob that matters is
+`--min_cluster_size` (default 5, same meaning as DBSCAN's `--min_samples`:
+the smallest group worth calling a cluster).
+
+**Why not DBSCAN + a fixed `eps`, which this doc used to recommend:**
+measured, not assumed — on SS7's 99.5-percentile pool (13,712
+candidates), DBSCAN's auto-suggested `eps` (`4.817`) put 84% of the pool
+in one cluster; a hand-swept fixed value (`eps=0.6`) got that down to a
+12%-largest-cluster, 296-cluster result, but HDBSCAN beat that with zero
+manual tuning — 786 clusters, largest only 1.5% of the pool, lower noise.
+`eps=0.6` remains available as `--algorithm dbscan --eps 0.6` (validated
+for SS7 at `--anomaly_percentile 99.5` only, re-sweep before trusting it
+elsewhere — `--eps_auto` re-suggests from k-distance), but there's no
+reason to reach for it unless HDBSCAN itself misbehaves on a given
+source/pool.
+
+**Also fixed since the DBSCAN era:** `select_clustering_features()`'s
+"content" mode used to include `near_dup_distinct_senders_1hr/24hr` from
+`NEAR_DUP_COLS`, which is sender-*identity*-derived, not content
+similarity — measured to vary 0–34 within a single real multi-sender
+campaign vs. flat 0–2 within a single-sender one, i.e. exactly the kind
+of behavioral leakage that risks splitting one campaign apart. Clustering
+now uses `CONTENT_SAFE_NEAR_DUP_COLS` instead (match-count/similarity
+only, sender-count columns dropped). Separately, an explicit experiment
+(`--cluster_features all`, blending behavioral columns back in) confirmed
+this cuts both ways depending on the campaign's own consistency — it
+fragmented a tight 2-sender gambling-spam cluster (204→38 rows in its
+largest sub-cluster) but *improved* cohesion on a many-sender WhatsApp-
+invite campaign (noise dropped 40%→21%) — there's no universal answer,
+which is why `content` (not `all`) stays the default; use `all` as a
+diagnostic on a specific cluster you suspect is under-grouped, not as a
+blanket setting.
 
 **3. Eyeball the cluster summary and react to shape, not just numbers:**
-- **One giant cluster + tiny noise** → `eps` too large, everything is
-  getting lumped together. Lower it (`--eps <smaller>`), or lower
-  `--min_samples`.
-- **Dozens of tiny 1-2 row clusters** → `eps` too small, real groups are
-  being split apart. Raise it.
+- **One giant cluster + tiny noise** → under HDBSCAN, try a larger
+  `--min_cluster_size` first (fewer, larger stable groups get pulled out);
+  under DBSCAN, `eps` is too large — lower it, or lower `--min_samples`.
+- **Dozens of tiny 1-2 row clusters** → under HDBSCAN, try a smaller
+  `--min_cluster_size`; under DBSCAN, `eps` is too small — raise it.
 - **Mostly noise (`-1`), few real clusters** → either genuinely correct
   (a lot of the top-anomaly pool really is heterogeneous one-offs — a
   legitimate finding), or `--anomaly_percentile` is pulling in too wide a
   pool. Try tightening it (`--anomaly_percentile 95`) to see if that
   concentrates the signal.
 - There's no ground truth to optimize a cluster-quality metric against
-  here (`suggest_eps()`'s heuristic is a starting point, not a proof) —
-  this step is inherently iterative and human-judgment-driven. Budget for
-  a few `--eps` passes, not one run-and-done.
+  here — this step is inherently iterative and human-judgment-driven.
+  Budget for a few passes, not one run-and-done, whichever algorithm
+  you're using.
 
 **4. Hand-label each real (non-noise) cluster.** Use
 `models/anomaly/inspect_clusters.py` rather than joining
