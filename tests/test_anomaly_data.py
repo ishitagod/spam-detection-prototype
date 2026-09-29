@@ -22,8 +22,9 @@ from models.anomaly.data import (
     SENDER_DIVERSITY_MIN_MSGS, SENDER_DIVERSITY_SHORT_COL,
     SENDER_DIVERSITY_SHORT_KNOWN_COL,
     SENDER_VELOCITY_ZSCORE_COL, SENDER_VELOCITY_ZSCORE_KNOWN_COL,
-    build_combined_frame, build_feature_matrix, compute_content_flag_meta_features,
-    load_source_features,
+    MissingEmbeddingsError, PLATFORM_TOKEN_COL,
+    build_combined_frame, build_feature_matrix, build_source_dummies,
+    compute_content_flag_meta_features, load_source_features, normalize_messages_frame,
 )
 
 N_EMBEDDING_DIMS = 4  # small, for test speed - real data uses 384
@@ -348,5 +349,86 @@ def test_load_source_features_inner_joins_all_three_sources(tmp_path):
     assert "emb_0" in result.columns
 
 
+def test_load_source_features_raises_actionable_error_when_embeddings_missing(tmp_path):
+    """A source dir with no embeddings.npy/id_map/faiss_output (e.g. SMPP
+    before its full text_embeddings.py run) must fail with a clear,
+    actionable error naming exactly what's missing and what to run - not a
+    bare FileNotFoundError from deep inside np.load()."""
+    source_dir = tmp_path / "SMPP"
+    source_dir.mkdir()
+    messages_path = source_dir / "messages_with_behavioral.csv"
+    pd.DataFrame({
+        "source": ["SMPP"], "record_id": ["1"],
+        **{c: [0] for c in BEHAVIORAL_COLS},
+        "rule_evaluated": [False], "rule_flagged": [None],
+    }).to_csv(messages_path, index=False)
+
+    with pytest.raises(MissingEmbeddingsError, match="embeddings.npy"):
+        load_source_features(source_dir, messages_path)
+
+
+def test_load_source_features_warns_when_embeddings_are_a_sample(tmp_path, capsys):
+    """embeddings_sample_info.txt (features/text_embeddings.py's persistent
+    --sample_n disclosure) must be surfaced here too, not just in that
+    script's own console output - see load_source_features()'s docstring
+    on why a sampled corpus silently degrades live near-dup features too."""
+    source_dir = tmp_path / "SMPP"
+    source_dir.mkdir()
+
+    messages_path = source_dir / "messages_with_behavioral.csv"
+    pd.DataFrame({
+        "source": ["SMPP"], "record_id": ["1"],
+        **{c: [0] for c in BEHAVIORAL_COLS},
+        "rule_evaluated": [False], "rule_flagged": [None],
+    }).to_csv(messages_path, index=False)
+
+    np.save(source_dir / "embeddings.npy", np.random.RandomState(0).rand(1, 4).astype(np.float32))
+    pd.DataFrame({"message_key": ["SMPP|1"]}).to_parquet(source_dir / "embeddings_id_map.parquet")
+    pd.DataFrame({
+        "message_key": ["SMPP|1"], **{c: [0] for c in NEAR_DUP_COLS},
+    }).to_parquet(source_dir / "faiss_output.parquet")
+    (source_dir / "embeddings_sample_info.txt").write_text("SAMPLED: 1 of 999999 total rows, seed=42\n")
+
+    load_source_features(source_dir, messages_path)
+    assert "SAMPLE" in capsys.readouterr().out
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --- shared helpers used by BOTH models' loaders/feature builders ---------
+
+def test_build_source_dummies_single_source_is_none_without_known_sources():
+    """Constant one-hot column would carry zero information."""
+    assert build_source_dummies(pd.Series(["SMPP", "SMPP"])) is None
+
+
+def test_build_source_dummies_multi_source_emits_one_column_each():
+    out = build_source_dummies(pd.Series(["SMPP", "SS7", "SS7"]))
+    assert list(out.columns) == ["source_SMPP", "source_SS7"]
+    assert out["source_SS7"].tolist() == [False, True, True]
+
+
+def test_build_source_dummies_known_sources_keeps_columns_for_a_single_live_row():
+    out = build_source_dummies(pd.Series(["SS7"]), known_sources=["SS7", "SMPP"])
+    assert list(out.columns) == ["source_SMPP", "source_SS7"]
+    assert out.iloc[0].tolist() == [False, True]
+
+
+def test_normalize_messages_frame_fills_absent_columns_and_drops_platform_rows(capsys):
+    df = pd.DataFrame({"source": ["SS7", "SS7", "SS7"], PLATFORM_TOKEN_COL: [False, True, False]})
+    out = normalize_messages_frame(df, "unit_test")
+    assert len(out) == 2
+    assert PLATFORM_TOKEN_COL not in out.columns
+    assert out[IMSI_DISTINCT_ORIG_COL].isna().all()
+    assert all((out[c] == 0).all() for c in CONTENT_FLAG_COLS)
+    assert "unit_test: dropping 1 platform" in capsys.readouterr().out
+
+
+def test_normalize_messages_frame_defaults_missing_platform_column_to_keep_everything():
+    """SMPP's file has no platform-token column at all - nothing is dropped."""
+    df = pd.DataFrame({"source": ["SMPP", "SMPP"], IMSI_DISTINCT_ORIG_COL: [1.0, 2.0]})
+    out = normalize_messages_frame(df, "unit_test")
+    assert len(out) == 2
+    assert out[IMSI_DISTINCT_ORIG_COL].tolist() == [1.0, 2.0]  # present column untouched

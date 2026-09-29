@@ -96,6 +96,15 @@ SENDER_VELOCITY_ZSCORE_KNOWN_COL = f"{SENDER_VELOCITY_ZSCORE_COL}_known"
 IMSI_DISTINCT_ORIG_COL = "imsi_distinct_originators_1hr"
 IMSI_DISTINCT_ORIG_KNOWN_COL = f"{IMSI_DISTINCT_ORIG_COL}_known"
 
+# SS7-only (same absence pattern as IMSI_DISTINCT_ORIG_COL above) - opaque
+# app/session verification tokens and Apple FaceTime "REG-REQ" activation
+# pings (ingestion/ss7.py's SS7_PLATFORM_TOKEN_PATTERN/
+# SS7_FACETIME_ACTIVATION_PATTERN). Rows are dropped entirely wherever this
+# is True (load_source_features() below, models/rule_pattern/data.py's
+# _load_messages_csv()) - not a feature, a training-pool exclusion, since
+# neither model should spend capacity on content that can never be spam.
+PLATFORM_TOKEN_COL = "is_platform_token_message"
+
 # sender_age_days: kept in BEHAVIORAL_COLS (still passed raw to
 # rule_pattern_score) but NOT passed raw into Isolation Forest - this
 # prototype's ~2-day CDR sample only has sender_age_days in [0.0, 2.0],
@@ -148,33 +157,116 @@ COUNT_COLS = [
 N_EMBEDDING_COMPONENTS = 30
 
 
+def normalize_messages_frame(df: pd.DataFrame, log_prefix: str) -> pd.DataFrame:
+    """Post-read cleanup shared by every messages_with_behavioral.csv loader
+    (load_source_features() below, models/rule_pattern/data.py's
+    _load_messages_csv()) so both models see the same pool:
+      - IMSI_DISTINCT_ORIG_COL: SS7-only, absent from SMPP's file -> all-NaN
+        (NaN = genuinely unknown, not zero).
+      - CONTENT_FLAG_COLS: absent from a CSV that predates content_flags.py
+        (or a later CONTENT_FLAG_PATTERNS addition) -> 0, not NaN; unlike
+        IMSI/velocity, "unknown" isn't meaningful for a deterministic regex.
+      - PLATFORM_TOKEN_COL: SS7-only, absent from SMPP or a pre-flag CSV ->
+        False. Rows where it's True are DROPPED (opaque app/session tokens
+        and Apple FaceTime "REG-REQ" pings can never be spam, so neither
+        model should spend capacity on them), and the column is removed.
+    Adds the missing columns to `df` IN PLACE (no up-front copy - this runs
+    on multi-million-row frames, see ChunkedEmbeddingReducer's OOM note) and
+    returns the filtered copy; callers must use the return value."""
+    if IMSI_DISTINCT_ORIG_COL not in df.columns:
+        df[IMSI_DISTINCT_ORIG_COL] = np.nan
+    for col in CONTENT_FLAG_COLS:
+        if col not in df.columns:
+            df[col] = 0
+    if PLATFORM_TOKEN_COL not in df.columns:
+        df[PLATFORM_TOKEN_COL] = False
+    dropped = df[PLATFORM_TOKEN_COL].sum()
+    if dropped:
+        print(f"  {log_prefix}: dropping {dropped} platform/protocol signaling row(s) (is_platform_token_message)")
+    return df[~df[PLATFORM_TOKEN_COL]].drop(columns=PLATFORM_TOKEN_COL).copy()
+
+
+def build_source_dummies(source: pd.Series, known_sources: list[str] | None = None) -> pd.DataFrame | None:
+    """One-hot `source`, shared by both models' feature builders.
+
+    `known_sources` forces a column for every listed name regardless of how
+    many distinct values `source` holds - needed by live single-row serving
+    (nunique() is always 1), which would otherwise silently drop a source_*
+    column the fitted model still expects. None (all training callers) only
+    emits dummies when >1 source is present: a single-source run (e.g.
+    --sources SMPP) would produce a constant, information-free column.
+    Returns None when no dummies should be added."""
+    if known_sources is not None:
+        return pd.get_dummies(
+            source.astype(pd.CategoricalDtype(categories=sorted(known_sources))), prefix="source",
+        )
+    if source.nunique() > 1:
+        return pd.get_dummies(source, prefix="source")
+    return None
+
+
+class MissingEmbeddingsError(RuntimeError):
+    """This source has no embeddings.npy/embeddings_id_map.parquet/
+    faiss_output.parquet yet - same missing-corpus state as serving's
+    CorpusUnavailableError (serving/anomaly_scoring.py), raised here too so
+    training fails with an actionable message instead of a bare
+    FileNotFoundError deep inside np.load()/pd.read_parquet()."""
+
+
 def load_source_features(source_dir: Path, messages_path: Path) -> pd.DataFrame:
     """One row per message with behavioral + near_dup + embedding columns
     (`emb_0`..`emb_{d-1}`) plus `source`/`rule_evaluated`/`rule_flagged`
     carried through unscaled."""
     source_dir = Path(source_dir)
+    missing = [
+        name for name in ("embeddings.npy", "embeddings_id_map.parquet", "faiss_output.parquet")
+        if not (source_dir / name).exists()
+    ]
+    if missing:
+        raise MissingEmbeddingsError(
+            f"{source_dir} is missing {missing} - run features/text_embeddings.py "
+            "then features/faiss_index.py for this source first."
+        )
     # Lambda usecols so a file missing IMSI_DISTINCT_ORIG_COL (SMPP) is
     # skipped rather than raising, unlike a plain list.
     wanted_cols = (
         ["source", "record_id"] + BEHAVIORAL_COLS
         + [IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL]
         + CONTENT_FLAG_COLS
-        + ["rule_evaluated", "rule_flagged"]
+        + ["rule_evaluated", "rule_flagged", PLATFORM_TOKEN_COL]
     )
     messages = pd.read_csv(
         messages_path, low_memory=False, usecols=lambda c: c in set(wanted_cols),
     )
-    if IMSI_DISTINCT_ORIG_COL not in messages.columns:
-        messages[IMSI_DISTINCT_ORIG_COL] = np.nan
-    # Absent entirely for a pre-content_flags.py CSV - default 0, not NaN
-    # (unlike IMSI/velocity, "unknown" isn't meaningful for a deterministic
-    # regex feature; missing just means this run predates the feature).
-    for col in CONTENT_FLAG_COLS:
-        if col not in messages.columns:
-            messages[col] = 0
+    # Isolation Forest trains on the full traffic stream (CLAUDE.md) MINUS
+    # the platform/protocol-signaling carve-out normalize_messages_frame()
+    # drops (shared with rule_pattern's loader).
+    messages = normalize_messages_frame(messages, "load_source_features")
     messages["source"] = messages["source"].astype(str)
     messages["record_id"] = messages["record_id"].astype(str)
     messages["message_key"] = messages["source"] + "|" + messages["record_id"]
+
+    # If features/text_embeddings.py's last run for this source was
+    # --sample_n (not the full corpus), it leaves this file as a
+    # persistent, deliberate disclosure (see its docstring) - surface it
+    # HERE too, not just in that script's own console output, because the
+    # consequence is worse than "fewer training rows": every message NOT
+    # in the sample is also invisible to serving/anomaly_scoring.py's
+    # near-dup comparison corpus (same embeddings.npy/id_map, see that
+    # module's docstring) - a live message matching an unsampled pattern
+    # will show near_dup_match_count=0 ("never seen this before") even if
+    # that pattern is common in real traffic, purely from this gap, not
+    # genuine novelty.
+    sample_info_path = source_dir / "embeddings_sample_info.txt"
+    if sample_info_path.exists():
+        print(
+            f"  load_source_features: WARNING - {source_dir}'s embeddings are a SAMPLE, "
+            "not full corpus coverage (see embeddings_sample_info.txt below). Both this "
+            "training run AND live serving's near-dup corpus (serving/anomaly_scoring.py) "
+            "are missing every unsampled row - re-run features/text_embeddings.py without "
+            "--sample_n before trusting anomaly_score for this source.\n"
+            f"    {sample_info_path.read_text().strip().replace(chr(10), chr(10) + '    ')}"
+        )
 
     embeddings = np.load(source_dir / "embeddings.npy")
     id_map = pd.read_parquet(source_dir / "embeddings_id_map.parquet")
@@ -183,8 +275,19 @@ def load_source_features(source_dir: Path, messages_path: Path) -> pd.DataFrame:
 
     near_dup = pd.read_parquet(source_dir / "faiss_output.parquet")
 
+    before = len(messages)
     df = messages.merge(emb_df, on="message_key", how="inner")
     df = df.merge(near_dup, on="message_key", how="inner")
+    after = len(df)
+    if after < before:
+        dropped_n = before - after
+        print(
+            f"  load_source_features: dropping {dropped_n}/{before} ({dropped_n / before:.1%}) "
+            f"row(s) from {source_dir} with no matching embedding/near-dup output (INNER join) "
+            "- see this function's docstring; a large fraction here usually means the "
+            "embeddings/FAISS corpus is stale or sampled relative to messages_with_behavioral.csv, "
+            "not that this many rows are individually anomalous."
+        )
     return df
 
 
@@ -346,15 +449,8 @@ def build_combined_frame(
         transformed[CONTENT_FLAG_COLS],
         content_flag_meta,
     ]
-    if known_sources is not None:
-        source_dummies = pd.get_dummies(
-            transformed["source"].astype(pd.CategoricalDtype(categories=sorted(known_sources))),
-            prefix="source",
-        )
-        other_cols += list(source_dummies.columns)
-        pieces.append(source_dummies)
-    elif transformed["source"].nunique() > 1:
-        source_dummies = pd.get_dummies(transformed["source"], prefix="source")
+    source_dummies = build_source_dummies(transformed["source"], known_sources)
+    if source_dummies is not None:
         other_cols += list(source_dummies.columns)
         pieces.append(source_dummies)
     pieces.append(df[embedding_cols])

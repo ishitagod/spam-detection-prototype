@@ -71,25 +71,33 @@ for every NOT_FRAUD request) and is treated as best-effort, same as
 anomaly_score below - a failure here degrades reason_codes/
 feature_contributions, it never turns a successful score into FAILURE.
 """
+
 import logging
 import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from features.identity_baseline import entropy_zscore
 import serving.anomaly_scoring as anomaly_scoring
 import serving.fraud_type_scoring as fraud_type_scoring
 import serving.fusion_scoring as fusion_scoring
 import serving.scoring as scoring
 from serving.anomaly_scoring import score_anomaly
-from serving.anomaly_scoring import ChampionUnavailableError as AnomalyChampionUnavailableError
+from serving.anomaly_scoring import (
+    ChampionUnavailableError as AnomalyChampionUnavailableError,
+)
 from serving.anomaly_scoring import CorpusUnavailableError
 from serving.canonical import CanonicalRow, map_smpp_transaction, map_ss7_transaction
 from serving.feature_lookup import get_imsi_features, get_sender_features
 from serving.fraud_type_scoring import score_fraud_type
-from serving.fraud_type_scoring import ChampionUnavailableError as FraudTypeChampionUnavailableError
+from serving.fraud_type_scoring import (
+    ChampionUnavailableError as FraudTypeChampionUnavailableError,
+)
 from serving.fusion_scoring import score_fusion
-from serving.fusion_scoring import ChampionUnavailableError as FusionChampionUnavailableError
+from serving.fusion_scoring import (
+    ChampionUnavailableError as FusionChampionUnavailableError,
+)
 from serving.schemas import (
     FeatureContribution,
     FraudPredictionResult,
@@ -112,8 +120,11 @@ from serving.scoring import (
 # convention). Level is INFO by default - override via
 # `logging.getLogger("serving").setLevel(...)` or the LOG_LEVEL env var if
 # ever wired through config/settings.py.
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -174,7 +185,9 @@ def _confidence(cold_start: bool, text_decode_failed: bool) -> int:
 
 
 def _reason_codes(
-    row: dict, cold_start: bool, contributions: list[tuple[str, float, float]],
+    row: dict,
+    cold_start: bool,
+    contributions: list[tuple[str, float, float]],
     fusion_delta: str | None = None,
 ) -> list[str]:
     """Reason codes for a FRAUD prediction, membership now driven by REAL
@@ -202,7 +215,8 @@ def _reason_codes(
     these strings to the real enum values and consider a typed Enum here
     instead of list[str], so an out-of-spec code can't silently go out."""
     positive_top = {
-        feature for feature, _value, shap_value in contributions[:_TOP_K_CONTRIBUTIONS]
+        feature
+        for feature, _value, shap_value in contributions[:_TOP_K_CONTRIBUTIONS]
         if shap_value > 0
     }
     codes = ["KNOWN_SPAM_PATTERN"]
@@ -229,7 +243,9 @@ def score_ss7(request: SS7ScoreRequest) -> ScoreResponse:
     return _score(request, map_ss7_transaction(request.transaction))
 
 
-def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow) -> ScoreResponse:
+def _score(
+    request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow
+) -> ScoreResponse:
     """Shared body behind both routes above - request-shape/canonical-
     mapping is the only thing that differs per protocol (see module
     docstring); everything from here on (Feast lookup, both scores,
@@ -238,6 +254,22 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
     start = time.perf_counter()
     reference = request.transaction.reference
     logger.info("[%s] score request received (source=%s)", reference, canonical.source)
+
+    # Platform/protocol signaling (opaque app/session tokens, Apple
+    # FaceTime/iMessage REG-REQ activation pings) - not human message
+    # content, so it's excluded from both training (models/rule_pattern/
+    # data.py, models/anomaly/data.py) and here from inference entirely.
+    if canonical.is_platform_token_message:
+        logger.info(
+            "[%s] platform/protocol signaling message - skipping inference", reference
+        )
+        return ScoreResponse(
+            reference=reference,
+            status="SUCCESS",
+            recommended_action="PASS",
+            processing_time_ms=int((time.perf_counter() - start) * 1000),
+            fraud_results=[],
+        )
 
     stage_start = time.perf_counter()
     try:
@@ -253,13 +285,16 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
         # real operational failure, not a modeling one.
         logger.error("[%s] Feast behavioral lookup failed: %s", reference, e)
         return ScoreResponse(
-            reference=reference, status="FAILURE",
+            reference=reference,
+            status="FAILURE",
             error_message=f"behavioral feature lookup failed: {e}",
         )
     cold_start = all(behavioral.get(c) is None for c in BEHAVIORAL_COLS)
     logger.info(
         "[%s] Feast lookup done in %dms (cold_start=%s)",
-        reference, int((time.perf_counter() - stage_start) * 1000), cold_start,
+        reference,
+        int((time.perf_counter() - stage_start) * 1000),
+        cold_start,
     )
 
     stage_start = time.perf_counter()
@@ -267,13 +302,20 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
         probability, model_version, row = score_rule_pattern(canonical, behavioral)
     except (ChampionUnavailableError, ChampionUnsupportedError) as e:
         logger.error("[%s] rule_pattern_score (LightGBM) unavailable: %s", reference, e)
-        return ScoreResponse(reference=reference, status="FAILURE", error_message=str(e))
+        return ScoreResponse(
+            reference=reference, status="FAILURE", error_message=str(e)
+        )
     except Exception as e:
         logger.error("[%s] rule_pattern_score (LightGBM) failed: %s", reference, e)
-        return ScoreResponse(reference=reference, status="FAILURE", error_message=f"scoring failed: {e}")
+        return ScoreResponse(
+            reference=reference, status="FAILURE", error_message=f"scoring failed: {e}"
+        )
     logger.info(
         "[%s] rule_pattern_score (LightGBM v%s) = %.4f in %dms",
-        reference, model_version, probability, int((time.perf_counter() - stage_start) * 1000),
+        reference,
+        model_version,
+        probability,
+        int((time.perf_counter() - stage_start) * 1000),
     )
 
     # Computed ahead of the fraud_type loop now - fusion needs it to make
@@ -283,7 +325,9 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
         anomaly_score, _, _ = score_anomaly(canonical, behavioral)
         logger.info(
             "[%s] anomaly_score (IsolationForest + FAISS near-dup) = %.4f in %dms",
-            reference, anomaly_score, int((time.perf_counter() - stage_start) * 1000),
+            reference,
+            anomaly_score,
+            int((time.perf_counter() - stage_start) * 1000),
         )
     except (AnomalyChampionUnavailableError, CorpusUnavailableError) as e:
         logger.warning("[%s] anomaly_score unavailable: %s", reference, e)
@@ -299,15 +343,28 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
     if anomaly_score is not None:
         stage_start = time.perf_counter()
         try:
-            fusion_score, fusion_version = score_fusion(canonical.source, probability, anomaly_score)
+            fusion_score, fusion_version = score_fusion(
+                canonical.source, probability, anomaly_score
+            )
             logger.info(
                 "[%s] fusion_score (decision_fusion v%s) = %.4f in %dms",
-                reference, fusion_version, fusion_score, int((time.perf_counter() - stage_start) * 1000),
+                reference,
+                fusion_version,
+                fusion_score,
+                int((time.perf_counter() - stage_start) * 1000),
             )
         except FusionChampionUnavailableError as e:
-            logger.info("[%s] fusion_score unavailable, falling back to rule_pattern_score alone: %s", reference, e)
+            logger.info(
+                "[%s] fusion_score unavailable, falling back to rule_pattern_score alone: %s",
+                reference,
+                e,
+            )
         except Exception as e:
-            logger.warning("[%s] fusion_score failed, falling back to rule_pattern_score alone: %s", reference, e)
+            logger.warning(
+                "[%s] fusion_score failed, falling back to rule_pattern_score alone: %s",
+                reference,
+                e,
+            )
     decision_score = fusion_score if fusion_score is not None else probability
     fusion_escalated = (
         fusion_score is not None
@@ -319,7 +376,9 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
     # the API spec - NOT "evaluate nothing" (see SS7ScoreRequest's
     # docstring; the old `if "SPAM_SMS" in request.fraud_types` check got
     # this backwards for the empty-list case).
-    requested = set(request.fraud_types) if request.fraud_types else set(_SUPPORTED_FRAUD_TYPES)
+    requested = (
+        set(request.fraud_types) if request.fraud_types else set(_SUPPORTED_FRAUD_TYPES)
+    )
     to_evaluate = [ft for ft in _SUPPORTED_FRAUD_TYPES if ft in requested]
 
     # deep_scan=False: stop at the first FRAUD prediction rather than
@@ -348,14 +407,19 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
                     contributions = explain_rule_pattern(canonical, row)
                     logger.info(
                         "[%s] explain_rule_pattern (shap.TreeExplainer) done in %dms, top feature=%s",
-                        reference, int((time.perf_counter() - explain_start) * 1000),
+                        reference,
+                        int((time.perf_counter() - explain_start) * 1000),
                         contributions[0][0] if contributions else None,
                     )
                 except Exception as e:
-                    logger.warning("[%s] reason-code explanation unavailable: %s", reference, e)
+                    logger.warning(
+                        "[%s] reason-code explanation unavailable: %s", reference, e
+                    )
                     contributions = []
                 reason_codes = _reason_codes(
-                    row, cold_start, contributions,
+                    row,
+                    cold_start,
+                    contributions,
                     fusion_delta="escalated" if fusion_escalated else None,
                 )
                 feature_contributions = [
@@ -365,10 +429,15 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
 
                 subtype_start = time.perf_counter()
                 try:
-                    fraud_subtype, fraud_subtype_confidence, subtype_version = score_fraud_type(canonical.source, row)
+                    fraud_subtype, fraud_subtype_confidence, subtype_version = (
+                        score_fraud_type(canonical.source, row)
+                    )
                     logger.info(
                         "[%s] fraud_subtype (fraud_type_classifier v%s) = %s (%.4f) in %dms",
-                        reference, subtype_version, fraud_subtype, fraud_subtype_confidence,
+                        reference,
+                        subtype_version,
+                        fraud_subtype,
+                        fraud_subtype_confidence,
                         int((time.perf_counter() - subtype_start) * 1000),
                     )
                 except FraudTypeChampionUnavailableError as e:
@@ -388,16 +457,24 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
                     fraud_subtype_confidence=fraud_subtype_confidence,
                 )
             )
-        if not request.deep_scan and fraud_results and fraud_results[-1].prediction == "FRAUD":
+        if (
+            not request.deep_scan
+            and fraud_results
+            and fraud_results[-1].prediction == "FRAUD"
+        ):
             break
 
-    recommended_action = "BLOCK" if any(r.prediction == "FRAUD" for r in fraud_results) else "PASS"
+    recommended_action = (
+        "BLOCK" if any(r.prediction == "FRAUD" for r in fraud_results) else "PASS"
+    )
 
     processing_time_ms = int((time.perf_counter() - start) * 1000)
     logger.info(
         "[%s] scored in %dms -> prediction=%s recommended_action=%s",
-        reference, processing_time_ms,
-        fraud_results[0].prediction if fraud_results else None, recommended_action,
+        reference,
+        processing_time_ms,
+        fraud_results[0].prediction if fraud_results else None,
+        recommended_action,
     )
 
     return ScoreResponse(
@@ -409,4 +486,9 @@ def _score(request: SMPPScoreRequest | SS7ScoreRequest, canonical: CanonicalRow)
         fraud_results=fraud_results,
         anomaly_score=anomaly_score,
         fusion_score=fusion_score,
+        entropy_zscore=entropy_zscore(
+            canonical.text,
+            behavioral.get("entropy_level"),
+            behavioral.get("entropy_residual_spread"),
+        ),
     )

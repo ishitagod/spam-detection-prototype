@@ -1,1 +1,10 @@
-上 WhatsApp 聊天！快速、简便且安全地免费收发消息和通话。此邀请即将过期。https://whatsapp.com/dl/co
+--- len raw 73 udh.present False payload len 73
+ascii: score=0.000 text=None
+latin1: score=0.438 text='\x02\x00\x00\x02:\x13\t\x05ò!3/4Ôò¿:\x8a\x16!\x03U\x04\x07\x02:\x98\x06\x10A\x90\x02\x915tõ:\x08Y !Q\x02\x915t:\x18  \x80Q4#:\x00:\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+utf16: score=0.000 text=None
+gsm7: score=0.976 text='$@@Δ gDèédìΘsé\rjràjQh"H£UòÆΔ ì&¥Δ$AΛΔ2\r:uu Hé¤H($"V!\'ìùΔ @F"3DÅ@:@@@@@@@@@@@@@@@@@@'
+--- len raw 54 udh.present False payload len 54
+ascii: score=0.000 text=None
+latin1: score=0.315 text='\x03\x00\x01\x01\x05%\x00\x0e\x01\x02\x0c%\x00\n\x08:e86RYU\x08\x0e%\x00\t\n\x98\x06\x10\x90p\x96\x87\x83\x98õ\x05%\x00\x0f\x01\x00\x04&\x01ú\x1e\x04&\x02ú\x1e'
+utf16: score=0.889 text='̀āԥ\x0eĂథ\n࠺攸㙒奕ࠎ─ऊ順႐炖螃飵ԥ\x0fĀЦǺḄ☂羽'
+gsm7: score=0.984 text='¥@èòP Ç@Å$ò¿Pè@éòtΛCcFT,UΔ8($ $éΣ\r¡@ÇNeC¥1V/Pè¡ì£@Δ0Φ¡>åèLòPo'

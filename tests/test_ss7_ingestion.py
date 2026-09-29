@@ -126,6 +126,53 @@ def test_record_id_joins_features_to_labels(features, labels):
     assert features["record_id"].is_unique
 
 
+# ---------------------------------------------------------------------------
+# is_platform_token_message - opaque app/session tokens and Apple FaceTime
+# "REG-REQ" activation pings decode fine (not text_decode_failed) but are
+# not human message content. See SS7_PLATFORM_TOKEN_PATTERN/
+# SS7_FACETIME_ACTIVATION_PATTERN in ingestion/ss7.py.
+# ---------------------------------------------------------------------------
+
+_TOKEN_HEX = "2854325a4b614d6a4b6866347729"  # ascii "(T2ZKaMjKhf4w)"
+_FACETIME_HEX = "5245472d5245513f763d353b743d374441433831323034394232364243324530374334373843413141424245363335413541394445443730373943383834414636394538304236313536374232363b723d313938373636373030"
+_TOKEN_WITH_TRAILING_TEXT_HEX = "2854325a4b614d6a4b68663477292068656c6c6f"  # "(T2ZKaMjKhf4w) hello"
+
+
+def test_opaque_bracket_token_flagged_and_text_blanked():
+    raw = pd.DataFrame([row(index=1, message_type=3, dcs=26, content=_TOKEN_HEX, decoded_content=None)])
+    cleaned = clean(raw)
+    r = cleaned.iloc[0]
+    assert r["is_platform_token_message"]
+    assert r["text_clean"] == ""
+    assert not r["text_decode_failed"]  # decoded fine, just not content
+
+
+def test_facetime_reg_req_flagged_and_text_blanked():
+    raw = pd.DataFrame([row(index=1, message_type=3, dcs=26, content=_FACETIME_HEX, decoded_content=None)])
+    cleaned = clean(raw)
+    r = cleaned.iloc[0]
+    assert r["is_platform_token_message"]
+    assert r["text_clean"] == ""
+
+
+def test_bracket_token_with_trailing_content_not_flagged():
+    """Real content that happens to start with a bracket token must not be
+    blanked out - only a bare, fully-anchored token is platform signaling."""
+    raw = pd.DataFrame([
+        row(index=1, message_type=3, dcs=26, content=_TOKEN_WITH_TRAILING_TEXT_HEX, decoded_content=None)
+    ])
+    cleaned = clean(raw)
+    r = cleaned.iloc[0]
+    assert not r["is_platform_token_message"]
+    assert r["text_clean"] == "(T2ZKaMjKhf4w) hello"
+
+
+def test_is_platform_token_message_propagates_to_canonical_features(cleaned):
+    features, _ = map_to_canonical(cleaned)
+    assert "is_platform_token_message" in features.columns
+    assert not features["is_platform_token_message"].any()  # BASE_ROW's "Hi" isn't a token
+
+
 def test_raises_when_clean_not_run_first():
     with pytest.raises(ValueError):
         map_to_canonical(pd.DataFrame([{"index": 1}]))

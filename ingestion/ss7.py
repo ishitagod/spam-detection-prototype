@@ -37,6 +37,8 @@ features/message_reassembly.py works unchanged across both sources -
 msg_parts of 0 or 1 (or missing) means genuinely single-part, matching
 SMPP's convention (concat_total_parts=1, concat_part_num=1, concat_ref=None).
 """
+import re
+
 import pandas as pd
 
 from common.schemas import (
@@ -88,6 +90,32 @@ _MO = 3
 # docstring on "same DCS byte does NOT imply the same convention across
 # sources") - this set is SS7-only.
 SS7_BINARY_DATA_CLASS_DCS = {4}
+
+# Platform/protocol signaling text found via ad-hoc forensic regex search
+# over decoded_content (notebooks/ss7_regex_content_match.ipynb,
+# notebooks/ss7_regex_reg_req_match.ipynb) - decodes FINE (not
+# text_decode_failed) but is not human message content, so scoring it with
+# content-flags/embeddings/TF-IDF is meaningless noise, not signal:
+#   - opaque base62 app/session verification tokens, e.g. "(T2ZKaMjKhf4w)" -
+#     confirmed structureless via base64-decode testing (no hidden second
+#     layer). Fully anchored: nothing before the opening bracket or after
+#     the closing one, or it's real wrapped content, not a bare token.
+#   - Apple FaceTime/iMessage activation pings, e.g.
+#     "REG-REQ?v=5;t=7DAC812049B26BC2E07C478CA1ABBE635A5A9DED7079C884AF69E80B61567B26;r=198766700" -
+#     7,153 matches, all message_type=3 (MO), all the same v=/t=/r= shape.
+# SS7-only: this signaling shape has not been checked for/found in SMPP.
+SS7_PLATFORM_TOKEN_PATTERN = re.compile(r"^\([A-Za-z0-9]{12}\)$")
+SS7_FACETIME_ACTIVATION_PATTERN = re.compile(r"^REG-REQ\?v=\d+;t=[0-9A-Fa-f]+;r=\d+$")
+
+
+def is_platform_token_text(text: str | None) -> bool:
+    """Scalar version of clean()'s vectorized platform-token check below -
+    shared so live single-message scoring (serving/canonical.py) can never
+    silently drift from what batch ingestion flags. See
+    SS7_PLATFORM_TOKEN_PATTERN/SS7_FACETIME_ACTIVATION_PATTERN above."""
+    if not text:
+        return False
+    return bool(SS7_PLATFORM_TOKEN_PATTERN.match(text) or SS7_FACETIME_ACTIVATION_PATTERN.match(text))
 
 
 def _decode_row(content_hex, dcs) -> dict:
@@ -231,6 +259,24 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     kept["text_decode_failed"] = text_missing
     kept["text_clean"] = kept["text_clean"].where(~text_missing, "")
 
+    # Platform/protocol signaling text, not human message content - see
+    # SS7_PLATFORM_TOKEN_PATTERN/SS7_FACETIME_ACTIVATION_PATTERN above.
+    # Blanked out the same way text_decode_failed rows are (text_clean="")
+    # so content-flags/embeddings/TF-IDF never treat it as content, but
+    # kept as its own flag rather than folded into text_decode_failed -
+    # these decoded successfully, they just aren't content.
+    platform_token = kept["text_clean"].str.match(
+        SS7_PLATFORM_TOKEN_PATTERN, na=False
+    ) | kept["text_clean"].str.match(SS7_FACETIME_ACTIVATION_PATTERN, na=False)
+    if platform_token.any():
+        print(
+            f"  clean (SS7): {platform_token.sum()} row(s) are platform/protocol "
+            "signaling text (opaque token or FaceTime REG-REQ), not content - "
+            "flagged via is_platform_token_message, text_clean blanked"
+        )
+    kept["is_platform_token_message"] = platform_token
+    kept["text_clean"] = kept["text_clean"].where(~platform_token, "")
+
     # Multipart grouping key, in the same concat_ref/concat_total_parts/
     # concat_part_num shape ingestion/smpp.py produces (from UDH instead of
     # SS7's native sarref/msg_part/msg_parts) - see module docstring's
@@ -343,7 +389,9 @@ def map_to_canonical(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     vlr_address merged in, `record_id` assigned).
     """
     missing_required = [
-        c for c in ("record_id", "text_clean", "text_decode_failed")
+        c for c in (
+            "record_id", "text_clean", "text_decode_failed", "is_platform_token_message"
+        )
         if c not in df.columns
     ]
     if missing_required:
@@ -359,6 +407,10 @@ def map_to_canonical(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     features["record_id"] = df["record_id"]
     features["source"] = "SS7"
     features["text_decode_failed"] = df["text_decode_failed"]
+    # SS7-only (see SS7_PLATFORM_TOKEN_PATTERN/SS7_FACETIME_ACTIVATION_PATTERN
+    # above) - not part of CANONICAL_FEATURE_SCHEMA, same treatment as other
+    # SS7-only signal per CLAUDE.md's architecture rules.
+    features["is_platform_token_message"] = df["is_platform_token_message"]
 
     raw_label_cols = df[[c for c in LABEL_SOURCE_COLS if c in df.columns]].copy()
     label_source = pd.DataFrame({"record_id": df["record_id"]})

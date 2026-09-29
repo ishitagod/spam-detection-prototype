@@ -197,3 +197,8 @@ class ScoreResponse(BaseModel):
     # None when no fusion champion exists yet - decision falls back to
     # rule_pattern_score alone.
     fusion_score: float | None = None
+    # ADDITIVE Lens 1 (identity) signal, NOT a model input and NOT fused:
+    # this message's character entropy vs the sender's own EMA baseline
+    # (features/identity_baseline.py). None when undefined (unknown sender,
+    # undecodable text, or too little history for a spread).
+    entropy_zscore: float | None = None

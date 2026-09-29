@@ -103,6 +103,7 @@ from features.behavioral import (
     _window_timedelta64,
 )
 from config.settings import BEHAVIORAL_LONG_WINDOW, BEHAVIORAL_SHORT_WINDOW
+from features.identity_baseline import compute_entropy_baselines
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -135,6 +136,8 @@ COL_MSGS_LONG = "sender_msgs_last_1hr"
 COL_UNIQUE_DEST_LONG = "sender_unique_destinations_1hr"
 COL_RECENT_TEXTS_JSON = "recent_text_counts_json"
 COL_SENDER_AGE_DAYS = "sender_age_days"
+COL_ENTROPY_LEVEL = "entropy_level"
+COL_ENTROPY_SPREAD = "entropy_residual_spread"
 
 SNAPSHOT_COLUMNS = [
     COL_SENDER_ID, "source", "originator", COL_EVENT_TS,
@@ -145,6 +148,9 @@ SNAPSHOT_COLUMNS = [
     # features/behavioral.py rather than redefined, single source of truth.
     COL_RECIPIENT_DIVERSITY_SHORT, COL_RECIPIENT_DIVERSITY_LONG,
     COL_VELOCITY_ZSCORE_SHORT,
+    # Lens 1 content-entropy baseline (features/identity_baseline.py) - NaN
+    # for senders with no decodable text.
+    COL_ENTROPY_LEVEL, COL_ENTROPY_SPREAD,
 ]
 
 COL_IMSI = "imsi"
@@ -285,6 +291,15 @@ def compute_sender_snapshots(
     # in_long) - a plain .map(), no fillna needed, NaN passes through
     # naturally for senders with <2 prior readings (see module docstring).
     snapshot[COL_VELOCITY_ZSCORE_SHORT] = snapshot.index.map(velocity_zscore_now)
+    # Entropy baseline - full-history replay through the generic EMA
+    # updater, see features/identity_baseline.py. Left NaN (not 0) for
+    # senders with no decodable text.
+    baselines = compute_entropy_baselines(
+        df[[COL_SENDER_ID, "timestamp", "text"]].rename(columns={COL_SENDER_ID: "sender_id"}),
+        now=now,
+    )
+    snapshot[COL_ENTROPY_LEVEL] = baselines["entropy_level"].reindex(snapshot.index)
+    snapshot[COL_ENTROPY_SPREAD] = baselines["entropy_residual_spread"].reindex(snapshot.index)
     snapshot[COL_EVENT_TS] = now
 
     return snapshot.reset_index()[SNAPSHOT_COLUMNS]

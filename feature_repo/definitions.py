@@ -117,6 +117,11 @@ sender_behavioral_stats = FeatureView(
         # Can be NaN (fewer than 2 prior readings, or zero variance) -
         # Float64 handles that natively, no imputation at this layer.
         Field(name="sender_velocity_zscore_5min", dtype=Float64),
+        # Lens 1 content-entropy baseline (features/identity_baseline.py) -
+        # NaN for senders with no decodable text. Serving derives
+        # entropy_zscore from these + the request's own text.
+        Field(name="entropy_level", dtype=Float64),
+        Field(name="entropy_residual_spread", dtype=Float64),
     ],
     online=True,
     source=sender_behavioral_snapshot_source,

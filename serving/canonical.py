@@ -29,6 +29,7 @@ import pandas as pd
 
 from ingestion.smpp import _decode_row as _smpp_decode_row
 from ingestion.ss7 import _decode_row as _ss7_decode_row
+from ingestion.ss7 import is_platform_token_text
 from serving.schemas import SMPPTransaction, SS7Transaction
 
 
@@ -43,6 +44,13 @@ class CanonicalRow:
     dcs: float | None
     text_decode_failed: bool
     imsi: str | None = None  # SS7-only, see module docstring
+    # SS7-only (see ingestion/ss7.py's SS7_PLATFORM_TOKEN_PATTERN/
+    # SS7_FACETIME_ACTIVATION_PATTERN) - always False for SMPP, no evidence
+    # this signaling shape exists there. `text` is already blanked to "" by
+    # map_ss7_transaction() when this is True, same convention as a
+    # text_decode_failed row - this flag exists so serving/app.py can skip
+    # model inference entirely for these messages (see its docstring).
+    is_platform_token_message: bool = False
 
     @property
     def sender_id(self) -> str:
@@ -74,6 +82,16 @@ def map_ss7_transaction(txn: SS7Transaction) -> CanonicalRow:
     decoded = _ss7_decode_row(_hex_to_bytes(txn.content), dcs)
     text = decoded["text"] or ""
     timestamp = pd.Timestamp(txn.time_stamp, unit="ms").isoformat()
+    text_decode_failed = not text.strip()  # computed BEFORE the platform-token
+    # blank below - these decode FINE, they're just not content, distinct
+    # from a genuine decode failure (see ingestion/ss7.py's clean()).
+
+    # Same platform-token/FaceTime-REG-REQ check batch ingestion's
+    # ss7.clean() runs - text is blanked the same way a text_decode_failed
+    # row is, so this message is never scored as if it were real content.
+    platform_token = is_platform_token_text(text)
+    if platform_token:
+        text = ""
 
     return CanonicalRow(
         source="SS7",
@@ -83,8 +101,9 @@ def map_ss7_transaction(txn: SS7Transaction) -> CanonicalRow:
         text=text,
         timestamp=timestamp,
         dcs=float(dcs) if dcs is not None else None,
-        text_decode_failed=not text.strip(),
+        text_decode_failed=text_decode_failed,
         imsi=str(txn.imsi) if txn.imsi not in (None, "") else None,
+        is_platform_token_message=platform_token,
     )
 
 

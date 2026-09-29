@@ -48,6 +48,10 @@ FEATURE_REFS = [
     "sender_behavioral_stats:sender_recipient_diversity_ratio_5min",
     "sender_behavioral_stats:sender_recipient_diversity_ratio_1hr",
     "sender_behavioral_stats:sender_velocity_zscore_5min",
+    # Lens 1 entropy baseline - read by serving/app.py for entropy_zscore,
+    # not a model input.
+    "sender_behavioral_stats:entropy_level",
+    "sender_behavioral_stats:entropy_residual_spread",
 ]
 
 # SS7-only, keyed on `imsi` not `sender_id` (feature_repo/definitions.py's

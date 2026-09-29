@@ -178,6 +178,27 @@ def _load_corpus(source: str, data_dir: Path) -> _LoadedCorpus:
             "run features/text_embeddings.py for it first."
         )
 
+    # Same disclosure file models/anomaly/data.py::load_source_features()
+    # checks for training - matters just as much here, arguably more:
+    # this corpus IS the "have I seen this before" comparison pool for
+    # every live request's near_dup_* features (see module docstring). If
+    # it's a SAMPLE, a live message matching a pattern that fell outside
+    # the sample will score near_dup_match_count=0 - looking like a brand
+    # new campaign when it's actually common traffic this corpus just
+    # never captured. Loud warning, not a hard failure - a sampled corpus
+    # still degrades gracefully to "less accurate," it isn't unusable.
+    sample_info_path = source_dir / "embeddings_sample_info.txt"
+    if sample_info_path.exists():
+        logger.warning(
+            "anomaly_score's near-dup corpus for source=%s is a SAMPLE, not full "
+            "corpus coverage - near_dup_match_count/max_similarity for live requests "
+            "will UNDERCOUNT real duplicate traffic outside the sample, inflating "
+            "anomaly_score for patterns that aren't actually novel. Re-run "
+            "features/text_embeddings.py without --sample_n for this source. "
+            "Details: %s",
+            source, sample_info_path.read_text().strip(),
+        )
+
     load_start = time.perf_counter()
     logger.info("loading corpus + building FAISS %s index for source=%s (cold cache)", FAISS_SERVING_INDEX_TYPE, source)
     embeddings = np.load(emb_path)

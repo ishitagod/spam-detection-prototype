@@ -49,17 +49,23 @@ running against a materially different candidate pool size/shape where
 rather than assuming 0.6 travels to every --anomaly_percentile/source
 combination.
 """
+
 import argparse
 from pathlib import Path
 
 import mlflow
 import numpy as np
 import pandas as pd
-from sklearn.cluster import DBSCAN, HDBSCAN
+from sklearn.cluster import HDBSCAN
 from sklearn.neighbors import NearestNeighbors
 
 from config.settings import MLFLOW_TRACKING_URI
-from models.anomaly.data import BEHAVIORAL_COLS, NEAR_DUP_COLS, build_feature_matrix, load_source_features
+from models.anomaly.data import (
+    BEHAVIORAL_COLS,
+    NEAR_DUP_COLS,
+    build_feature_matrix,
+    load_source_features,
+)
 
 # Separate from "anomaly_score" - this can't be a promotable model (see
 # module docstring), so it gets its own MLflow experiment name.
@@ -79,8 +85,10 @@ MLFLOW_EXPERIMENT_NAME = "fraud_type_cluster_discovery"
 # near_dup_match_count_*/near_dup_max_similarity_* stay in - genuinely
 # content-recurrence/embedding-similarity, not sender-identity.
 CONTENT_SAFE_NEAR_DUP_COLS = [
-    "near_dup_match_count_1hr", "near_dup_max_similarity_1hr",
-    "near_dup_match_count_24hr", "near_dup_max_similarity_24hr",
+    "near_dup_match_count_1hr",
+    "near_dup_max_similarity_1hr",
+    "near_dup_match_count_24hr",
+    "near_dup_max_similarity_24hr",
 ]
 
 # Raw (pre-PCA/scale) columns to print per cluster - human-readable
@@ -131,7 +139,9 @@ def suggest_eps(X: np.ndarray, min_samples: int) -> float:
     return suggested
 
 
-def load_features_and_scores(sources: list[str], data_dir: Path) -> tuple[pd.DataFrame, np.ndarray, list[str]]:
+def load_features_and_scores(
+    sources: list[str], data_dir: Path
+) -> tuple[pd.DataFrame, np.ndarray, list[str]]:
     """Loads the same joined feature set train.py trains on, then merges
     in that run's anomaly_score by message_key. Raises clearly if
     anomaly_scores.parquet is missing - this script consumes it, doesn't
@@ -150,7 +160,9 @@ def load_features_and_scores(sources: list[str], data_dir: Path) -> tuple[pd.Dat
         df = load_source_features(source_dir, messages_path)
         scores = pd.read_parquet(scores_path)[["message_key", "anomaly_score"]]
         df = df.merge(scores, on="message_key", how="inner", validate="one_to_one")
-        print(f"  {source}: {len(df)} message(s) with both features and an anomaly_score")
+        print(
+            f"  {source}: {len(df)} message(s) with both features and an anomaly_score"
+        )
         frames.append(df)
 
     combined = pd.concat(frames, ignore_index=True)
@@ -159,7 +171,9 @@ def load_features_and_scores(sources: list[str], data_dir: Path) -> tuple[pd.Dat
 
 
 def select_clustering_features(
-    X: np.ndarray, feature_names: list[str], mode: str = "content",
+    X: np.ndarray,
+    feature_names: list[str],
+    mode: str = "content",
 ) -> np.ndarray:
     """Selects which columns the clustering distance metric sees.
 
@@ -184,16 +198,21 @@ def select_clustering_features(
     if mode == "all":
         return X
     if mode != "content":
-        raise ValueError(f"Unknown cluster_features mode {mode!r} - expected 'content' or 'all'.")
+        raise ValueError(
+            f"Unknown cluster_features mode {mode!r} - expected 'content' or 'all'."
+        )
     keep = [
-        i for i, name in enumerate(feature_names)
+        i
+        for i, name in enumerate(feature_names)
         if name.startswith("emb_pca_") or name in CONTENT_SAFE_NEAR_DUP_COLS
     ]
     return X[:, keep]
 
 
 def select_anomalous_subset(
-    df: pd.DataFrame, X: np.ndarray, percentile: float,
+    df: pd.DataFrame,
+    X: np.ndarray,
+    percentile: float,
 ) -> tuple[pd.DataFrame, np.ndarray]:
     """Threshold computed once across the combined (all-sources) pool,
     not per source - matches Isolation Forest's joint-source training."""
@@ -206,15 +225,9 @@ def select_anomalous_subset(
     return df[mask].reset_index(drop=True), X[mask]
 
 
-def run_dbscan(X: np.ndarray, eps: float, min_samples: int, n_jobs: int) -> np.ndarray:
-    # n_jobs defaults to 4, not -1 (all cores) - more workers means more
-    # concurrent memory for the neighbor search, not just more speed,
-    # once the candidate pool is large. Pass -1 explicitly if safe to.
-    model = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=n_jobs)
-    return model.fit_predict(X)
-
-
-def run_hdbscan(X: np.ndarray, min_cluster_size: int, min_samples: int, n_jobs: int) -> np.ndarray:
+def run_hdbscan(
+    X: np.ndarray, min_cluster_size: int, min_samples: int, n_jobs: int
+) -> np.ndarray:
     """No eps to pick - HDBSCAN builds a cluster hierarchy across a RANGE
     of density thresholds and extracts whichever groupings are stable
     across the widest range, instead of one global flat density cutoff.
@@ -227,7 +240,9 @@ def run_hdbscan(X: np.ndarray, min_cluster_size: int, min_samples: int, n_jobs: 
     DBSCAN). sklearn.cluster.HDBSCAN, not the standalone hdbscan package -
     already available in this project's installed sklearn (>=1.3), no
     new dependency."""
-    model = HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples, n_jobs=n_jobs)
+    model = HDBSCAN(
+        min_cluster_size=min_cluster_size, min_samples=min_samples, n_jobs=n_jobs
+    )
     return model.fit_predict(X)
 
 
@@ -252,8 +267,10 @@ def summarize_clusters(df: pd.DataFrame, labels: np.ndarray) -> dict:
 
 def print_cluster_summary(summary: dict) -> None:
     for name, stats in sorted(summary.items(), key=lambda kv: -kv[1]["n_rows"]):
-        print(f"  {name}: {stats['n_rows']} row(s), mean_anomaly_score={stats['mean_anomaly_score']:.3f}, "
-              f"sources={stats['source_counts']}")
+        print(
+            f"  {name}: {stats['n_rows']} row(s), mean_anomaly_score={stats['mean_anomaly_score']:.3f}, "
+            f"sources={stats['source_counts']}"
+        )
         for col in SUMMARY_RAW_COLS:
             print(f"      {col}: {stats[col]:.3f}")
 
@@ -275,9 +292,13 @@ def run(
 
     print(f"Selecting top {100 - anomaly_percentile:.0f}% by anomaly_score ...")
     df_subset, X_subset = select_anomalous_subset(df, X, anomaly_percentile)
-    X_subset = select_clustering_features(X_subset, feature_names, mode=cluster_features)
-    print(f"  clustering on {X_subset.shape[1]} column(s), cluster_features={cluster_features!r} "
-          f"(algorithm={algorithm!r}) - see select_clustering_features()")
+    X_subset = select_clustering_features(
+        X_subset, feature_names, mode=cluster_features
+    )
+    print(
+        f"  clustering on {X_subset.shape[1]} column(s), cluster_features={cluster_features!r} "
+        f"(algorithm={algorithm!r}) - see select_clustering_features()"
+    )
     if len(df_subset) < min_samples:
         raise ValueError(
             f"Only {len(df_subset)} row(s) selected, fewer than --min_samples "
@@ -295,22 +316,26 @@ def run(
         )
 
     resolved_eps = None
-    if algorithm == "dbscan":
-        resolved_eps = eps if eps is not None else suggest_eps(X_subset, min_samples)
-        print(f"Running DBSCAN (eps={resolved_eps:.4f}, min_samples={min_samples}, n_jobs={n_jobs}) on {len(X_subset)} rows ...")
-        labels = run_dbscan(X_subset, resolved_eps, min_samples, n_jobs)
-    elif algorithm == "hdbscan":
-        print(f"Running HDBSCAN (min_cluster_size={min_cluster_size}, min_samples={min_samples}, "
-              f"n_jobs={n_jobs}) on {len(X_subset)} rows ...")
+    if algorithm == "hdbscan":
+        print(
+            f"Running HDBSCAN (min_cluster_size={min_cluster_size}, min_samples={min_samples}, "
+            f"n_jobs={n_jobs}) on {len(X_subset)} rows ..."
+        )
         labels = run_hdbscan(X_subset, min_cluster_size, min_samples, n_jobs)
     else:
-        raise ValueError(f"Unknown algorithm {algorithm!r} - expected 'dbscan' or 'hdbscan'.")
+        raise ValueError(
+            f"Unknown algorithm {algorithm!r} - expected 'dbscan' or 'hdbscan'."
+        )
     n_clusters = len(set(labels.tolist()) - {-1})
     n_noise = int((labels == -1).sum())
-    print(f"  {n_clusters} cluster(s) found, {n_noise} row(s) unclustered (noise, label -1)")
+    print(
+        f"  {n_clusters} cluster(s) found, {n_noise} row(s) unclustered (noise, label -1)"
+    )
 
     summary = summarize_clusters(df_subset, labels)
-    print("Cluster summary (see module docstring - this feeds human hand-labeling, not a formal metric):")
+    print(
+        "Cluster summary (see module docstring - this feeds human hand-labeling, not a formal metric):"
+    )
     print_cluster_summary(summary)
 
     dataset_label = "+".join(sorted(sources))
@@ -321,34 +346,46 @@ def run(
         mlflow.log_input(
             mlflow.data.from_pandas(
                 df_subset,
-                source=",".join(str(data_dir / s / "anomaly_scores.parquet") for s in sources),
+                source=",".join(
+                    str(data_dir / s / "anomaly_scores.parquet") for s in sources
+                ),
                 name=dataset_label,
             ),
             context="clustering",
         )
-        mlflow.log_params({
-            "dataset": dataset_label,
-            "anomaly_percentile": anomaly_percentile,
-            "n_candidate_rows": len(df_subset),
-            "algorithm": algorithm,
-            "cluster_features": cluster_features,
-            "eps": resolved_eps,
-            "eps_was_auto_suggested": eps is None if algorithm == "dbscan" else None,
-            "min_cluster_size": min_cluster_size if algorithm == "hdbscan" else None,
-            "min_samples": min_samples,
-            "n_jobs": n_jobs,
-        })
+        mlflow.log_params(
+            {
+                "dataset": dataset_label,
+                "anomaly_percentile": anomaly_percentile,
+                "n_candidate_rows": len(df_subset),
+                "algorithm": algorithm,
+                "cluster_features": cluster_features,
+                "eps": resolved_eps,
+                "eps_was_auto_suggested": (
+                    eps is None if algorithm == "dbscan" else None
+                ),
+                "min_cluster_size": (
+                    min_cluster_size if algorithm == "hdbscan" else None
+                ),
+                "min_samples": min_samples,
+                "n_jobs": n_jobs,
+            }
+        )
         mlflow.log_metrics({"n_clusters": n_clusters, "n_noise": n_noise})
         mlflow.log_dict(summary, "cluster_summary.json")
         # No mlflow.sklearn.log_model() - not a deployable model, see module docstring.
-        print(f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={MLFLOW_EXPERIMENT_NAME})")
+        print(
+            f"Logged run to MLflow (tracking_uri={MLFLOW_TRACKING_URI}, experiment={MLFLOW_EXPERIMENT_NAME})"
+        )
 
-    df_out = pd.DataFrame({
-        "message_key": df_subset["source"] + "|" + df_subset["record_id"],
-        "source": df_subset["source"],
-        "anomaly_score": df_subset["anomaly_score"],
-        "cluster_label": labels,
-    })
+    df_out = pd.DataFrame(
+        {
+            "message_key": df_subset["source"] + "|" + df_subset["record_id"],
+            "source": df_subset["source"],
+            "anomaly_score": df_subset["anomaly_score"],
+            "cluster_label": labels,
+        }
+    )
     for source in sources:
         out_path = data_dir / source / "fraud_type_clusters.parquet"
         subset = df_out[df_out["source"] == source].drop(columns="source")
@@ -361,33 +398,44 @@ def main():
     parser.add_argument("--sources", type=str, nargs="+", default=["SMPP", "SS7"])
     parser.add_argument("--data_dir", type=str, default="data/processed")
     parser.add_argument(
-        "--anomaly_percentile", type=float, default=DEFAULT_ANOMALY_PERCENTILE,
+        "--anomaly_percentile",
+        type=float,
+        default=DEFAULT_ANOMALY_PERCENTILE,
         help="Only cluster rows at/above this anomaly_score percentile "
         f"(default: top {100 - DEFAULT_ANOMALY_PERCENTILE:.1f}%%, tighter than the "
         "old 90 default - see module docstring's SCALE WARNING).",
     )
     parser.add_argument(
-        "--eps", type=float, default=DEFAULT_EPS,
+        "--eps",
+        type=float,
+        default=DEFAULT_EPS,
         help=f"DBSCAN eps. Default: {DEFAULT_EPS} (fixed, validated constant - see "
         "module docstring's EPS DEFAULT section), not auto-suggested, so everyone "
         "running with no flags gets the same, known-good clustering shape. Pass "
         "--eps_auto instead to fall back to suggest_eps()'s k-distance heuristic.",
     )
     parser.add_argument(
-        "--eps_auto", action="store_true",
+        "--eps_auto",
+        action="store_true",
         help="Ignore --eps/DEFAULT_EPS and re-suggest eps from this run's own "
         "k-distance distribution (suggest_eps()) - use when clustering a "
         "materially different candidate pool (different --anomaly_percentile, "
         "source, or corpus size) where DEFAULT_EPS hasn't been validated.",
     )
     parser.add_argument(
-        "--algorithm", type=str, default="hdbscan", choices=["hdbscan", "dbscan"],
+        "--algorithm",
+        type=str,
+        default="hdbscan",
+        choices=["hdbscan", "dbscan"],
         help="Clustering algorithm. Default hdbscan (no --eps to tune, handles "
         "uneven density natively - see run_hdbscan()). --dbscan kept for "
         "comparison/rollback, uses --eps/--eps_auto.",
     )
     parser.add_argument(
-        "--cluster_features", type=str, default="content", choices=["content", "all"],
+        "--cluster_features",
+        type=str,
+        default="content",
+        choices=["content", "all"],
         help="Which columns the clustering distance metric sees. 'content' "
         "(default, validated) = embedding PCA + near-dup only - see "
         "select_clustering_features(). 'all' includes behavioral columns too - "
@@ -395,26 +443,37 @@ def main():
         "docstring for what this risks.",
     )
     parser.add_argument(
-        "--min_cluster_size", type=int, default=5,
+        "--min_cluster_size",
+        type=int,
+        default=5,
         help="HDBSCAN only: smallest group size worth calling a cluster. Ignored "
         "for --algorithm dbscan (which uses --min_samples/--eps instead).",
     )
     parser.add_argument("--min_samples", type=int, default=5)
     parser.add_argument(
-        "--n_jobs", type=int, default=4,
+        "--n_jobs",
+        type=int,
+        default=4,
         help="Parallel workers (DBSCAN or HDBSCAN). Default 4, not -1 - see run_dbscan().",
     )
     parser.add_argument(
-        "--force", action="store_true",
+        "--force",
+        action="store_true",
         help="Proceed past MAX_RECOMMENDED_CANDIDATES - see that constant's "
         "comment. Prefer a tighter --anomaly_percentile instead.",
     )
     args = parser.parse_args()
     resolved_eps = None if args.eps_auto else args.eps
     run(
-        args.sources, Path(args.data_dir), args.anomaly_percentile, resolved_eps,
-        args.min_samples, n_jobs=args.n_jobs, force=args.force,
-        algorithm=args.algorithm, cluster_features=args.cluster_features,
+        args.sources,
+        Path(args.data_dir),
+        args.anomaly_percentile,
+        resolved_eps,
+        args.min_samples,
+        n_jobs=args.n_jobs,
+        force=args.force,
+        algorithm=args.algorithm,
+        cluster_features=args.cluster_features,
         min_cluster_size=args.min_cluster_size,
     )
 

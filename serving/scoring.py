@@ -21,10 +21,11 @@ CONTENT_FLAG_COLS (features/content_flags.py, computed inline here via
 compute_content_flags()), one-hot `source`), and
 OPTIONALLY TF-IDF (`tfidf_*`) and/or PCA-reduced MiniLM embeddings
 (`emb_pca_*`) if the champion was trained with --with_tfidf/
---with_embeddings. This module rebuilds the base frame rather than
-importing _base_feature_frame() directly (that helper takes a whole
-DataFrame + is private) - column NAMES and construction below are kept
-deliberately identical to it so the two never drift apart silently. The
+--with_embeddings. The base frame is built by calling _base_feature_frame()
+itself on a one-row frame (known_sources= keeps the source one-hot columns
+stable at nunique()==1) - the same reuse serving/anomaly_scoring.py does
+with build_combined_frame() - so training and serving share one
+implementation instead of two hand-synced copies. The
 TF-IDF/embedding paths reuse the champion's OWN fitted
 tfidf_vectorizer/embedding_pca_pipeline artifacts (logged alongside
 `model` in the same MLflow run) and features/text_embeddings.py's
@@ -68,9 +69,9 @@ from models.anomaly.data import (
     BEHAVIORAL_COLS,
     IMSI_DISTINCT_ORIG_COL,
     SENDER_VELOCITY_ZSCORE_COL,
-    compute_content_flag_meta_features,
 )
 from models.registry import MLFLOW_TRACKING_URI
+from models.rule_pattern.data import _base_feature_frame
 from serving.canonical import CanonicalRow
 
 logger = logging.getLogger(__name__)
@@ -220,50 +221,41 @@ def build_rule_pattern_row(
     embed-then-PCA order). None (the default) skips that column group
     entirely - correct for a champion trained without that flag, where
     feature_names.json won't ask for those columns anyway."""
-    row = {col: (behavioral.get(col) or 0) for col in BEHAVIORAL_COLS}
-    row["dcs"] = canonical.dcs if canonical.dcs is not None else np.nan  # LightGBM
-    # has native missing-value handling - no imputation, same as training
-    # (models/rule_pattern/data.py's _base_feature_frame() docstring).
-    # imsi_distinct_originators_1hr: RAW value or NaN, deliberately NOT
-    # 0-filled like BEHAVIORAL_COLS above and NOT log1p'd - mirrors
-    # _base_feature_frame() exactly (unlike models/anomaly/data.py's
-    # build_feature_matrix(), this model never log1p's it or adds a
-    # separate _known indicator; LightGBM's native missing-value handling
-    # covers both SMPP (no imsi concept) and an SS7 request whose imsi
-    # Feast doesn't recognize - both come back None from `behavioral`).
-    imsi_value = behavioral.get(IMSI_DISTINCT_ORIG_COL)
-    row[IMSI_DISTINCT_ORIG_COL] = imsi_value if imsi_value is not None else np.nan
-    # sender_velocity_zscore_5min: same RAW-value-or-NaN treatment as IMSI
-    # above, for the same reason - kept OUT of BEHAVIORAL_COLS deliberately
-    # (models/anomaly/data.py's comment) since it can be a genuine NaN
-    # (cold-start sender, <2 prior readings), which LightGBM handles
-    # natively - a 0-fill here would fabricate "exactly average burst
-    # size" for a sender with no real baseline yet.
-    velocity_value = behavioral.get(SENDER_VELOCITY_ZSCORE_COL)
-    row[SENDER_VELOCITY_ZSCORE_COL] = velocity_value if velocity_value is not None else np.nan
-    row["text_decode_failed"] = int(canonical.text_decode_failed)
-    row["text_length"] = len(canonical.text or "")
-    row["source_SMPP"] = int(canonical.source == "SMPP")
-    row["source_SS7"] = int(canonical.source == "SS7")
-
     text = canonical.text or ""
-    # Content-rule flags (features/content_flags.py): sub-millisecond
-    # regex, computed inline same as text_length above - no model/index
-    # load, same registry (config.settings.CONTENT_FLAG_PATTERNS) training
-    # used. Base features - always computed, same as the columns above,
-    # not gated behind tfidf_vectorizer/embedding_pca_pipeline like
-    # tfidf_*/emb_pca_* below.
-    flags_df = compute_content_flags(pd.Series([text]))
-    flags = flags_df.iloc[0]
-    for name, value in flags.items():
-        row[name] = int(value)
-    # content_flag_hit_count/any/high_conf - engineered on top of the
-    # flags above, same discipline as training (models/anomaly/data.py::
-    # compute_content_flag_meta_features()), computed here on the same
-    # single-row frame so serving matches training exactly.
-    meta = compute_content_flag_meta_features(flags_df).iloc[0]
-    for name, value in meta.items():
-        row[name] = int(value)
+    # Raw one-row input in the shape _base_feature_frame() expects from the
+    # training CSV - that function alone owns the column set/order/dtypes
+    # (behavioral, imsi, velocity, dcs, text_decode_failed, text_length,
+    # content flags + meta, source one-hot), so nothing here can drift from
+    # training. What stays serving-specific is only the None handling:
+    #  - BEHAVIORAL_COLS: cold-start None -> 0 (same convention as
+    #    models/anomaly/data.py's plausibility_check() and the endpoint's
+    #    cold_start flag).
+    #  - dcs / imsi_distinct_originators_1hr / sender_velocity_zscore_5min:
+    #    None -> NaN, deliberately NOT 0-filled - LightGBM handles missing
+    #    natively, and a 0 would fabricate "exactly average burst size" (or
+    #    a real DCS / IMSI count) for a sender with no real baseline yet.
+    raw = {col: [behavioral.get(col) or 0] for col in BEHAVIORAL_COLS}
+    for col in (IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL):
+        value = behavioral.get(col)
+        raw[col] = [value if value is not None else np.nan]
+    raw.update(
+        dcs=[canonical.dcs if canonical.dcs is not None else np.nan],
+        text_decode_failed=[canonical.text_decode_failed],
+        text=[text],
+        source=[canonical.source],
+    )
+    # Content-rule flags: sub-millisecond regex over the same registry
+    # (config.settings.CONTENT_FLAG_PATTERNS) training used.
+    raw_df = pd.concat(
+        [pd.DataFrame(raw), compute_content_flags(pd.Series([text]))], axis=1,
+    )
+    frame = _base_feature_frame(raw_df, known_sources=KNOWN_SOURCES)
+    # Plain Python scalars (object dtype), bools back to 0/1 - keeps the
+    # features_used payload JSON-friendly and identical to the old shape.
+    row = {
+        name: int(value) if isinstance(value, (bool, np.bool_)) else value
+        for name, value in frame.astype(object).iloc[0].items()
+    }
     if tfidf_vectorizer is not None:
         tfidf_vector = tfidf_vectorizer.transform([text]).toarray()[0]
         for name, value in zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vector):

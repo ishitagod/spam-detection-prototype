@@ -77,9 +77,12 @@ from models.anomaly.data import (
     CONTENT_FLAG_META_COLS,
     IMSI_DISTINCT_ORIG_COL,
     N_EMBEDDING_COMPONENTS,
+    PLATFORM_TOKEN_COL,
     SENDER_VELOCITY_ZSCORE_COL,
+    build_source_dummies,
     compute_content_flag_meta_features,
     embedding_pca_pipeline,
+    normalize_messages_frame,
 )
 
 CANONICAL_COLS = ["dcs", "text_decode_failed"]
@@ -87,7 +90,7 @@ REQUIRED_COLS = (
     ["source", "record_id", "rule_evaluated", "rule_flagged", "text"]
     + CANONICAL_COLS
     + BEHAVIORAL_COLS
-    + [IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL]
+    + [IMSI_DISTINCT_ORIG_COL, SENDER_VELOCITY_ZSCORE_COL, PLATFORM_TOKEN_COL]
     + CONTENT_FLAG_COLS
 )
 
@@ -124,6 +127,7 @@ def _load_messages_csv(messages_path: Path) -> pd.DataFrame:
         "sender_recipient_diversity_ratio_5min": "float64",
         "sender_recipient_diversity_ratio_1hr": "float64",
         "sender_velocity_zscore_5min": "float64",  # can be NaN
+        PLATFORM_TOKEN_COL: bool,
         # Nullable extension dtype, not plain bool: rule_flagged is
         # genuinely True/False/NA (NA is a real, distinct value) - without
         # this pandas sees inconsistent types across chunks and warns.
@@ -134,16 +138,9 @@ def _load_messages_csv(messages_path: Path) -> pd.DataFrame:
         usecols=lambda c: c in set(REQUIRED_COLS),
         dtype=dtypes,  # `text` left out - free text doesn't fit a fixed dtype
     )
-    # IMSI_DISTINCT_ORIG_COL is SS7-only, absent from SMPP's file - add
-    # back as all-NaN so every caller sees the same column regardless of
-    # source (LightGBM treats NaN as a genuine missing split).
-    if IMSI_DISTINCT_ORIG_COL not in df.columns:
-        df[IMSI_DISTINCT_ORIG_COL] = np.nan
-    # Same treatment for content flags, but 0 (no flags known) not NaN.
-    for col in CONTENT_FLAG_COLS:
-        if col not in df.columns:
-            df[col] = 0
-    return df
+    # Same column defaults + platform-token exclusion as Isolation Forest's
+    # loader (LightGBM treats the all-NaN IMSI column as a genuine missing split).
+    return normalize_messages_frame(df, "_load_messages_csv")
 
 
 def load_labelled_messages(messages_path: Path) -> pd.DataFrame:
@@ -201,11 +198,16 @@ def label_content_flagged_positives(
     return positives
 
 
-def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+def _base_feature_frame(df: pd.DataFrame, known_sources: list[str] | None = None) -> pd.DataFrame:
     """
     The canonical + behavioral + source columns build_feature_matrix()
     always includes, regardless of use_embeddings/use_tfidf. `dcs` can be
     NaN - left as-is, LightGBM has native missing-value handling.
+
+    Also the single source of truth for live serving: serving/scoring.py's
+    build_rule_pattern_row() calls this on a one-row frame with
+    `known_sources` set (see models/anomaly/data.py::build_source_dummies)
+    so training and serving can't drift apart.
     """
     text_length = df["text"].fillna("").str.len().rename("text_length")
     text_decode_failed = (
@@ -233,10 +235,9 @@ def _base_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         df[CONTENT_FLAG_COLS],
         compute_content_flag_meta_features(df),
     ]
-    # `source` is dead weight once a run is restricted to one source -
-    # only add it when df actually spans more than one.
-    if df["source"].nunique() > 1:
-        pieces.append(pd.get_dummies(df["source"], prefix="source"))
+    source_dummies = build_source_dummies(df["source"], known_sources)
+    if source_dummies is not None:
+        pieces.append(source_dummies)
     return pd.concat(pieces, axis=1)
 
 
